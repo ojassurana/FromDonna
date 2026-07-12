@@ -1,0 +1,23 @@
+{
+  "name": "fromdonna-e2b-template",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Build and publish FromDonna E2B sandbox templates",
+  "type": "module",
+  "scripts": {
+    "build:dev": "tsx build.dev.ts",
+    "build:prod": "tsx build.prod.ts",
+    "smoke": "tsx scripts/smoke-create.ts"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.7",
+    "e2b": "^2.3.0"
+  },
+  "devDependencies": {
+    "tsx": "^4.19.3",
+    "typescript": "^5.8.2"
+  }
+}

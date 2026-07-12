@@ -1,0 +1,18 @@
+# Default Hermes config baked into the template (agent-only).
+# Copy/adapt during template build to ~/.hermes/config.yaml.
+# NO product secrets here — use Worker / Nango for those.
+
+# model: set at runtime via Worker-provided env or proxy if needed
+
+# Example tool posture (adjust when wiring real policy):
+# Disable gateway platforms inside the sandbox — Worker owns Telegram/WhatsApp.
+# platforms: {}
+
+# Prefer product tools that call Worker over in-box secrets.
+# mcp_servers: {}   # only secret-free local MCP if any
+
+agent:
+  # max_turns: 90
+  {}
+
+# terminal / tools: configure once product policy is fixed
