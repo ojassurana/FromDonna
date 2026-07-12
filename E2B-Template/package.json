@@ -7,7 +7,10 @@
   "scripts": {
     "build:dev": "tsx build.dev.ts",
     "build:prod": "tsx build.prod.ts",
-    "smoke": "tsx scripts/smoke-create.ts"
+    "smoke": "tsx scripts/smoke-create.ts",
+    "deploy:dev": "bash scripts/deploy-template.sh --dev",
+    "deploy:prod": "bash scripts/deploy-template.sh --prod",
+    "deploy:dry-run": "bash scripts/deploy-template.sh --dry-run"
   },
   "engines": {
     "node": ">=20"

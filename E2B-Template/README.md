@@ -21,8 +21,7 @@ E2B-Template/
 ├── config/
 │   └── hermes/               ← default agent-only Hermes config (no product secrets)
 │       └── config.yaml.example
-├── hermes/                   ← optional: pin/instructions for stock or forked Hermes
-│   └── README.md
+├── hermes/                   ← vendored Hermes fork (agent source pin)
 ├── extensions/               ← product plugins, bundled skills, agent tools
 │   ├── plugins/.gitkeep
 │   ├── skills/.gitkeep
@@ -34,6 +33,7 @@ E2B-Template/
 ├── harness/                  ← HTTP entry Worker will call (POST turn → reply)
 │   └── README.md
 └── scripts/
+    ├── deploy-template.sh    ← preflight + publish template to E2B (dev/prod)
     └── smoke-create.ts       ← create one sandbox from template and probe PATH
 ```
 
@@ -59,17 +59,37 @@ cp .env.example .env   # fill E2B_API_KEY
 npm install
 ```
 
-## Build
+## Deploy template (publish to E2B)
+
+Helper script (checks Node, `.env`, `hermes/`, npm install, then builds):
 
 ```bash
-# Development tag
-npm run build:dev
-# → template name: fromdonna-hermes-dev
+chmod +x scripts/deploy-template.sh   # once
 
-# Production tag
-npm run build:prod
-# → template name: fromdonna-hermes
+# Preflight only — no E2B build
+./scripts/deploy-template.sh --dry-run
+# or: npm run deploy:dry-run
+
+# Publish development template (fromdonna-hermes-dev)
+./scripts/deploy-template.sh --dev
+# or: npm run deploy:dev
+
+# Publish production template (fromdonna-hermes)
+./scripts/deploy-template.sh --prod
+# or: npm run deploy:prod
+
+# Dev publish + smoke sandbox
+./scripts/deploy-template.sh --dev --smoke
 ```
+
+Low-level (same build, no preflight wrapper):
+
+```bash
+npm run build:dev    # → fromdonna-hermes-dev
+npm run build:prod   # → fromdonna-hermes
+```
+
+**Note:** do not run deploy until `template.ts` installs Hermes/CLIs/harness for real — current recipe is still a stub.
 
 Worker create path:
 
