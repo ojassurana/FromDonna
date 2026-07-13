@@ -1,37 +1,28 @@
-/**
- * FromDonna E2B sandbox template recipe.
- *
- * Build with build.dev.ts / build.prod.ts.
- * Fill install steps as Hermes pin, CLIs, extensions, and harness land.
- *
- * Rules:
- * - No product secrets in the image (Telegram, Nango, user OAuth, Exa, …).
- * - Privileged MCP/API → Worker; only secret-free local MCP may be registered here.
- * - Per-user brain lives in live sandbox ~/.hermes after create, not in this recipe.
- */
-import { Template, waitForTimeout } from "e2b";
+import { Template, waitForPort } from "e2b";
 
-/** Template alias used by Worker / smoke after publish. */
+/** Template aliases used by the gateway Worker. */
 export const TEMPLATE_NAME_DEV = "fromdonna-hermes-dev";
 export const TEMPLATE_NAME_PROD = "fromdonna-hermes";
 
 /**
- * Shared recipe. Extend with .run(), .copy(), etc. as pieces are ready.
- * @see https://e2b.dev/docs/template/quickstart
+ * Shared FromDonna sandbox image. It contains the vendored Hermes source,
+ * agent-only configuration, and the Worker-facing harness — never channel or
+ * provider secrets.
  */
 export const template = Template()
   .fromBaseImage()
-  // Placeholder env only — not product secrets.
+  .aptInstall(["curl", "ca-certificates", "python3", "python3-venv"])
+  .runCmd("curl -LsSf https://astral.sh/uv/install.sh | sh")
   .setEnvs({
+    PATH: "/home/user/.local/bin:/home/user/venv/bin:$PATH",
     FROMDONNA_RUNTIME: "e2b",
-    // HERMES_HOME can be set once install path is fixed.
+    HERMES_HOME: "/home/user/.hermes",
   })
-  // TODO: install OS packages / runtimes (python, node, …)
-  // TODO: install CLIs (see clis/)
-  // TODO: install or copy Hermes pin (see hermes/)
-  // TODO: copy config/hermes → ~/.hermes/config.yaml
-  // TODO: copy extensions/ (plugins, skills, tools)
-  // TODO: optional local MCP from mcp/
-  // TODO: copy harness/ and set real start command
-  // Warm start stub — replace with harness listen + waitForPort when ready.
-  .setStartCmd("echo fromdonna-e2b-template-ready", waitForTimeout(3_000));
+  .copy("hermes", "/opt/fromdonna/hermes")
+  .copy("harness", "/opt/fromdonna/harness")
+  .copy("config/hermes/config.yaml", "/home/user/.hermes/config.yaml")
+  .runCmd("uv venv /home/user/venv --python python3 && uv pip install --python /home/user/venv/bin/python /opt/fromdonna/hermes && mkdir -p /home/user/workspace")
+  .setStartCmd(
+    "/home/user/venv/bin/uvicorn server:app --app-dir /opt/fromdonna/harness --host 0.0.0.0 --port 8788",
+    waitForPort(8788),
+  );

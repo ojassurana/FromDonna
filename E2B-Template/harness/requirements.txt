@@ -1,0 +1,4 @@
+# FastAPI and Uvicorn are Hermes core dependencies; retained as an explicit
+# harness contract for the template build.
+fastapi
+uvicorn[standard]

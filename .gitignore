@@ -1,0 +1,5 @@
+# Local build/runtime artifacts
+.wrangler/
+**/node_modules/
+**/__pycache__/
+*.pyc

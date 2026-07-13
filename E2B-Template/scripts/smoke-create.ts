@@ -13,11 +13,11 @@ async function main() {
 
   const sandbox = await Sandbox.create(TEMPLATE_NAME_DEV);
   try {
-    const who = await sandbox.commands.run("whoami && uname -a");
+    const who = await sandbox.commands.run("whoami && /home/user/venv/bin/hermes --version");
     console.log(who.stdout);
-    // Uncomment as installs land:
-    // console.log((await sandbox.commands.run("which hermes || true")).stdout);
-    // console.log((await sandbox.commands.run("hermes --version || true")).stdout);
+    const health = await fetch(`https://${sandbox.getHost(8788)}/health`);
+    if (!health.ok) throw new Error(`Harness health failed: HTTP ${health.status}`);
+    console.log(await health.text());
   } finally {
     await sandbox.kill();
   }

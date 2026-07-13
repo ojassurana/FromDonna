@@ -1,0 +1,16 @@
+name = "fromdonna-llm-proxy"
+main = "src/index.ts"
+compatibility_date = "2026-07-12"
+[vars]
+CODEX_RELAY_URL = "https://0998-2406-da18-154e-1a00-113a-22dd-5154-42dd.ngrok-free.app/v1/responses"
+
+# Secrets are provisioned separately and are never committed:
+# - CODEX_ACCESS_TOKEN
+# - CODEX_REFRESH_TOKEN
+#
+# Capability tokens are required as Bearer credentials at the HTTP boundary,
+# but this first release deliberately does not verify them yet.
+
+[[kv_namespaces]]
+binding = "CODEX_TOKENS"
+id = "3bdfdedaa2184651866854718dc226f6"

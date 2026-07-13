@@ -1,0 +1,13 @@
+[Unit]
+Description=FromDonna Codex relay ngrok tunnel
+After=network-online.target fromdonna-codex-relay.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/ngrok http 9121 --log=stdout
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

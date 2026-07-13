@@ -1,0 +1,15 @@
+[Unit]
+Description=FromDonna Codex relay
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/ubuntu/FromDonna/cloudflare/llm-proxy/relay
+EnvironmentFile=/home/ubuntu/.config/fromdonna-codex-relay.env
+ExecStart=/usr/bin/python3 /home/ubuntu/FromDonna/cloudflare/llm-proxy/relay/codex_relay.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

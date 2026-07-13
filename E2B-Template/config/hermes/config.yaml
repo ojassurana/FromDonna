@@ -1,0 +1,8 @@
+# Agent-only configuration baked into every FromDonna sandbox.
+# The Telegram Worker owns channels; the sandbox only receives /turn requests.
+model:
+  provider: custom
+  base_url: "https://fromdonna-llm-proxy.code-df4.workers.dev/v1"
+  default: "gpt-5.6-terra"
+
+agent: {}
