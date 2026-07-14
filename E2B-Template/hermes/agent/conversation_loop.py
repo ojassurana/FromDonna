@@ -4996,9 +4996,15 @@ def run_conversation(
                     )
                     if _truly_empty and (not _has_structured or _prefill_exhausted) and agent._empty_content_retries < 3:
                         agent._empty_content_retries += 1
+                        # FromDonna/custom proxies: empty stream frames can
+                        # surface as success-with-no-content. Force the
+                        # non-streaming path on retry so the same request can
+                        # still produce a real reply instead of exhausting
+                        # three identical stream attempts.
+                        agent._disable_streaming = True
                         logger.warning(
                             "Empty response (no content or reasoning) — "
-                            "retry %d/3 (model=%s)",
+                            "retry %d/3 non-stream (model=%s)",
                             agent._empty_content_retries, agent.model,
                         )
                         agent._buffer_status(

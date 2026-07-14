@@ -68,6 +68,34 @@ test("uses text deltas when Codex terminal snapshot omits output", () => {
   assert.deepEqual(normalized.content, [{ type: "text", text: "proxy-ok" }]);
 });
 
+test("extracts reasoning summary text when message content is missing", () => {
+  const normalized = fromCodexResponses("gpt-5.6-terra", {
+    id: "resp_reason",
+    status: "completed",
+    output: [
+      {
+        type: "reasoning",
+        summary: [{ type: "summary_text", text: "I should answer briefly." }],
+      },
+    ],
+    usage: { input_tokens: 1, output_tokens: 8 },
+  });
+  assert.deepEqual(normalized.content, [{ type: "text", text: "I should answer briefly." }]);
+});
+
+test("reconstructs function calls from SSE argument deltas when completed output is empty", () => {
+  const sse = [
+    'event: response.function_call_arguments.delta\ndata: {"type":"response.function_call_arguments.delta","item_id":"fc_1","call_id":"call_1","name":"read_file","delta":"{\\"path\\":"}',
+    'event: response.function_call_arguments.delta\ndata: {"type":"response.function_call_arguments.delta","item_id":"fc_1","delta":"\\"SOUL.md\\"}"}',
+    'event: response.completed\ndata: {"type":"response.completed","response":{"id":"resp_fc","status":"completed","output":[],"usage":{"input_tokens":10,"output_tokens":20}}}',
+  ].join("\n\n") + "\n\n";
+  const normalized = fromCodexResponses("gpt-5.6-terra", parseCodexResponsesSse(sse));
+  assert.equal(normalized.toolCalls.length, 1);
+  assert.equal(normalized.toolCalls[0].function.name, "read_file");
+  assert.match(normalized.toolCalls[0].function.arguments, /SOUL\.md/);
+  assert.equal(normalized.finishReason, "tool_calls");
+});
+
 test("emits Chat Completions SSE including tool calls", () => {
   const sse = toChatCompletionSse("gpt-5.6-terra", {
     id: "resp_stream",

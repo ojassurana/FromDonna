@@ -3006,9 +3006,9 @@ class AIAgent:
         if reason == "empty_response_exhausted":
             return (
                 prefix
-                + "the model returned empty content after retries and any "
-                "fallback providers. Try `continue`, switch model/provider, "
-                "or inspect the tool output above."
+                + "the model returned no usable text after retries. "
+                "I can keep going — send another message or `continue`. "
+                "If this keeps happening, try `/new` to reset session context."
             )
         if reason == "all_retries_exhausted_no_response":
             return (

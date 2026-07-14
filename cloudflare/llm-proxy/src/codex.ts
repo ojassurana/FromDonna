@@ -137,31 +137,78 @@ export function toCodexResponsesRequest(request: NormalizedChatCompletionRequest
 
 function responseTextParts(payload: JsonObject): ChatContentPart[] {
   const parts: ChatContentPart[] = [];
+  const pushText = (text: unknown) => {
+    if (typeof text === "string" && text.trim()) parts.push({ type: "text", text });
+  };
+
   const output = Array.isArray(payload.output) ? payload.output : [];
   for (const item of output) {
-    if (!isObject(item) || !Array.isArray(item.content)) continue;
-    for (const content of item.content) {
-      if (isObject(content) && content.type === "output_text" && typeof content.text === "string") {
-        parts.push({ type: "text", text: content.text });
+    if (!isObject(item)) continue;
+
+    // Standard assistant message item.
+    if (Array.isArray(item.content)) {
+      for (const content of item.content) {
+        if (!isObject(content)) continue;
+        if ((content.type === "output_text" || content.type === "text" || content.type === "summary_text") && typeof content.text === "string") {
+          pushText(content.text);
+        }
       }
     }
+
+    // Reasoning-only models may emit summary text without a message item.
+    if (item.type === "reasoning") {
+      if (typeof item.content === "string") pushText(item.content);
+      if (Array.isArray(item.summary)) {
+        for (const part of item.summary) {
+          if (isObject(part) && typeof part.text === "string") pushText(part.text);
+        }
+      }
+    }
+
+    // Some backends put plain text on the item itself.
+    if (typeof item.text === "string") pushText(item.text);
   }
-  if (!parts.length && typeof payload.output_text === "string") parts.push({ type: "text", text: payload.output_text });
+
+  if (!parts.length && typeof payload.output_text === "string") pushText(payload.output_text);
   return parts;
+}
+
+function extractToolCalls(payload: JsonObject): Array<{ id: string; type: "function"; function: { name: string; arguments: string } }> {
+  const output = Array.isArray(payload.output) ? payload.output : [];
+  const calls: Array<{ id: string; type: "function"; function: { name: string; arguments: string } }> = [];
+  for (const item of output) {
+    if (!isObject(item)) continue;
+    const type = typeof item.type === "string" ? item.type : "";
+    // OpenAI Responses: function_call; some builds use custom_tool_call.
+    if (type !== "function_call" && type !== "custom_tool_call") continue;
+    const name = typeof item.name === "string" ? item.name : typeof item.tool_name === "string" ? item.tool_name : null;
+    if (!name) continue;
+    const id =
+      (typeof item.call_id === "string" && item.call_id) ||
+      (typeof item.id === "string" && item.id) ||
+      `call_${calls.length + 1}`;
+    let args = item.arguments;
+    if (args == null && isObject(item.input)) args = item.input;
+    if (typeof args !== "string") {
+      try {
+        args = JSON.stringify(args ?? {});
+      } catch {
+        args = "{}";
+      }
+    }
+    calls.push({ id, type: "function", function: { name, arguments: args as string } });
+  }
+  return calls;
 }
 
 /** Convert a Codex Responses object to the provider-neutral completion result. */
 export function fromCodexResponses(model: string, payload: JsonObject): NormalizedChatCompletionResponse {
-  const output = Array.isArray(payload.output) ? payload.output : [];
-  const toolCalls = output.flatMap((item) => {
-    if (!isObject(item) || item.type !== "function_call" || typeof item.name !== "string" || typeof item.arguments !== "string") return [];
-    const id = typeof item.call_id === "string" ? item.call_id : typeof item.id === "string" ? item.id : undefined;
-    return id ? [{ id, type: "function" as const, function: { name: item.name, arguments: item.arguments } }] : [];
-  });
+  const toolCalls = extractToolCalls(payload);
+  const content = responseTextParts(payload);
   const usage = isObject(payload.usage) ? payload.usage : {};
   return {
     ...(typeof payload.id === "string" ? { id: payload.id } : {}),
-    content: responseTextParts(payload),
+    content,
     toolCalls,
     finishReason: toolCalls.length ? "tool_calls" : payload.status === "incomplete" ? "length" : "stop",
     usage: {
@@ -175,20 +222,84 @@ export function fromCodexResponses(model: string, payload: JsonObject): Normaliz
 export function parseCodexResponsesSse(text: string): JsonObject {
   let completed: JsonObject | null = null;
   let textDelta = "";
+  const outputItems: JsonObject[] = [];
+  const functionArgs = new Map<string, { name?: string; arguments: string; call_id?: string }>();
+
   for (const frame of text.split(/\r?\n\r?\n/)) {
-    const data = frame.split(/\r?\n/).find((line) => line.startsWith("data:"))?.slice(5).trim();
+    const data = frame
+      .split(/\r?\n/)
+      .filter((line) => line.startsWith("data:"))
+      .map((line) => line.slice(5).trim())
+      .join("");
     if (!data || data === "[DONE]") continue;
     try {
       const event = JSON.parse(data) as JsonObject;
-      if (event.type === "response.completed" && isObject(event.response)) completed = event.response;
-      if (event.type === "response.output_text.delta" && typeof event.delta === "string") textDelta += event.delta;
-    } catch { /* ignore malformed upstream SSE frames */ }
+      const type = typeof event.type === "string" ? event.type : "";
+
+      if (type === "response.completed" && isObject(event.response)) completed = event.response;
+      if (type === "response.output_text.delta" && typeof event.delta === "string") textDelta += event.delta;
+      // Alternate text delta event names used by some Responses backends.
+      if ((type === "response.content_part.delta" || type === "response.text.delta") && typeof event.delta === "string") {
+        textDelta += event.delta;
+      }
+      if (type === "response.output_item.done" && isObject(event.item)) {
+        outputItems.push(event.item);
+      }
+      if (type === "response.function_call_arguments.delta") {
+        const itemId = typeof event.item_id === "string" ? event.item_id : typeof event.output_index === "number" ? `idx_${event.output_index}` : "fn";
+        const prev = functionArgs.get(itemId) || { arguments: "" };
+        if (typeof event.delta === "string") prev.arguments += event.delta;
+        if (typeof event.name === "string") prev.name = event.name;
+        if (typeof event.call_id === "string") prev.call_id = event.call_id;
+        functionArgs.set(itemId, prev);
+      }
+      if (type === "response.function_call_arguments.done") {
+        const itemId = typeof event.item_id === "string" ? event.item_id : typeof event.output_index === "number" ? `idx_${event.output_index}` : "fn";
+        const prev = functionArgs.get(itemId) || { arguments: "" };
+        if (typeof event.arguments === "string") prev.arguments = event.arguments;
+        if (typeof event.name === "string") prev.name = event.name;
+        if (typeof event.call_id === "string") prev.call_id = event.call_id;
+        functionArgs.set(itemId, prev);
+      }
+    } catch {
+      /* ignore malformed upstream SSE frames */
+    }
   }
+
+  // Prefer the terminal snapshot; enrich it when the snapshot is sparse.
   if (completed) {
     if (!responseTextParts(completed).length && textDelta) completed.output_text = textDelta;
+    const existing = Array.isArray(completed.output) ? (completed.output as unknown[]) : [];
+    if (!existing.length && outputItems.length) completed.output = outputItems;
+    if (!extractToolCalls(completed).length && functionArgs.size) {
+      const synthesized = Array.from(functionArgs.entries()).map(([itemId, fn], i) => ({
+        type: "function_call",
+        id: itemId,
+        call_id: fn.call_id || itemId || `call_${i + 1}`,
+        name: fn.name || "unknown_tool",
+        arguments: fn.arguments || "{}",
+      }));
+      completed.output = [...(Array.isArray(completed.output) ? (completed.output as unknown[]) : []), ...synthesized];
+    }
     return completed;
   }
-  return { id: `resp_${crypto.randomUUID()}`, status: "completed", output_text: textDelta };
+
+  const synthesizedOutput: JsonObject[] = [...outputItems];
+  for (const [itemId, fn] of functionArgs.entries()) {
+    synthesizedOutput.push({
+      type: "function_call",
+      id: itemId,
+      call_id: fn.call_id || itemId,
+      name: fn.name || "unknown_tool",
+      arguments: fn.arguments || "{}",
+    });
+  }
+  return {
+    id: `resp_${crypto.randomUUID()}`,
+    status: "completed",
+    ...(textDelta ? { output_text: textDelta } : {}),
+    ...(synthesizedOutput.length ? { output: synthesizedOutput } : {}),
+  };
 }
 
 export const codexAdapter: ProviderAdapter<Env> = {
@@ -197,9 +308,35 @@ export const codexAdapter: ProviderAdapter<Env> = {
     const raw = await upstream.text();
     if (!upstream.ok) {
       let payload: unknown;
-      try { payload = JSON.parse(raw); } catch { /* handled below */ }
+      try {
+        payload = JSON.parse(raw);
+      } catch {
+        /* handled below */
+      }
       throw new UpstreamError(`Codex upstream returned HTTP ${upstream.status}.`, upstream.status, payload);
     }
-    return fromCodexResponses(request.model, parseCodexResponsesSse(raw));
+    const parsed = parseCodexResponsesSse(raw);
+    const normalized = fromCodexResponses(request.model, parsed);
+    // Never hand Hermes a successful empty completion when the upstream spent
+    // tokens — keep a minimal diagnostic so the agent can recover instead of
+    // thrashing "empty content" retries.
+    if (!normalized.content.length && !normalized.toolCalls.length) {
+      const usage = isObject(parsed.usage) ? parsed.usage : {};
+      const outTokens = typeof usage.output_tokens === "number" ? usage.output_tokens : 0;
+      if (outTokens > 0 || raw.includes("function_call") || raw.includes("output_text")) {
+        console.error(
+          JSON.stringify({
+            msg: "codex_empty_mapping",
+            model: request.model,
+            outTokens,
+            rawHead: raw.slice(0, 1500),
+            parsedOutputTypes: Array.isArray(parsed.output)
+              ? (parsed.output as unknown[]).map((item) => (isObject(item) ? item.type : typeof item))
+              : [],
+          }),
+        );
+      }
+    }
+    return normalized;
   },
 };
