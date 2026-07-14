@@ -2,63 +2,89 @@
 
 ## Purpose
 
-`cloudflare/llm-proxy/` is the Worker-facing inference door for FromDonna sandboxes. It gives the sandbox an OpenAI-compatible endpoint while credentials remain in Cloudflare, not E2B.
+`cloudflare/llm-proxy/` is the inference door for FromDonna sandboxes. It exposes an OpenAI-compatible HTTP API while **provider credentials stay in Cloudflare / the host relay**, never in E2B.
 
 ```text
-sandbox ── Bearer capability token + explicit model ──> LLM Proxy Worker ──> provider
+sandbox Hermes
+  Authorization: Bearer <capability>
+  model: gpt-5.6-terra
+       │
+       ▼
+LLM Proxy Worker  ──HTTPS + X-Relay-Token──►  Codex relay (host)  ──►  Codex / ChatGPT
 ```
 
-The sandbox never chooses a provider and never receives an upstream credential.
+Related: [telegram.md](./telegram.md) (how the gateway mints the capability per turn), [gateway.md](./gateway.md).
 
-## Current state
+## Live deployment
 
-- Routes: `GET /v1/models` and `POST /v1/chat/completions`
-- The catalog advertises exactly `gpt-5.6-terra`; requests require that explicit model ID (no default or aliases).
-- The model routes internally to the ChatGPT/Codex OAuth provider.
-- The Worker calls Codex Responses with its required upstream stream, aggregates it, and returns a normal non-streaming OpenAI chat-completions JSON response.
-- Non-streaming only for callers. `stream: true` returns a clear OpenAI-shaped error. Client token caps are accepted at the OpenAI-compatible edge but not forwarded because ChatGPT's Codex endpoint rejects `max_output_tokens`.
-- A `Bearer` capability token is **required syntactically**, but its contents are intentionally not verified or authorized yet.
-- Codex OAuth starts from Worker secrets `CODEX_ACCESS_TOKEN` and `CODEX_REFRESH_TOKEN`. Mutable token state is kept in the bound `CODEX_TOKENS` KV namespace so rotated refresh tokens survive beyond one request.
+| Piece | Value |
+|-------|--------|
+| Worker | `https://fromdonna-llm-proxy.code-df4.workers.dev` |
+| Health | `GET /health` |
+| Models | `GET /v1/models` |
+| Completions | `POST /v1/chat/completions` |
+| Catalog model | `gpt-5.6-terra` only (explicit; no aliases) |
+| Sandbox base_url | baked in template `config/hermes/config.yaml` → `…/v1` |
 
-### Current security posture
+### Secrets (Worker — never commit)
 
-This is an integration-stage proxy, not a sandbox security boundary yet. Any caller holding any non-empty Bearer token can invoke an allowed `gpt-*` model. Do not give its URL to untrusted callers until capability verification ships.
+| Secret | Purpose |
+|--------|---------|
+| `RELAY_SHARED_SECRET` | `X-Relay-Token` to the Codex relay |
+| `CODEX_ACCESS_TOKEN` / `CODEX_REFRESH_TOKEN` | Present on Worker historically; **live path uses the host relay’s Hermes credential** (see below) |
 
-## OAuth provisioning
+### Vars
 
-The initial credential comes from the maintainer's existing Hermes `openai-codex` OAuth session and is copied only into Cloudflare Worker secrets:
+| Var | Purpose |
+|-----|---------|
+| `CODEX_RELAY_URL` | HTTPS endpoint of the private Codex relay (currently ngrok-published) |
 
-- never commit either token
-- never place either token in E2B or sandbox configuration
-- never print either token in command output or logs
-- the local Hermes credential remains unchanged
+---
 
-The Worker reads a cached/rotated pair from KV, falls back to the secret pair once, and stores a successful refresh result back in KV.
+## Current behavior
 
-### Live verification status
+| Concern | Behavior |
+|---------|----------|
+| Auth | `Authorization: Bearer …` required and non-empty; **contents not verified yet** |
+| Model | Must be exactly `gpt-5.6-terra` |
+| Non-stream | Returns normal OpenAI `chat.completion` JSON |
+| Stream | Hermes often sends `stream: true`. Proxy still aggregates Codex server-side, then returns a **minimal OpenAI `text/event-stream`** (one content chunk + finish + `[DONE]`) so clients work without real token streaming |
+| Token caps | Accepted at the edge; not always forwarded (Codex Responses rejects some fields) |
+| Provider choice | Internal only; caller cannot pick provider |
 
-- Codex rejects direct Worker egress with `403`, so the Worker forwards only the request and a relay-auth secret over HTTPS to a private relay running on the Hermes host. The relay resolves Hermes's active `openai-codex` runtime credential **for every request** and performs the Codex call from the allowed host egress.
-- This is intentionally a single OAuth authority: the Worker never reads, stores, refreshes, or forwards Codex OAuth tokens. When Hermes refreshes or changes its active credential, the next proxy request uses that exact live Hermes credential.
-- The relay is currently published through an ngrok endpoint. The end-to-end route reaches Codex (it returned Codex's `429 The usage limit has been reached`, rather than the former Worker-egress `403`).
-- The current ngrok free endpoint is session-bound. Before production use, reserve a stable relay domain or automate relay-URL rotation and Worker redeploy on relay restart.
+### Security posture
 
-## Planned: capability-token detector
+Integration-stage proxy, not a hard multi-tenant security boundary yet. Any non-empty Bearer can call the allowed model. Do not expose the URL beyond sandboxes that receive Worker-minted capabilities until the capability verifier ships.
 
-The next security step is a capability-token detector/verifier at the Worker boundary.
+Planned verifier will: signature/expiry/audience, bind user + sandbox, authorize model policy, reject replay — without changing the public request shape.
 
-It will:
+---
 
-1. verify token signature, issuer, expiry, and audience;
-2. bind the request to the authenticated user and sandbox;
-3. authorize the `llm` connector and the exact requested model or model policy;
-4. reject replayed/revoked tokens where applicable;
-5. emit safe audit metadata (user, sandbox, model, provider, timing), without storing prompt content by default.
+## OAuth / relay model
 
-The public API will not change: callers still send an explicit model and `Authorization: Bearer <capability-token>`. Only the Worker begins enforcing the token.
+Codex rejects direct Worker egress (`403`). Live path:
 
-## Adding providers later
+1. LLM proxy POSTs the Responses-shaped body to `CODEX_RELAY_URL`
+2. Header `X-Relay-Token: RELAY_SHARED_SECRET`
+3. Relay (`cloudflare/llm-proxy/relay/codex_relay.py`) resolves the host Hermes `openai-codex` runtime credential **per request** and calls Codex from allowed egress
+4. Single OAuth authority stays on the Hermes host; Worker does not refresh or forward OAuth tokens on this path
 
-Provider selection remains internal. Add a model-to-provider mapping and a provider adapter; do not add a caller-controlled `provider` parameter. Future OAuth/API-key credential routes remain Worker-side.
+**Ops caveat:** free ngrok URLs are session-bound. If the tunnel restarts, update `CODEX_RELAY_URL` and redeploy the LLM proxy (or use a stable domain).
+
+Relay processes observed as local `codex_relay.py` + `ngrok http 9121` (systemd unit files exist under `relay/` but may not be enabled).
+
+---
+
+## How Telegram path uses this proxy
+
+1. Gateway Worker mints `x-llm-capability` per turn (opaque nonce, not a provider key)
+2. Harness sets `OPENAI_API_KEY=<capability>` and `OPENAI_BASE_URL=<proxy>/v1` only for that Hermes child process
+3. Hermes oneshot uses provider `custom` + model `gpt-5.6-terra`
+4. Proxy validates Bearer presence + model, calls relay, returns completion (JSON or SSE)
+
+No Telegram, E2B, or Codex secrets are required inside the sandbox for inference.
+
+---
 
 ## Local checks
 
@@ -69,9 +95,32 @@ npm test
 npm run check
 ```
 
-## Deployment prerequisites
+## Deploy
 
-1. Create a Cloudflare KV namespace and replace `REPLACE_WITH_CREATED_KV_NAMESPACE_ID` in `wrangler.toml`.
-2. Provision `CODEX_ACCESS_TOKEN` and `CODEX_REFRESH_TOKEN` from the existing local Hermes Codex OAuth store through `wrangler secret put` without printing them.
-3. Deploy with Wrangler using the FromDonna Cloudflare account.
-4. Confirm `GET /health`, then make a real `POST /v1/chat/completions` request with an explicit GPT model and a non-empty temporary Bearer token.
+```bash
+cd cloudflare/llm-proxy
+npx wrangler secret put RELAY_SHARED_SECRET
+# optional / legacy token secrets if still used by other paths
+npx wrangler deploy
+```
+
+Smoke:
+
+```bash
+curl -sS https://fromdonna-llm-proxy.code-df4.workers.dev/health
+
+curl -sS -X POST https://fromdonna-llm-proxy.code-df4.workers.dev/v1/chat/completions \
+  -H 'authorization: Bearer smoke-test' \
+  -H 'content-type: application/json' \
+  -d '{"model":"gpt-5.6-terra","messages":[{"role":"user","content":"Say only: ok"}]}'
+```
+
+Live logs:
+
+```bash
+npx wrangler tail fromdonna-llm-proxy --format pretty
+```
+
+## Adding providers later
+
+Provider selection remains internal. Add a model→provider mapping and adapter; do not add a caller-controlled `provider` parameter. Future OAuth/API-key routes stay Worker-side.

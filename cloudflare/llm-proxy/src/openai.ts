@@ -79,3 +79,24 @@ export function toChatCompletion(model: string, payload: Record<string, unknown>
     usage: { prompt_tokens: inputTokens, completion_tokens: outputTokens, total_tokens: inputTokens + outputTokens },
   };
 }
+
+/**
+ * Hermes (and most OpenAI clients) request stream=true by default.
+ * Upstream Codex is already consumed as SSE and aggregated. Present a
+ * minimal OpenAI chat.completion.chunk stream so callers that insist on
+ * streaming still receive a complete answer without real token streaming.
+ */
+export function toChatCompletionSse(model: string, payload: Record<string, unknown>): string {
+  const completion = toChatCompletion(model, payload) as {
+    id: string;
+    created: number;
+    model: string;
+    choices: Array<{ message: { content: string }; finish_reason: string | null }>;
+  };
+  const content = completion.choices[0]?.message.content ?? "";
+  const finish = completion.choices[0]?.finish_reason ?? "stop";
+  const base = { id: completion.id, object: "chat.completion.chunk", created: completion.created, model: completion.model };
+  const first = { ...base, choices: [{ index: 0, delta: { role: "assistant", content }, finish_reason: null }] };
+  const last = { ...base, choices: [{ index: 0, delta: {}, finish_reason: finish }] };
+  return `data: ${JSON.stringify(first)}\n\ndata: ${JSON.stringify(last)}\n\ndata: [DONE]\n\n`;
+}

@@ -2,7 +2,43 @@
 
 How to build the **shared sandbox image** FromDonna users boot from: Hermes (possibly customized), CLIs, optional MCPs, plugins, and extra product code.
 
-Related: [memorymanagement.md](./memorymanagement.md) (what lives on the box vs R2), [../tooling/general.md](../tooling/general.md) (secrets stay on Worker).
+Related: [memorymanagement.md](./memorymanagement.md) (what lives on the box vs R2), [../tooling/general.md](../tooling/general.md) (secrets stay on Worker), [../gateway/telegram.md](../gateway/telegram.md) (Worker create + `/bootstrap` + `/turn`).
+
+Source tree: `E2B-Template/`
+
+## Live status (FromDonna)
+
+| Item | Value |
+|------|--------|
+| Prod template alias | `fromdonna-hermes` |
+| Dev template alias | `fromdonna-hermes-dev` |
+| Gateway var | `E2B_TEMPLATE=fromdonna-hermes` |
+| Harness port | `8788` (uvicorn warm start) |
+| Hermes config | `config/hermes/config.yaml` → LLM proxy base URL + `gpt-5.6-terra` |
+| Harness code | `E2B-Template/harness/server.py` |
+
+### What is baked today
+
+- Vendored Hermes under `E2B-Template/hermes/`
+- Agent-only Hermes config (no channel tokens)
+- FastAPI harness with `/health`, `/bootstrap`, `/turn`
+- `setStartCmd` starts uvicorn and waits for port 8788
+
+### What is *not* baked
+
+- Telegram bot token, E2B API key, Codex/OAuth, relay secret
+- Per-user `WORKER_TO_HARNESS_SECRET` (injected post-create via `/bootstrap`)
+- Per-user capability tokens (injected per `/turn` as `OPENAI_API_KEY` for the Hermes child only)
+
+### Warm start + `/bootstrap`
+
+Build snapshots uvicorn already listening. Create-time `envVars` do **not** reach that process. After `Sandbox.create`, the gateway:
+
+1. Waits for `GET /health`
+2. `POST /bootstrap` with `{ "secret": "<WORKER_TO_HARNESS_SECRET>" }`
+3. Stores sandbox id in D1 as `ready`
+
+See [telegram.md](../gateway/telegram.md) for the full Worker lifecycle.
 
 ## Goal
 
@@ -117,11 +153,14 @@ If default config lists an MCP server, ensure either:
 
 Typical extras in the image:
 
-- Small **HTTP harness**: Worker `POST /message` (or equivalent) → run Hermes turn → return reply  
+- **HTTP harness** (implemented):  
+  - `POST /bootstrap` — one-time Worker secret into process memory  
+  - `POST /turn` — Worker-forwarded message → Hermes `--oneshot` → `{ text }`  
+  - `GET /health` — liveness + `auth_ready`  
 - **Thin tools** / wrappers that call Worker for Nango / API / MCP  
 - CLI shims that rewrite upstream base URLs to Worker  
 
-This code is **yours**, versioned in FromDonna (or a runtime repo), **copied in at template build**.
+This code is **yours**, versioned in FromDonna, **copied in at template build** (`template.ts` copies `harness/` + `hermes/` + default config).
 
 ### 8. Warm start (recommended)
 
@@ -132,7 +171,7 @@ wait until port accepts connections
 
 Build captures a snapshot with the process **already running** → `Sandbox.create` is much cheaper than “install + boot Hermes from zero” every time.
 
-**Caveat:** env frozen at start — apply runtime secrets/capability on each request (or restart with env), same class of issue as older snapshot env pitfalls. Prefer **capability on each Worker → sandbox request**, not only build-time env.
+**Caveat:** env frozen at start — create-time `envVars` do not update the snapshotted uvicorn. FromDonna handles this with **`POST /bootstrap`** after create, and **capability on each `/turn`**, never long-lived provider keys in the image.
 
 ### 9. Build and name
 
@@ -143,14 +182,31 @@ record template id/name in Worker config
 
 ### 10. Wire create path
 
-Worker on first need:
+Worker on first need (implemented in `cloudflare/gateway`):
 
 ```text
-Sandbox.create({ template: "fromdonna-hermes", /* tags/metadata userId */ })
-store sandbox_id on user
+POST api.e2b.app/sandboxes
+  templateID: fromdonna-hermes
+  autoPause + autoResume
+  metadata.fromdonna_user_id
+→ wait GET https://8788-{id}.e2b.dev/health
+→ POST /bootstrap { secret }
+→ D1 status=ready
 ```
 
-Resume/pause afterward; don’t rebuild template per message.
+Before later turns: `POST .../sandboxes/{id}/connect` then `POST /turn`.  
+Don’t rebuild the template per message.
+
+### Build commands
+
+```bash
+cd E2B-Template
+cp .env.example .env   # E2B_API_KEY only
+npm install
+npm run build:dev      # fromdonna-hermes-dev
+npm run build:prod     # fromdonna-hermes
+npm run smoke          # create sandbox, probe hermes + harness /health
+```
 
 ## Upgrade workflow
 

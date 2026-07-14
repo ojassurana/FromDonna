@@ -2,26 +2,242 @@
 
 ## Scope
 
-Telegram-specific adapter on the **shared Cloudflare Worker** (see `gateway.md`).
+Telegram-specific adapter on the **shared Cloudflare Worker** (see [gateway.md](./gateway.md)).
 
-All users share **one Telegram bot**. The bot token lives **only on the Worker**, never in E2B / Hermes sandboxes.
+All users share **one Telegram bot** (`@fromdonna_bot`). The bot token lives **only on the Worker**, never in E2B / Hermes sandboxes.
 
-## Flow
+Source: `cloudflare/gateway/`
+
+---
+
+## Live deployment (FromDonna)
+
+| Piece | Value |
+|-------|--------|
+| Gateway Worker | `https://fromdonna-telegram-gateway.code-df4.workers.dev` |
+| Webhook | `POST /telegram/webhook` |
+| Health | `GET /health` |
+| D1 database | `fromdonna-routing` (`FROMDONNA_ROUTING` binding) |
+| D1 table | `telegram_user_sandboxes` |
+| E2B template | `fromdonna-hermes` |
+| Sandbox domain default | `e2b.dev` |
+| Harness port | `8788` |
+| LLM path | Sandbox → `fromdonna-llm-proxy` with per-turn capability only |
+
+### Worker secrets (never commit)
+
+| Secret | Purpose |
+|--------|---------|
+| `TELEGRAM_BOT_TOKEN` | Bot API token; outbound `sendMessage` only from Worker |
+| `TELEGRAM_WEBHOOK_SECRET` | Telegram `secret_token`; checked via `X-Telegram-Bot-Api-Secret-Token` |
+| `E2B_API_KEY` | Create / connect / resume sandboxes |
+| `WORKER_TO_HARNESS_SECRET` | Worker → harness auth; injected into process via `/bootstrap` |
+
+### Worker vars (`wrangler.toml`)
+
+| Var | Value |
+|-----|--------|
+| `E2B_TEMPLATE` | `fromdonna-hermes` |
+| `HARNESS_PORT` | `8788` |
+| `E2B_SANDBOX_DOMAIN` | `e2b.dev` |
+
+---
+
+## User experience
+
+From the user side: **DM the bot → get a private Hermes**. No setup, no “pick a sandbox,” no extra friction.
+
+1. User texts `@fromdonna_bot`
+2. Worker looks up `telegram_user_id` in D1
+3. **No row / failed** → create E2B sandbox, health-check harness, `/bootstrap` auth, mark `ready`
+4. **Ready** → `POST /turn` on that user’s harness with capability header
+5. Hermes calls the LLM proxy; Worker sends the reply via Bot API
+
+Concurrent first messages: only one request wins the D1 insert claim; others see `provisioning` and are asked to retry shortly. Failed provisions self-heal on the next message.
+
+---
+
+## End-to-end flow
 
 ```
-User DMs / messages @bot
+User DMs @fromdonna_bot
   → Telegram servers
-  → Worker webhook (full Update)
-  → Resolve telegram user/chat → userId → sandboxId
-  → POST normalized payload to that user’s Hermes (E2B)
-  → Hermes reply
-  → Worker Bot API sendMessage (or media) to same chat
+  → POST /telegram/webhook (secret header verified)
+  → Worker ACKs Telegram immediately (ctx.waitUntil)
+  → D1 lookup telegram_user_id
+       ├─ missing / failed → claim row → E2B create → wait /health → POST /bootstrap → status=ready
+       └─ ready           → E2B connect (resume + TTL) → POST /turn
+  → Harness runs Hermes oneshot (capability = OPENAI_API_KEY)
+  → Hermes → fromdonna-llm-proxy → Codex relay → model
+  → Worker sendMessage(reply) back to same chat_id
 ```
 
-1. **In:** Worker receives Telegram `Update` on the webhook.
-2. **Map:** `from.id` / `chat.id` → internal user and that user’s sandbox.
-3. **Forward:** Worker sends a **clean payload** into Hermes in that sandbox (HTTPS + capability auth). Not the raw bot token. Prefer a minimal normalized message (text, ids, media refs), not dumping secrets.
-4. **Out:** Hermes returns reply content; Worker calls Telegram Bot API with the **Worker-held** token.
+### What the Worker sends to the sandbox
+
+```json
+{
+  "userId": "telegram:<telegram_user_id>",
+  "gateway": "telegram",
+  "gatewayChatId": "<chat.id>",
+  "gatewayMessageId": "<message_id>",
+  "text": "<user text>"
+}
+```
+
+Headers:
+
+- `Authorization: Bearer <WORKER_TO_HARNESS_SECRET>`
+- `x-llm-capability: fd_cap_<userId>_<uuid>` — **not** a real provider key; LLM proxy currently accepts any non-empty Bearer (verification planned)
+
+### What never enters the sandbox
+
+- Telegram bot token
+- Codex / OAuth tokens
+- Relay shared secret
+- E2B API key
+
+---
+
+## D1 schema
+
+Migrations: `cloudflare/gateway/migrations/`
+
+```sql
+-- telegram_user_sandboxes
+telegram_user_id TEXT PRIMARY KEY
+telegram_chat_id TEXT NOT NULL
+user_id TEXT NOT NULL UNIQUE          -- e.g. telegram:1063008785
+e2b_sandbox_id TEXT NOT NULL
+e2b_sandbox_domain TEXT                 -- usually e2b.dev
+status TEXT NOT NULL                    -- provisioning | ready | failed
+provisioning_started_at TEXT
+created_at / updated_at
+```
+
+| Status | Meaning |
+|--------|---------|
+| `provisioning` | Claim row inserted; E2B create in progress (or concurrent loser) |
+| `ready` | Sandbox id stored; harness bootstrapped |
+| `failed` | Create/bootstrap failed; next message attempts recovery |
+
+---
+
+## Sandbox harness contract
+
+Source: `E2B-Template/harness/server.py`  
+Warm-started on port **8788** in the template.
+
+| Method | Path | Auth | Purpose |
+|--------|------|------|---------|
+| `GET` | `/health` | none | Liveness; `auth_ready` when secret is set |
+| `POST` | `/bootstrap` | none (once) | Inject `WORKER_TO_HARNESS_SECRET` into process memory |
+| `POST` | `/turn` | Bearer secret + `x-llm-capability` | Run one Hermes oneshot; return `{ "text": "..." }` |
+
+### Why `/bootstrap` exists
+
+Template warm-start freezes the uvicorn process env at **image build** time. Create-time `envVars` are visible to new shells but **not** to the already-running harness. The Worker therefore:
+
+1. Creates the sandbox (may still pass `envVars` for future processes)
+2. Waits for `/health`
+3. `POST /bootstrap` with the shared Worker secret
+4. Marks the D1 row `ready`
+
+Best-effort re-bootstrap runs before later turns (idempotent if the same secret).
+
+---
+
+## E2B lifecycle (Worker)
+
+On create:
+
+- `autoPause: true`
+- `autoResume: { enabled: true }`
+- `timeout: 3600` (seconds)
+- `secure: true`
+- `allow_internet_access: true`
+- metadata: `fromdonna_user_id`
+
+Before each turn:
+
+- `POST /sandboxes/{id}/connect` with `{ timeout: 3600 }` to resume if paused and extend TTL
+- Host URL shape: `https://{HARNESS_PORT}-{sandboxId}.{domain}/…`  
+  (E2B may omit `domain` in create response; Worker defaults to `e2b.dev`)
+
+---
+
+## Implementation notes
+
+| Topic | Behavior |
+|-------|----------|
+| Webhook ACK | Telegram is ACKed with `{ ok: true }` immediately; provision + Hermes run in `waitUntil` |
+| Message types (v1) | Text only; non-text updates ignored |
+| Reply length | Split at ~4000 chars for Telegram limits |
+| Errors | User gets a short “try again” message; details go to Worker logs only |
+| Free Workers plan | No custom `cpu_ms`; long turns depend on network wait + platform limits |
+
+---
+
+## Ops
+
+### Deploy gateway
+
+```bash
+cd cloudflare/gateway
+# Cloudflare auth (email + global key, or CLOUDFLARE_API_TOKEN)
+npx wrangler d1 migrations apply fromdonna-routing --remote
+npx wrangler secret put TELEGRAM_BOT_TOKEN
+npx wrangler secret put TELEGRAM_WEBHOOK_SECRET
+npx wrangler secret put E2B_API_KEY
+npx wrangler secret put WORKER_TO_HARNESS_SECRET
+npx wrangler deploy
+```
+
+### Point Telegram webhook
+
+```bash
+curl -sS "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/setWebhook" \
+  -H 'content-type: application/json' \
+  -d "{
+    \"url\": \"https://fromdonna-telegram-gateway.code-df4.workers.dev/telegram/webhook\",
+    \"secret_token\": \"${TELEGRAM_WEBHOOK_SECRET}\",
+    \"allowed_updates\": [\"message\"],
+    \"drop_pending_updates\": true
+  }"
+```
+
+### Live logs
+
+```bash
+cd cloudflare/gateway
+npx wrangler tail fromdonna-telegram-gateway --format pretty
+```
+
+Success path is mostly quiet (errors use `console.error`). Pair with LLM proxy tail if diagnosing model path:
+
+```bash
+cd cloudflare/llm-proxy
+npx wrangler tail fromdonna-llm-proxy --format pretty
+```
+
+### Status checks
+
+```bash
+# Gateway
+curl -sS https://fromdonna-telegram-gateway.code-df4.workers.dev/health
+
+# Webhook
+curl -sS "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getWebhookInfo"
+
+# D1 rows
+cd cloudflare/gateway
+npx wrangler d1 execute fromdonna-routing --remote --command \
+  "SELECT telegram_user_id, status, e2b_sandbox_id, updated_at FROM telegram_user_sandboxes ORDER BY updated_at DESC LIMIT 10;"
+
+# Harness for a known sandbox
+curl -sS "https://8788-<sandboxId>.e2b.dev/health"
+```
+
+---
 
 ## Why one bot works for many users
 
@@ -36,23 +252,7 @@ Multi-tenant = **routing table** on the Worker (`telegram identity → user → 
 
 Hermes in E2B is **agent-only**: tools + LLM loop for **one** user.
 
-## Worker responsibilities (Telegram)
-
-- Store / use `TELEGRAM_BOT_TOKEN`
-- Set and serve webhook
-- Parse supported update types (text, voice, etc. as product requires)
-- Optional: STT / media upload before agent turn
-- Outbound: `sendMessage`, media, drafts/edits if used
-- Never put the bot token in sandbox env or payload
-
-## Sandbox responsibilities (Telegram)
-
-- Accept Worker-forwarded turn
-- Run Hermes for that user
-- Return reply to Worker
-- No knowledge of the bot token required
-
 ## Relation to gateway-agnostic design
 
-Telegram is **one adapter**. Same Worker also owns WhatsApp and future channels (`gateway.md`).  
+Telegram is **one adapter**. Same Worker can own WhatsApp and future channels ([gateway.md](./gateway.md)).  
 After the Telegram adapter normalizes the update, the path is identical: **user → sandbox → reply → channel send**.

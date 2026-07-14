@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { isSupportedModel, providerForModel, SUPPORTED_MODELS } from "../src/models";
-import { parseResponsesSse, responseText, toChatCompletion, toResponsesInput } from "../src/openai";
+import { parseResponsesSse, responseText, toChatCompletion, toChatCompletionSse, toResponsesInput } from "../src/openai";
 
 test("only advertised model IDs route to Codex", () => {
   assert.deepEqual(SUPPORTED_MODELS, ["gpt-5.6-terra"]);
@@ -35,4 +35,11 @@ test("uses the completed Responses event from SSE", () => {
   const payload = parseResponsesSse(sse);
   assert.equal(payload.id, "resp_done");
   assert.equal(responseText(payload), "complete");
+});
+
+test("emits a minimal OpenAI chat.completion SSE for stream clients", () => {
+  const sse = toChatCompletionSse("gpt-5.6-terra", { id: "resp_stream", status: "completed", output_text: "hello-stream" });
+  assert.match(sse, /data: .*hello-stream/);
+  assert.match(sse, /chat\.completion\.chunk/);
+  assert.match(sse, /data: \[DONE\]/);
 });

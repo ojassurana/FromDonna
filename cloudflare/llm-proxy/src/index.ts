@@ -1,6 +1,13 @@
 import { codexResponse, type Env } from "./codex";
 import { providerForModel, SUPPORTED_MODELS } from "./models";
-import { errorResponse, parseResponsesSse, toChatCompletion, toResponsesInput, type ChatCompletionRequest } from "./openai";
+import {
+  errorResponse,
+  parseResponsesSse,
+  toChatCompletion,
+  toChatCompletionSse,
+  toResponsesInput,
+  type ChatCompletionRequest,
+} from "./openai";
 
 export async function handleRequest(request: Request, env: Env): Promise<Response> {
   const url = new URL(request.url);
@@ -24,7 +31,6 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
   try { input = await request.json() as ChatCompletionRequest; } catch { return errorResponse(400, "Request body must be JSON.", "invalid_json"); }
   if (!input.model) return errorResponse(400, "'model' is required.", "model_required");
   if (!Array.isArray(input.messages) || input.messages.length === 0) return errorResponse(400, "'messages' must be a non-empty array.", "messages_required");
-  if (input.stream) return errorResponse(400, "Streaming is not implemented yet.", "stream_unsupported");
   if (!providerForModel(input.model)) return errorResponse(404, `The model '${input.model}' is not available.`, "model_not_found");
 
   try {
@@ -44,7 +50,20 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
       try { return Response.json(JSON.parse(raw), { status: upstream.status }); }
       catch { return errorResponse(502, `Codex upstream returned HTTP ${upstream.status}.`, "upstream_error"); }
     }
-    return Response.json(toChatCompletion(input.model, parseResponsesSse(raw)));
+    const payload = parseResponsesSse(raw);
+    // Hermes oneshot requests stream=true; return OpenAI-compatible SSE while
+    // still aggregating Codex server-side (no provider credentials in sandboxes).
+    if (input.stream) {
+      return new Response(toChatCompletionSse(input.model, payload), {
+        status: 200,
+        headers: {
+          "content-type": "text/event-stream; charset=utf-8",
+          "cache-control": "no-cache",
+          connection: "keep-alive",
+        },
+      });
+    }
+    return Response.json(toChatCompletion(input.model, payload));
   } catch (error) {
     const message = error instanceof Error ? error.message : "Codex upstream request failed.";
     return errorResponse(502, message, "upstream_error");

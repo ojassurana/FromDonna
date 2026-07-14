@@ -1,6 +1,7 @@
 name = "fromdonna-telegram-gateway"
 main = "src/index.ts"
 compatibility_date = "2026-07-13"
+# Free plan: no custom cpu_ms. Hermes turns run via waitUntil after Telegram is ACKed.
 
 [[d1_databases]]
 binding = "FROMDONNA_ROUTING"
@@ -11,13 +12,15 @@ database_id = "938cd24b-ded6-4830-9494-933bbf4278ce"
 [vars]
 E2B_TEMPLATE = "fromdonna-hermes"
 HARNESS_PORT = "8788"
+E2B_SANDBOX_DOMAIN = "e2b.dev"
 
 # Secrets, never committed:
 # TELEGRAM_BOT_TOKEN       Telegram Bot API token
 # TELEGRAM_WEBHOOK_SECRET  Telegram webhook secret_token
 # E2B_API_KEY              Team API key used only to provision/resume sandboxes
-# WORKER_TO_HARNESS_SECRET Shared key presented to each sandbox harness
+# WORKER_TO_HARNESS_SECRET Shared key presented to each sandbox harness after /bootstrap
 #
-# Vars configured at deploy time:
+# Vars:
 # E2B_TEMPLATE = "fromdonna-hermes"
 # HARNESS_PORT = "8788"
+# E2B_SANDBOX_DOMAIN = "e2b.dev"
