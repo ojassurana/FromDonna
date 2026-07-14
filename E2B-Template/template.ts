@@ -20,6 +20,7 @@ export const template = Template()
   })
   .copy("hermes", "/opt/fromdonna/hermes")
   .copy("harness", "/opt/fromdonna/harness")
+  .copy("extensions/plugins", "/home/user/.hermes/plugins")
   .copy("config/hermes/config.yaml", "/home/user/.hermes/config.yaml")
   .runCmd("uv venv /home/user/venv --python python3 && uv pip install --python /home/user/venv/bin/python /opt/fromdonna/hermes && mkdir -p /home/user/workspace")
   .setStartCmd(

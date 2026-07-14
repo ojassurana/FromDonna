@@ -1,0 +1,6 @@
+name: fromdonna_transport
+version: "1.0"
+description: "Channel-neutral outbound actions for the FromDonna Worker transport."
+kind: standalone
+platforms:
+  - linux

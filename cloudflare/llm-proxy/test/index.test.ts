@@ -1,7 +1,12 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { fromCodexResponses, parseCodexResponsesSse, toCodexResponsesRequest } from "../src/codex";
 import { isSupportedModel, providerForModel, SUPPORTED_MODELS } from "../src/models";
-import { parseResponsesSse, responseText, toChatCompletion, toChatCompletionSse, toResponsesInput } from "../src/openai";
+import {
+  normalizeChatCompletionRequest,
+  toChatCompletion,
+  toChatCompletionSse,
+} from "../src/openai";
 
 test("only advertised model IDs route to Codex", () => {
   assert.deepEqual(SUPPORTED_MODELS, ["gpt-5.6-terra"]);
@@ -12,34 +17,66 @@ test("only advertised model IDs route to Codex", () => {
   assert.equal(providerForModel("default"), null);
 });
 
-test("converts chat messages into Responses input", () => {
-  assert.deepEqual(toResponsesInput([{ role: "user", content: "hello" }]), [{ role: "user", content: [{ type: "input_text", text: "hello" }] }]);
+test("normalizes multipart messages and tool calls without flattening them", () => {
+  const request = normalizeChatCompletionRequest({
+    model: "gpt-5.6-terra",
+    messages: [
+      { role: "user", content: [{ type: "text", text: "inspect" }, { type: "image_url", image_url: { url: "https://example.test/image.png" } }] },
+      { role: "assistant", content: null, tool_calls: [{ id: "call_1", type: "function", function: { name: "inspect_image", arguments: "{\"detail\":\"high\"}" } }] },
+      { role: "tool", tool_call_id: "call_1", content: "image is a cat" },
+    ],
+    tools: [{ type: "function", function: { name: "inspect_image", parameters: { type: "object" } } }],
+    tool_choice: "auto",
+    stream: true,
+  });
+
+  assert.equal(request.stream, true);
+  assert.equal(request.messages[1].toolCalls?.[0].function.name, "inspect_image");
+  assert.equal(request.messages[2].toolCallId, "call_1");
+
+  const codex = toCodexResponsesRequest(request);
+  const input = codex.input as Array<Record<string, unknown>>;
+  assert.equal((input[0].content as Array<Record<string, unknown>>)[1].type, "input_image");
+  assert.equal(input[1].type, "function_call");
+  assert.equal(input[2].type, "function_call_output");
+  assert.equal((codex.tools as Array<Record<string, unknown>>)[0].name, "inspect_image");
 });
 
-test("converts a Responses payload to OpenAI chat-completion format", () => {
-  const payload = { id: "resp_1", status: "completed", output: [{ content: [{ type: "output_text", text: "hi" }] }], usage: { input_tokens: 2, output_tokens: 1 } };
-  assert.equal(responseText(payload), "hi");
-  const output = toChatCompletion("gpt-5.6-terra", payload) as { object: string; choices: Array<{ message: { content: string } }>; usage: { total_tokens: number } };
+test("converts Codex function calls back to OpenAI chat-completion format", () => {
+  const normalized = fromCodexResponses("gpt-5.6-terra", {
+    id: "resp_1",
+    status: "completed",
+    output: [{ type: "function_call", call_id: "call_1", name: "skills_list", arguments: "{}" }],
+    usage: { input_tokens: 2, output_tokens: 1 },
+  });
+  const output = toChatCompletion("gpt-5.6-terra", normalized) as {
+    object: string;
+    choices: Array<{ message: { content: string | null; tool_calls: Array<{ id: string }> }; finish_reason: string }>;
+    usage: { total_tokens: number };
+  };
+
   assert.equal(output.object, "chat.completion");
-  assert.equal(output.choices[0].message.content, "hi");
+  assert.equal(output.choices[0].message.content, null);
+  assert.equal(output.choices[0].message.tool_calls[0].id, "call_1");
+  assert.equal(output.choices[0].finish_reason, "tool_calls");
   assert.equal(output.usage.total_tokens, 3);
 });
 
-test("uses delta text when Codex's terminal snapshot omits output", () => {
+test("uses text deltas when Codex terminal snapshot omits output", () => {
   const sse = 'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"proxy-ok"}\n\nevent: response.completed\ndata: {"type":"response.completed","response":{"id":"resp_done","status":"completed","output":[]}}\n\n';
-  assert.equal(responseText(parseResponsesSse(sse)), "proxy-ok");
+  const normalized = fromCodexResponses("gpt-5.6-terra", parseCodexResponsesSse(sse));
+  assert.deepEqual(normalized.content, [{ type: "text", text: "proxy-ok" }]);
 });
 
-test("uses the completed Responses event from SSE", () => {
-  const sse = 'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"partial"}\n\nevent: response.completed\ndata: {"type":"response.completed","response":{"id":"resp_done","status":"completed","output_text":"complete"}}\n\n';
-  const payload = parseResponsesSse(sse);
-  assert.equal(payload.id, "resp_done");
-  assert.equal(responseText(payload), "complete");
-});
-
-test("emits a minimal OpenAI chat.completion SSE for stream clients", () => {
-  const sse = toChatCompletionSse("gpt-5.6-terra", { id: "resp_stream", status: "completed", output_text: "hello-stream" });
-  assert.match(sse, /data: .*hello-stream/);
+test("emits Chat Completions SSE including tool calls", () => {
+  const sse = toChatCompletionSse("gpt-5.6-terra", {
+    id: "resp_stream",
+    content: [{ type: "text", text: "hello-stream" }],
+    toolCalls: [{ id: "call_stream", type: "function", function: { name: "terminal", arguments: "{}" } }],
+    finishReason: "tool_calls",
+  });
+  assert.match(sse, /hello-stream/);
+  assert.match(sse, /tool_calls/);
   assert.match(sse, /chat\.completion\.chunk/);
   assert.match(sse, /data: \[DONE\]/);
 });

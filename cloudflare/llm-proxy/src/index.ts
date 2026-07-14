@@ -1,13 +1,40 @@
-import { codexResponse, type Env } from "./codex";
-import { providerForModel, SUPPORTED_MODELS } from "./models";
+import type { Env } from "./codex";
+import { adapterForModel, SUPPORTED_MODELS } from "./models";
 import {
+  ChatCompletionRequestError,
   errorResponse,
-  parseResponsesSse,
+  normalizeChatCompletionRequest,
   toChatCompletion,
   toChatCompletionSse,
-  toResponsesInput,
-  type ChatCompletionRequest,
+  UpstreamError,
 } from "./openai";
+
+function decodeBase64Url(value: string): Uint8Array | null {
+  if (!/^[A-Za-z0-9_-]+$/.test(value)) return null;
+  try {
+    const padded = value.replaceAll("-", "+").replaceAll("_", "/") + "=".repeat((4 - (value.length % 4)) % 4);
+    const binary = atob(padded);
+    return Uint8Array.from(binary, (char) => char.charCodeAt(0));
+  } catch {
+    return null;
+  }
+}
+
+/** Validate the gateway's short-lived HMAC capability before spending relay credentials. */
+async function validCapability(env: Env, authorization: string | null): Promise<boolean> {
+  const token = authorization?.match(/^Bearer ([A-Za-z0-9_-]+\.[A-Za-z0-9_-]+)$/)?.[1];
+  if (!token) return false;
+  const [payloadPart, signaturePart] = token.split(".");
+  const payload = decodeBase64Url(payloadPart);
+  const signature = decodeBase64Url(signaturePart);
+  if (!payload || !signature || payload.byteLength > 1024 || signature.byteLength !== 32) return false;
+  let parsed: { sub?: unknown; exp?: unknown };
+  try { parsed = JSON.parse(new TextDecoder().decode(payload)); } catch { return false; }
+  const now = Math.floor(Date.now() / 1000);
+  if (typeof parsed.sub !== "string" || !parsed.sub || typeof parsed.exp !== "number" || !Number.isInteger(parsed.exp) || parsed.exp < now || parsed.exp > now + 16 * 60) return false;
+  const key = await crypto.subtle.importKey("raw", new TextEncoder().encode(env.LLM_CAPABILITY_SECRET), { name: "HMAC", hash: "SHA-256" }, false, ["verify"]);
+  return crypto.subtle.verify("HMAC", key, signature, payload);
+}
 
 export async function handleRequest(request: Request, env: Env): Promise<Response> {
   const url = new URL(request.url);
@@ -20,41 +47,26 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
   }
   if (request.method !== "POST" || url.pathname !== "/v1/chat/completions") return errorResponse(404, "Not found.", "not_found");
 
-  // Intentional temporary contract: require a capability-token-shaped bearer
-  // credential now, but do not verify or authorize it until the detector ships.
-  const authorization = request.headers.get("Authorization");
-  if (!authorization?.startsWith("Bearer ") || authorization.length <= 7) {
-    return errorResponse(401, "A capability token is required.", "missing_capability_token");
+  // Only the Telegram gateway can mint this short-lived HMAC capability.
+  if (!(await validCapability(env, request.headers.get("Authorization")))) {
+    return errorResponse(401, "A valid capability token is required.", "invalid_capability_token");
   }
 
-  let input: ChatCompletionRequest;
-  try { input = await request.json() as ChatCompletionRequest; } catch { return errorResponse(400, "Request body must be JSON.", "invalid_json"); }
-  if (!input.model) return errorResponse(400, "'model' is required.", "model_required");
-  if (!Array.isArray(input.messages) || input.messages.length === 0) return errorResponse(400, "'messages' must be a non-empty array.", "messages_required");
-  if (!providerForModel(input.model)) return errorResponse(404, `The model '${input.model}' is not available.`, "model_not_found");
+  let input: ReturnType<typeof normalizeChatCompletionRequest>;
+  try {
+    input = normalizeChatCompletionRequest(await request.json());
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Request body must be JSON.";
+    return errorResponse(400, message, error instanceof ChatCompletionRequestError ? "invalid_request" : "invalid_json");
+  }
+
+  const adapter = adapterForModel(input.model);
+  if (!adapter) return errorResponse(404, `The model '${input.model}' is not available.`, "model_not_found");
 
   try {
-    const upstream = await codexResponse(env, {
-      model: input.model,
-      // The ChatGPT/Codex backend rejects persisted Responses objects.
-      store: false,
-      stream: true,
-      input: toResponsesInput(input.messages),
-      // ChatGPT's Codex Responses endpoint rejects the public Responses API's
-      // max_output_tokens field.  Accept OpenAI-compatible client caps at the
-      // edge, but do not forward an unsupported parameter upstream.
-      ...(typeof input.temperature === "number" ? { temperature: input.temperature } : {}),
-    });
-    const raw = await upstream.text();
-    if (!upstream.ok) {
-      try { return Response.json(JSON.parse(raw), { status: upstream.status }); }
-      catch { return errorResponse(502, `Codex upstream returned HTTP ${upstream.status}.`, "upstream_error"); }
-    }
-    const payload = parseResponsesSse(raw);
-    // Hermes oneshot requests stream=true; return OpenAI-compatible SSE while
-    // still aggregating Codex server-side (no provider credentials in sandboxes).
+    const result = await adapter.complete(env, input);
     if (input.stream) {
-      return new Response(toChatCompletionSse(input.model, payload), {
+      return new Response(toChatCompletionSse(input.model, result), {
         status: 200,
         headers: {
           "content-type": "text/event-stream; charset=utf-8",
@@ -63,9 +75,11 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
         },
       });
     }
-    return Response.json(toChatCompletion(input.model, payload));
+    return Response.json(toChatCompletion(input.model, result));
   } catch (error) {
-    const message = error instanceof Error ? error.message : "Codex upstream request failed.";
+    if (error instanceof ChatCompletionRequestError) return errorResponse(400, error.message, "invalid_request");
+    if (error instanceof UpstreamError && error.payload !== undefined) return Response.json(error.payload, { status: error.status });
+    const message = error instanceof Error ? error.message : "Upstream request failed.";
     return errorResponse(502, message, "upstream_error");
   }
 }

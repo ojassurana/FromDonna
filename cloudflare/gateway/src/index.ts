@@ -6,27 +6,27 @@
  * with a short-lived capability token only.
  */
 
+import {
+  normalizeTelegramUpdate,
+  renderTelegramActions,
+  type HarnessReply,
+  type NormalizedTelegramEvent,
+  type TelegramUpdate,
+} from "./telegram";
+
 export interface Env {
   FROMDONNA_ROUTING: D1Database;
   TELEGRAM_BOT_TOKEN: string;
   TELEGRAM_WEBHOOK_SECRET: string;
   E2B_API_KEY: string;
   WORKER_TO_HARNESS_SECRET: string;
+  /** HMAC key shared only with the LLM proxy for short-lived turn capability tokens. */
+  LLM_CAPABILITY_SECRET: string;
   E2B_TEMPLATE: string;
   HARNESS_PORT: string;
   /** Optional override; defaults to e2b.dev when E2B omits domain. */
   E2B_SANDBOX_DOMAIN?: string;
 }
-
-type TelegramUpdate = {
-  update_id: number;
-  message?: {
-    message_id: number;
-    chat: { id: number | string };
-    from?: { id: number | string };
-    text?: string;
-  };
-};
 
 type SandboxRow = {
   telegram_user_id: string;
@@ -38,7 +38,6 @@ type SandboxRow = {
 };
 
 type E2bSandbox = { sandboxID: string; domain?: string | null };
-type HarnessReply = { text?: string };
 
 const json = (body: unknown, status = 200) => Response.json(body, { status });
 const DEFAULT_SANDBOX_DOMAIN = "e2b.dev";
@@ -63,9 +62,18 @@ function harnessBaseUrl(env: Env, sandboxId: string, domain: string | null | und
   return `https://${port}-${sandboxId}.${sandboxDomain(env, domain)}`;
 }
 
-/** Non-provider capability for Hermes → LLM proxy. Proxy currently requires any non-empty Bearer. */
-function mintLlmCapability(userId: string): string {
-  return `fd_cap_${userId}_${crypto.randomUUID()}`;
+/** URL-safe HMAC capability for one Hermes → proxy turn; never a provider credential. */
+function encodeBase64Url(bytes: Uint8Array): string {
+  let binary = "";
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary).replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/, "");
+}
+
+async function mintLlmCapability(env: Env, userId: string): Promise<string> {
+  const payload = new TextEncoder().encode(JSON.stringify({ sub: userId, exp: Math.floor(Date.now() / 1000) + 15 * 60 }));
+  const key = await crypto.subtle.importKey("raw", new TextEncoder().encode(required(env, "LLM_CAPABILITY_SECRET")), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  const signature = new Uint8Array(await crypto.subtle.sign("HMAC", key, payload));
+  return `${encodeBase64Url(payload)}.${encodeBase64Url(signature)}`;
 }
 
 async function telegram(env: Env, method: string, body: Record<string, unknown>): Promise<void> {
@@ -231,7 +239,7 @@ async function provision(env: Env, telegramUserId: string): Promise<SandboxRow> 
   return row;
 }
 
-async function sendTurn(env: Env, row: SandboxRow, update: TelegramUpdate): Promise<HarnessReply> {
+async function sendTurn(env: Env, row: SandboxRow, event: NormalizedTelegramEvent): Promise<HarnessReply> {
   await ensureSandboxRunning(env, row.e2b_sandbox_id);
   // Best-effort re-bootstrap: no-ops if already configured with the same secret.
   try {
@@ -241,7 +249,7 @@ async function sendTurn(env: Env, row: SandboxRow, update: TelegramUpdate): Prom
   }
 
   const url = `${harnessBaseUrl(env, row.e2b_sandbox_id, row.e2b_sandbox_domain)}/turn`;
-  const capability = mintLlmCapability(row.user_id);
+  const capability = await mintLlmCapability(env, row.user_id);
   const response = await fetch(url, {
     method: "POST",
     headers: {
@@ -251,10 +259,13 @@ async function sendTurn(env: Env, row: SandboxRow, update: TelegramUpdate): Prom
     },
     body: JSON.stringify({
       userId: row.user_id,
+      // `event` is the transport contract. Keep the legacy fields while the
+      // current template rolls forward so ordinary text turns remain live.
+      event,
       gateway: "telegram",
-      gatewayChatId: String(update.message?.chat.id ?? ""),
-      gatewayMessageId: String(update.message?.message_id ?? ""),
-      text: update.message?.text ?? "",
+      gatewayChatId: event.conversationId,
+      gatewayMessageId: event.type === "message" ? event.message.id : (event.callback.messageId ?? ""),
+      text: event.type === "message" ? (event.message.text ?? "") : (event.callback.data ?? ""),
     }),
   });
   if (!response.ok) {
@@ -298,12 +309,12 @@ async function resolveReadyRow(env: Env, telegramUserId: string, chatId: string)
   return row;
 }
 
-async function processTelegramMessage(env: Env, update: TelegramUpdate): Promise<void> {
-  const message = update.message;
-  if (!message?.from || !message.text?.trim()) return;
+async function processTelegramUpdate(env: Env, update: TelegramUpdate): Promise<void> {
+  const event = normalizeTelegramUpdate(update);
+  if (!event) return;
 
-  const telegramUserId = String(message.from.id);
-  const chatId = String(message.chat.id);
+  const telegramUserId = event.actorId;
+  const chatId = event.conversationId;
 
   try {
     const resolved = await resolveReadyRow(env, telegramUserId, chatId);
@@ -315,23 +326,20 @@ async function processTelegramMessage(env: Env, update: TelegramUpdate): Promise
       return;
     }
 
-    const reply = await sendTurn(env, resolved, update);
-    const text = reply.text?.trim();
-    if (text) {
-      // Telegram hard limit ~4096; keep replies deliverable.
-      const chunks: string[] = [];
-      for (let i = 0; i < text.length; i += 4000) chunks.push(text.slice(i, i + 4000));
-      for (const chunk of chunks) {
-        await telegram(env, "sendMessage", { chat_id: chatId, text: chunk });
-      }
-    } else {
+    const reply = await sendTurn(env, resolved, event);
+    const calls = renderTelegramActions(reply, chatId, event.type === "callback" ? event.callback.id : undefined);
+    if (calls.length > 0) {
+      for (const call of calls) await telegram(env, call.method, call.body);
+    } else if (!Array.isArray(reply.actions)) {
+      // Preserve the old `{ text: "" }` harness response behavior. An explicit
+      // empty action list is intentionally silent (useful for callback turns).
       await telegram(env, "sendMessage", {
         chat_id: chatId,
         text: "I got that, but had nothing to say back. Try again?",
       });
     }
   } catch (error) {
-    console.error(error instanceof Error ? error.message : "processTelegramMessage failed");
+    console.error(error instanceof Error ? error.message : "processTelegramUpdate failed");
     try {
       await telegram(env, "sendMessage", {
         chat_id: chatId,
@@ -350,7 +358,7 @@ async function handleTelegram(request: Request, env: Env, ctx: ExecutionContext)
 
   const update = await request.json<TelegramUpdate>();
   // ACK Telegram quickly; do provision + Hermes turn in the background.
-  ctx.waitUntil(processTelegramMessage(env, update));
+  ctx.waitUntil(processTelegramUpdate(env, update));
   return json({ ok: true });
 }
 

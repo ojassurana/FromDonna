@@ -3,10 +3,25 @@
 # LLM credentials never live here — only a per-turn capability token from the Worker.
 model:
   provider: custom
-  base_url: "https://fromdonna-llm-proxy.code-df4.workers.dev/v1"
   default: "gpt-5.6-terra"
+
+# Named custom provider intentionally reads the per-turn, Worker-minted
+# capability. Hermes will not send OPENAI_API_KEY to an unrelated host.
+providers:
+  custom:
+    name: FromDonna LLM Proxy
+    base_url: "https://fromdonna-llm-proxy.code-df4.workers.dev/v1"
+    key_env: FROMDONNA_LLM_CAPABILITY
+    default_model: "gpt-5.6-terra"
+    api_mode: chat_completions
 
 display:
   streaming: false
+
+plugins:
+  # Template-packaged transport extension. It is exposed only in a harness
+  # child process that receives a request-scoped action file path.
+  enabled:
+    - fromdonna_transport
 
 agent: {}
