@@ -216,7 +216,7 @@ class GatewayRuntime:
         async def _run() -> list[dict[str, Any]]:
             from gateway.config import Platform
             from gateway.platforms.base import MessageEvent, MessageType
-            from gateway.session import SessionSource
+            from gateway.session import SessionSource, build_session_key
 
             self._bot.calls.clear()
             source = SessionSource(
@@ -253,11 +253,54 @@ class GatewayRuntime:
                     reply_to_text=reply_to_text,
                 )
             # Official adapter entrypoint (same as real Telegram updates).
+            # CRITICAL: handle_message() returns immediately after spawning the
+            # per-session background task. If we collect bot.calls right away,
+            # the Worker gets an empty action list and the user sees silence.
             await self._adapter.handle_message(event)
+            await self._wait_for_session_turn(source)
             return _calls_to_actions(self._bot.calls)
 
         future = asyncio.run_coroutine_threadsafe(_run(), self._loop)
         return future.result(timeout=840)
+
+    async def _wait_for_session_turn(self, source: Any) -> None:
+        """Block until the adapter finishes the session task for this inbound."""
+        from gateway.session import build_session_key
+
+        assert self._adapter is not None
+        extra = getattr(self._adapter.config, "extra", {}) or {}
+        session_key = build_session_key(
+            source,
+            group_sessions_per_user=extra.get("group_sessions_per_user", True),
+            thread_sessions_per_user=extra.get("thread_sessions_per_user", False),
+        )
+
+        task = None
+        for _ in range(100):  # up to ~2s for task registration
+            task = self._adapter._session_tasks.get(session_key)
+            if task is not None:
+                break
+            # Inline command paths may complete without a session task.
+            if session_key not in self._adapter._active_sessions and not self._adapter._session_tasks:
+                if self._bot and self._bot.calls:
+                    return
+            await asyncio.sleep(0.02)
+
+        if task is not None:
+            try:
+                await task
+            except asyncio.CancelledError:
+                logger.warning("gateway session task cancelled for %s", session_key)
+            except Exception:
+                logger.exception("gateway session task failed for %s", session_key)
+            return
+
+        # Fallback: wait until the session guard clears (inline/busy paths).
+        deadline = asyncio.get_event_loop().time() + 840
+        while session_key in self._adapter._active_sessions:
+            if asyncio.get_event_loop().time() >= deadline:
+                raise TimeoutError(f"gateway session still active after timeout: {session_key}")
+            await asyncio.sleep(0.05)
 
 
 def _inline_keyboard_to_buttons(reply_markup: Any) -> list[list[dict[str, str]]] | None:
