@@ -392,6 +392,31 @@ async function processTelegramUpdate(env: Env, update: TelegramUpdate): Promise<
   }
 }
 
+async function rebindTelegramWebhook(env: Env): Promise<Response> {
+  const base = workerPublicUrl(env);
+  const url = `${base}/telegram/webhook`;
+  // Official Hermes UX needs callbacks (buttons), edits, and media messages.
+  const allowed_updates = [
+    "message",
+    "edited_message",
+    "callback_query",
+    "inline_query",
+    "chosen_inline_result",
+    "my_chat_member",
+    "chat_member",
+    "chat_join_request",
+    "message_reaction",
+    "message_reaction_count",
+  ];
+  const result = await telegram(env, "setWebhook", {
+    url,
+    secret_token: required(env, "TELEGRAM_WEBHOOK_SECRET"),
+    allowed_updates,
+    drop_pending_updates: false,
+  });
+  return json({ ok: true, webhook: url, allowed_updates, result });
+}
+
 async function handleTelegram(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
   if (request.headers.get("X-Telegram-Bot-Api-Secret-Token") !== required(env, "TELEGRAM_WEBHOOK_SECRET")) {
     return new Response("Unauthorized", { status: 401 });
@@ -408,6 +433,14 @@ export default {
     try {
       if (request.method === "GET" && url.pathname === "/health") {
         return json({ ok: true, service: "fromdonna-telegram-gateway", mode: "official-telegram-proxy" });
+      }
+
+      // Ops: rebind Telegram webhook with full allowed_updates (auth via harness secret).
+      if (request.method === "POST" && url.pathname === "/admin/rebind-webhook") {
+        const auth = request.headers.get("authorization") || "";
+        const expected = `Bearer ${required(env, "WORKER_TO_HARNESS_SECRET")}`;
+        if (auth !== expected) return new Response("Unauthorized", { status: 401 });
+        return await rebindTelegramWebhook(env);
       }
 
       // Official Hermes TelegramAdapter Bot API reverse proxy (token never leaves Worker).

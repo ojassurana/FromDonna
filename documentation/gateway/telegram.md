@@ -203,10 +203,20 @@ curl -sS "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/setWebhook" \
   -d "{
     \"url\": \"https://fromdonna-telegram-gateway.code-df4.workers.dev/telegram/webhook\",
     \"secret_token\": \"${TELEGRAM_WEBHOOK_SECRET}\",
-    \"allowed_updates\": [\"message\"],
-    \"drop_pending_updates\": true
+    \"allowed_updates\": [\"message\", \"edited_message\", \"callback_query\", \"inline_query\", \"chosen_inline_result\", \"my_chat_member\", \"chat_member\", \"chat_join_request\", \"message_reaction\", \"message_reaction_count\"],
+    \"drop_pending_updates\": false
   }"
 ```
+
+Or (uses Worker secrets, no token in shell):
+
+```bash
+SECRET="$WORKER_TO_HARNESS_SECRET"
+curl -sS -X POST "https://fromdonna-telegram-gateway.code-df4.workers.dev/admin/rebind-webhook" \
+  -H "authorization: Bearer ${SECRET}"
+```
+
+**Critical:** `allowed_updates` must include `callback_query` or inline keyboard button presses never reach the Worker.
 
 ### Live logs
 

@@ -165,11 +165,39 @@ class GatewayRuntime:
             if tg_update is None:
                 raise RuntimeError("Invalid Telegram update payload")
 
+            cq = getattr(tg_update, "callback_query", None)
+            if cq is not None:
+                state_keys = list(getattr(self._adapter, "_model_picker_state", {}).keys())
+                logger.info(
+                    "inject callback_query id=%s data=%r chat=%s picker_state_keys=%s handlers=%s",
+                    getattr(cq, "id", None),
+                    getattr(cq, "data", None),
+                    getattr(getattr(getattr(cq, "message", None), "chat", None), "id", None),
+                    state_keys,
+                    len(getattr(app, "handlers", {}) or {}),
+                )
+
             # Snapshot active session tasks before process_update.
             before = set(getattr(self._adapter, "_session_tasks", {}).keys())
-            await app.process_update(tg_update)
+            try:
+                await app.process_update(tg_update)
+            except Exception:
+                logger.exception("Application.process_update failed for update_id=%s", update.get("update_id"))
+                raise
             await self._wait_for_new_or_active_sessions(before)
-            return {"ok": True}
+
+            if cq is not None:
+                # Ensure callback spinner is cleared even if a Hermes handler forgot answer().
+                try:
+                    await cq.answer()
+                except Exception as exc:
+                    logger.info("callback answer after process_update: %s", exc)
+
+            return {
+                "ok": True,
+                "kind": "callback" if cq is not None else "message",
+                "callback_data": getattr(cq, "data", None) if cq is not None else None,
+            }
 
         future = asyncio.run_coroutine_threadsafe(_run(), self._loop)
         return future.result(timeout=840)
