@@ -420,24 +420,60 @@ def _agent_prompt(event: InboundEvent) -> str:
     return f"[Associated event context]\n{metadata}"
 
 
-def _hermes_command(prompt: str, session_id: str | None) -> list[str]:
-    command = [
-        HERMES_BINARY,
-        "chat",
-        "--query",
-        prompt,
-        "--quiet",
-        "--provider",
-        "custom",
-        "--model",
-        HERMES_MODEL,
-        "--source",
-        "fromdonna",
-    ]
-    if session_id:
-        # Do not use --continue: this is an explicit persisted session id.
-        command.extend(["--resume", session_id])
-    return command
+def _session_db():
+    """Open Hermes' official session store under this sandbox's HERMES_HOME."""
+    from hermes_state import SessionDB
+
+    return SessionDB(db_path=HERMES_HOME / "state.db")
+
+
+def _conversation_history(session_id: str | None) -> list[dict]:
+    """Load prior turns for the persisted Hermes session id."""
+    if not session_id:
+        return []
+    try:
+        db = _session_db()
+        try:
+            if hasattr(db, "get_messages_as_conversation"):
+                history = db.get_messages_as_conversation(session_id) or []
+            else:
+                history = db.get_messages(session_id) or []
+        finally:
+            with contextlib.suppress(Exception):
+                db.close()
+    except Exception:
+        return []
+    # Only pass ordinary chat roles into the agent loop.
+    cleaned: list[dict] = []
+    for message in history:
+        if not isinstance(message, dict):
+            continue
+        role = message.get("role")
+        content = message.get("content")
+        if role in {"user", "assistant", "system", "tool"} and content is not None:
+            cleaned.append(message)
+    return cleaned
+
+
+def _ensure_session_row(session_id: str | None) -> str:
+    """Create or reopen the one Hermes session owned by this sandbox."""
+    import uuid
+
+    db = _session_db()
+    try:
+        if session_id:
+            existing = db.get_session(session_id) if hasattr(db, "get_session") else None
+            if existing:
+                with contextlib.suppress(Exception):
+                    if hasattr(db, "reopen_session"):
+                        db.reopen_session(session_id)
+                return session_id
+        new_id = session_id or f"fromdonna-{uuid.uuid4().hex}"
+        db.create_session(new_id, "fromdonna", model=HERMES_MODEL)
+        return new_id
+    finally:
+        with contextlib.suppress(Exception):
+            db.close()
 
 
 def _invoke_hermes(
@@ -445,31 +481,90 @@ def _invoke_hermes(
     capability: str,
     session_id: str | None,
     action_file: Path,
+    *,
+    event: InboundEvent | None = None,
+    user_id: str | None = None,
+    chat_id: str | None = None,
+    message_id: str | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    """Run one non-interactive Hermes chat turn using the persisted session."""
-    env = os.environ | {
-        "HERMES_HOME": str(HERMES_HOME),
-        # The named custom provider resolves only this per-turn capability;
-        # never route it through OPENAI_API_KEY to a non-OpenAI host.
-        "FROMDONNA_LLM_CAPABILITY": capability,
-        # The template-packaged plugin can only record actions in this fresh,
-        # harness-selected file. It contains no recipient or channel secrets.
-        ACTION_FILE_ENV: str(action_file),
-    }
-    return subprocess.run(
-        _hermes_command(prompt, session_id),
-        cwd=str(HOME / "workspace"),
-        env=env,
-        text=True,
-        capture_output=True,
-        timeout=840,
-        check=False,
-    )
+    """Run one official Hermes Telegram-gateway turn (Worker is the edge only).
+
+    Uses GatewayRunner + TelegramAdapter inside the sandbox — the same codepath
+    as a normal Hermes Telegram bot — while the Cloudflare Worker still owns
+    the webhook and Bot API delivery.
+    """
+    os.environ["HERMES_HOME"] = str(HERMES_HOME)
+    os.environ["FROMDONNA_LLM_CAPABILITY"] = capability
+    os.environ[ACTION_FILE_ENV] = str(action_file)
+
+    try:
+        from gateway_runtime import get_gateway_runtime
+
+        runtime = get_gateway_runtime(str(HERMES_HOME))
+        # Prefer real Telegram ids from the Worker edge when provided.
+        resolved_user = (user_id or "1").removeprefix("telegram:") or "1"
+        resolved_chat = chat_id or resolved_user
+        callback_data = None
+        callback_id = None
+        reply_to_message_id = None
+        reply_to_text = None
+        text = prompt
+        if event is not None:
+            if event.callback is not None and event.callback.data:
+                callback_data = event.callback.data
+                callback_id = event.callback.id
+                text = event.text or event.callback.data
+            else:
+                text = event.text or prompt
+            if event.reply is not None:
+                reply_to_message_id = event.reply.messageId
+                reply_to_text = event.reply.text
+            if event.callback is not None and event.callback.messageId and not message_id:
+                message_id = event.callback.messageId
+
+        actions = runtime.handle_turn(
+            text=text,
+            user_id=resolved_user,
+            chat_id=resolved_chat,
+            message_id=message_id,
+            reply_to_message_id=reply_to_message_id,
+            reply_to_text=reply_to_text,
+            callback_data=callback_data,
+            callback_id=callback_id,
+            capability=capability,
+        )
+
+        with open(action_file, "a", encoding="utf-8") as handle:
+            for action in actions:
+                handle.write(json.dumps(action, ensure_ascii=False, separators=(",", ":")) + "\n")
+
+        final = ""
+        for action in actions:
+            if action.get("type") == "sendMessage" and action.get("text"):
+                final = str(action["text"])
+                break
+
+        effective_session_id = session_id or _ensure_session_row(None)
+        if session_id is None:
+            _persist_session_id(effective_session_id)
+
+        return subprocess.CompletedProcess(
+            args=["hermes-telegram-gateway", effective_session_id],
+            returncode=0,
+            stdout=final,
+            stderr="",
+        )
+    except Exception as exc:
+        return subprocess.CompletedProcess(
+            args=["hermes-telegram-gateway"],
+            returncode=1,
+            stdout="",
+            stderr=str(exc),
+        )
 
 
 def _new_session_since(before: set[str]) -> str | None:
-    # The source tag makes recovery deterministic. The all-session fallback
-    # keeps first-turn persistence working on older Hermes builds that omit it.
+    """Find a new Hermes session created during this turn."""
     for candidates in (_sessions(source="fromdonna"), _sessions()):
         for session_id in candidates:
             if session_id not in before:
@@ -478,8 +573,8 @@ def _new_session_since(before: set[str]) -> str | None:
 
 
 def _clean_stdout(stdout: str, session_id: str | None) -> str:
-    """Do not expose the CLI's quiet-mode session footer as a user message."""
-    text = stdout.strip()
+    """Strip residual runtime chrome; gateway path should already be clean."""
+    text = (stdout or "").strip()
     if not session_id or not text:
         return text
     lines = []
@@ -491,7 +586,14 @@ def _clean_stdout(stdout: str, session_id: str | None) -> str:
     return "\n".join(lines).strip()
 
 
-def _run_turn(event: InboundEvent, capability: str) -> tuple[str, str | None, list[OutboundAction]]:
+def _run_turn(
+    event: InboundEvent,
+    capability: str,
+    *,
+    user_id: str | None = None,
+    chat_id: str | None = None,
+    message_id: str | None = None,
+) -> tuple[str, str | None, list[OutboundAction]]:
     """Run an ordered turn and return its text, session id, and emitted actions."""
     with _serialized_turns():
         session_id = _load_session_id() or _recover_prior_session()
@@ -500,13 +602,19 @@ def _run_turn(event: InboundEvent, capability: str) -> tuple[str, str | None, li
             with _request_action_file() as action_file:
                 try:
                     completed = _invoke_hermes(
-                        _agent_prompt(event), capability, session_id, action_file
+                        _agent_prompt(event),
+                        capability,
+                        session_id,
+                        action_file,
+                        event=event,
+                        user_id=user_id,
+                        chat_id=chat_id,
+                        message_id=message_id,
                     )
                 except subprocess.TimeoutExpired as exc:
                     raise HTTPException(status_code=504, detail="agent_turn_timed_out") from exc
 
                 if completed.returncode != 0:
-                    # Do not return stderr: it can contain runtime details.
                     raise HTTPException(status_code=502, detail="agent_turn_failed")
                 try:
                     actions = _collect_actions(action_file)
@@ -516,10 +624,15 @@ def _run_turn(event: InboundEvent, capability: str) -> tuple[str, str | None, li
             raise HTTPException(status_code=502, detail="agent_actions_unavailable") from exc
 
         if session_id is None:
-            session_id = _new_session_since(before)
+            if (
+                isinstance(completed.args, (list, tuple))
+                and len(completed.args) > 1
+                and _valid_session_id(completed.args[1])
+            ):
+                session_id = str(completed.args[1])
+            else:
+                session_id = _new_session_since(before)
             if session_id is None:
-                # Never silently fall back to --continue: preserving the exact
-                # one-user conversation is more important than a partial reply.
                 raise HTTPException(status_code=502, detail="agent_session_not_persisted")
             _persist_session_id(session_id)
 
@@ -586,5 +699,11 @@ def turn(
     if not x_llm_capability or not x_llm_capability.strip():
         raise HTTPException(status_code=401, detail="missing_llm_capability")
 
-    text, session_id, actions = _run_turn(event, x_llm_capability.strip())
+    text, session_id, actions = _run_turn(
+        event,
+        x_llm_capability.strip(),
+        user_id=turn.userId,
+        chat_id=turn.gatewayChatId,
+        message_id=turn.gatewayMessageId,
+    )
     return _response(text, session_id, actions)

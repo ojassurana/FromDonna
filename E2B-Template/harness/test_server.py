@@ -45,11 +45,16 @@ def call_turn(payload):
 def test_first_turn_creates_and_persists_then_second_turn_resumes(monkeypatch):
     calls = []
 
-    def fake_invoke(prompt, capability, session_id, action_file):
-        calls.append((prompt, capability, session_id, server._hermes_command(prompt, session_id)))
+    def fake_invoke(prompt, capability, session_id, action_file, **_kwargs):
+        calls.append((prompt, capability, session_id))
         if session_id is None:
             create_session()
-        return subprocess.CompletedProcess([], 0, stdout="first reply\n", stderr="")
+            sid = "session-first"
+        else:
+            sid = session_id
+        return subprocess.CompletedProcess(
+            ["hermes-telegram-gateway", sid], 0, stdout="first reply\n", stderr=""
+        )
 
     monkeypatch.setattr(server, "_invoke_hermes", fake_invoke)
 
@@ -63,20 +68,19 @@ def test_first_turn_creates_and_persists_then_second_turn_resumes(monkeypatch):
     }
     assert second.sessionId == "session-first"
     assert calls[0][2] is None
-    assert "--resume" not in calls[0][3]
     assert calls[1][2] == "session-first"
-    assert calls[1][3][-2:] == ["--resume", "session-first"]
-    assert "--continue" not in calls[1][3]
     assert server._load_session_id() == "session-first"
 
 
 def test_normalized_event_is_rendered_as_neutral_agent_context(monkeypatch):
     received_prompts = []
 
-    def fake_invoke(prompt, capability, session_id, action_file):
+    def fake_invoke(prompt, capability, session_id, action_file, **_kwargs):
         received_prompts.append(prompt)
         create_session("session-event")
-        return subprocess.CompletedProcess([], 0, stdout="done", stderr="")
+        return subprocess.CompletedProcess(
+            ["hermes-telegram-gateway", "session-event"], 0, stdout="done", stderr=""
+        )
 
     monkeypatch.setattr(server, "_invoke_hermes", fake_invoke)
     response = call_turn(
@@ -131,7 +135,7 @@ def test_action_contract_supports_media_and_inline_buttons():
 def test_turn_collects_private_plugin_actions_and_deduplicates_final_text(monkeypatch):
     observed_action_files = []
 
-    def fake_invoke(prompt, capability, session_id, action_file):
+    def fake_invoke(prompt, capability, session_id, action_file, **_kwargs):
         del prompt, capability, session_id
         observed_action_files.append(action_file)
         assert action_file.parent == server.HERMES_HOME / server.ACTION_DIRECTORY_NAME
@@ -143,7 +147,9 @@ def test_turn_collects_private_plugin_actions_and_deduplicates_final_text(monkey
             encoding="utf-8",
         )
         create_session("session-actions")
-        return subprocess.CompletedProcess([], 0, stdout="Sent deliberately\n", stderr="")
+        return subprocess.CompletedProcess(
+            ["hermes-telegram-gateway", "session-actions"], 0, stdout="Sent deliberately\n", stderr=""
+        )
 
     monkeypatch.setattr(server, "_invoke_hermes", fake_invoke)
     response = call_turn(server.Turn(text="please send it"))
@@ -161,7 +167,7 @@ def test_turn_collects_private_plugin_actions_and_deduplicates_final_text(monkey
 def test_invalid_plugin_action_is_rejected_and_request_file_is_removed(monkeypatch):
     observed_action_files = []
 
-    def fake_invoke(prompt, capability, session_id, action_file):
+    def fake_invoke(prompt, capability, session_id, action_file, **_kwargs):
         del prompt, capability, session_id
         observed_action_files.append(action_file)
         action_file.write_text('{"type":"sendMessage","text":"x","recipient":"leak"}\n', encoding="utf-8")
@@ -184,7 +190,7 @@ def test_concurrent_turns_are_serialized(monkeypatch):
     active_lock = threading.Lock()
     calls = []
 
-    def fake_invoke(prompt, capability, session_id, action_file):
+    def fake_invoke(prompt, capability, session_id, action_file, **_kwargs):
         nonlocal active, maximum_active
         with active_lock:
             active += 1
@@ -193,7 +199,12 @@ def test_concurrent_turns_are_serialized(monkeypatch):
         time.sleep(0.05)
         with active_lock:
             active -= 1
-        return subprocess.CompletedProcess([], 0, stdout=f"reply: {prompt}", stderr="")
+        return subprocess.CompletedProcess(
+            ["hermes-telegram-gateway", "session-existing"],
+            0,
+            stdout=f"reply: {prompt}",
+            stderr="",
+        )
 
     monkeypatch.setattr(server, "_invoke_hermes", fake_invoke)
     with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
@@ -213,7 +224,9 @@ def test_success_without_a_created_session_is_not_silently_continued(monkeypatch
     monkeypatch.setattr(
         server,
         "_invoke_hermes",
-        lambda prompt, capability, session_id, action_file: subprocess.CompletedProcess([], 0, stdout="reply", stderr=""),
+        lambda prompt, capability, session_id, action_file, **_kwargs: subprocess.CompletedProcess(
+            ["hermes-telegram-gateway"], 0, stdout="reply", stderr=""
+        ),
     )
 
     with pytest.raises(HTTPException) as exc:

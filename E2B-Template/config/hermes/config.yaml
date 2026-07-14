@@ -1,12 +1,11 @@
 # Agent-only configuration baked into every FromDonna sandbox.
-# The Telegram Worker owns channels; the sandbox only receives /turn requests.
-# LLM credentials never live here — only a per-turn capability token from the Worker.
+# Cloudflare Worker = Telegram edge (webhook + provision + Bot API delivery).
+# Sandbox = official Hermes Telegram gateway runtime (GatewayRunner + TelegramAdapter).
+
 model:
   provider: custom
   default: "gpt-5.6-terra"
 
-# Named custom provider intentionally reads the per-turn, Worker-minted
-# capability. Hermes will not send OPENAI_API_KEY to an unrelated host.
 providers:
   custom:
     name: FromDonna LLM Proxy
@@ -17,11 +16,25 @@ providers:
 
 display:
   streaming: false
+  tool_progress: false
+
+# Official Hermes Telegram tool surface inside the sandbox.
+platform_toolsets:
+  telegram:
+    - hermes-telegram
+  api_server:
+    - hermes-api-server
+  cli:
+    - hermes-cli
 
 plugins:
-  # Template-packaged transport extension. It is exposed only in a harness
-  # child process that receives a request-scoped action file path.
   enabled:
     - fromdonna_transport
+
+# Telegram platform is owned by the in-sandbox GatewayRunner bridge.
+# The Bot token is a stub — Worker owns real Bot API delivery.
+platforms:
+  telegram:
+    enabled: true
 
 agent: {}
