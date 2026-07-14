@@ -1,13 +1,17 @@
 """Official Hermes Telegram gateway runtime for one FromDonna sandbox.
 
-The Cloudflare Worker remains the Telegram edge (webhook, provision, render).
-Inside the sandbox we run the real Hermes GatewayRunner + TelegramAdapter
-codepath so slash commands, /model pickers, sessions, and tools behave like a
-normal Hermes Telegram gateway.
+Cloudflare Worker owns the real bot token + webhook.
+This process runs the stock Hermes TelegramAdapter + GatewayRunner with:
 
-Outbound Bot API calls are intercepted and converted into Worker-renderable
-actions (sendMessage / inlineButtons / media). No Telegram secret needs to live
-in the sandbox for the happy path — the Worker still sends to Telegram.
+  platforms.telegram.extra.base_url      → Worker Bot API proxy
+  platforms.telegram.extra.base_file_url → Worker file proxy
+  token                                  → per-user proxy token (not real TG token)
+
+Inbound: Worker POSTs the raw Telegram Update JSON to the harness, which calls
+``Application.process_update`` — the same handler graph as polling/webhook.
+Outbound: adapter Bot methods hit Worker proxy → api.telegram.org.
+
+No recording bot. No ``hermes chat -q``.
 """
 from __future__ import annotations
 
@@ -15,91 +19,20 @@ import asyncio
 import logging
 import os
 import threading
-from dataclasses import dataclass, field
-from types import SimpleNamespace
+from dataclasses import dataclass
 from typing import Any, Optional
 
 logger = logging.getLogger("fromdonna.gateway_runtime")
 
 
 @dataclass
-class CapturedOutbound:
-    """One Telegram Bot API call intercepted from the official adapter."""
-
-    method: str
-    kwargs: dict[str, Any] = field(default_factory=dict)
-
-
-class _RecordingBot:
-    """Drop-in stand-in for python-telegram-bot Bot used only for capture."""
-
-    def __init__(self) -> None:
-        self.calls: list[CapturedOutbound] = []
-        self._msg_id = 0
-
-    def _next_id(self) -> int:
-        self._msg_id += 1
-        return self._msg_id
-
-    def _record(self, method: str, kwargs: dict[str, Any]) -> SimpleNamespace:
-        self.calls.append(CapturedOutbound(method=method, kwargs=dict(kwargs)))
-        return SimpleNamespace(
-            message_id=self._next_id(),
-            chat=SimpleNamespace(id=kwargs.get("chat_id")),
-            text=kwargs.get("text") or kwargs.get("caption") or "",
-        )
-
-    async def send_message(self, **kwargs):
-        return self._record("send_message", kwargs)
-
-    async def send_photo(self, **kwargs):
-        return self._record("send_photo", kwargs)
-
-    async def send_document(self, **kwargs):
-        return self._record("send_document", kwargs)
-
-    async def send_audio(self, **kwargs):
-        return self._record("send_audio", kwargs)
-
-    async def send_video(self, **kwargs):
-        return self._record("send_video", kwargs)
-
-    async def send_voice(self, **kwargs):
-        return self._record("send_voice", kwargs)
-
-    async def send_animation(self, **kwargs):
-        return self._record("send_animation", kwargs)
-
-    async def send_sticker(self, **kwargs):
-        return self._record("send_sticker", kwargs)
-
-    async def send_media_group(self, **kwargs):
-        self.calls.append(CapturedOutbound(method="send_media_group", kwargs=dict(kwargs)))
-        return [SimpleNamespace(message_id=self._next_id())]
-
-    async def edit_message_text(self, **kwargs):
-        return self._record("edit_message_text", kwargs)
-
-    async def edit_message_reply_markup(self, **kwargs):
-        return self._record("edit_message_reply_markup", kwargs)
-
-    async def answer_callback_query(self, **kwargs):
-        self.calls.append(CapturedOutbound(method="answer_callback_query", kwargs=dict(kwargs)))
-        return True
-
-    async def send_chat_action(self, **kwargs):
-        # Typing indicators are intentionally dropped — Worker has no live typing
-        # bridge yet. Do not fail the turn for them.
-        return True
-
-    async def get_me(self):
-        return SimpleNamespace(id=0, username="fromdonna", first_name="Donna", is_bot=True)
-
-    async def delete_webhook(self, **kwargs):
-        return True
-
-    async def get_webhook_info(self):
-        return SimpleNamespace(url="", pending_update_count=0)
+class TelegramProxyConfig:
+    token: str
+    base_url: str
+    base_file_url: str
+    user_id: str
+    chat_id: str
+    gateway_user_id: str
 
 
 class GatewayRuntime:
@@ -112,11 +45,16 @@ class GatewayRuntime:
         self._thread: Optional[threading.Thread] = None
         self._runner = None
         self._adapter = None
-        self._bot: Optional[_RecordingBot] = None
         self._ready = threading.Event()
         self._start_error: Optional[BaseException] = None
+        self._proxy: Optional[TelegramProxyConfig] = None
+
+    def configure_proxy(self, proxy: TelegramProxyConfig) -> None:
+        self._proxy = proxy
 
     def start(self) -> None:
+        if not self._proxy:
+            raise RuntimeError("Telegram proxy config required before starting gateway")
         with self._lock:
             if self._thread and self._thread.is_alive():
                 return
@@ -128,37 +66,43 @@ class GatewayRuntime:
                 daemon=True,
             )
             self._thread.start()
-        if not self._ready.wait(timeout=60):
-            raise RuntimeError("Hermes Telegram gateway failed to start within 60s")
+        if not self._ready.wait(timeout=120):
+            raise RuntimeError("Hermes Telegram gateway failed to start within 120s")
         if self._start_error is not None:
             raise RuntimeError(f"Hermes Telegram gateway failed to start: {self._start_error}") from self._start_error
 
     def _run_loop(self) -> None:
         os.environ["HERMES_HOME"] = self.hermes_home
-        # Single-user sandbox: never run pairing / allowlist gates against the Worker-edge user.
+        # Single-user sandbox: Worker already authenticated the Telegram user.
         os.environ.setdefault("TELEGRAM_ALLOW_ALL_USERS", "true")
+        # Custom base_url points at Worker — do NOT rewrite traffic to Telegram IPs.
+        os.environ["HERMES_TELEGRAM_DISABLE_FALLBACK_IPS"] = "1"
+        # Never let the adapter open a real Telegram webhook/poll on the shared bot.
+        os.environ.pop("TELEGRAM_WEBHOOK_URL", None)
         try:
             from gateway.config import GatewayConfig, Platform, PlatformConfig, load_gateway_config
             from gateway.run import GatewayRunner
             from plugins.platforms.telegram.adapter import TelegramAdapter
+
+            assert self._proxy is not None
+            proxy = self._proxy
 
             try:
                 config = load_gateway_config()
             except Exception:
                 config = GatewayConfig()
 
-            # Force the official Telegram platform surface. Worker is the edge;
-            # this adapter never owns the Bot API webhook.
             config.platforms[Platform.TELEGRAM] = PlatformConfig(
                 enabled=True,
-                token="fromdonna-proxy",  # never used for real network I/O
+                token=proxy.token,
                 extra={
                     "group_sessions_per_user": True,
-                    # Allow the sole sandbox owner without pairing prompts.
                     "allow_all_users": True,
+                    # Official PTB/Hermes hook for local Bot API servers — we point at Worker.
+                    "base_url": proxy.base_url if proxy.base_url.endswith("/") else proxy.base_url,
+                    "base_file_url": proxy.base_file_url if proxy.base_file_url.endswith("/") else proxy.base_file_url,
                 },
             )
-            # Do not boot other platforms in the sandbox.
             for plat in list(config.platforms.keys()):
                 if plat != Platform.TELEGRAM:
                     config.platforms[plat].enabled = False
@@ -167,14 +111,7 @@ class GatewayRuntime:
             asyncio.set_event_loop(self._loop)
 
             self._runner = GatewayRunner(config)
-            self._bot = _RecordingBot()
             self._adapter = TelegramAdapter(config.platforms[Platform.TELEGRAM])
-            # Official adapter code, but network-less: inject a recording bot and
-            # mark the adapter connected without polling/webhook.
-            self._adapter._bot = self._bot
-            self._adapter._connected = True
-            self._adapter._running = True
-            self._adapter._webhook_mode = True  # skip getUpdates health probes
             self._adapter.set_message_handler(self._runner._handle_message)
             if hasattr(self._adapter, "set_busy_session_handler") and hasattr(self._runner, "_handle_busy_session"):
                 try:
@@ -183,106 +120,85 @@ class GatewayRuntime:
                     pass
             self._runner.adapters[Platform.TELEGRAM] = self._adapter
             self._runner._running = True
+
+            # Skip polling/webhook transport: Worker injects raw Updates.
+            # Still run official Application.initialize/start + handlers via connect().
+            async def _skip_polling(self_adapter, **_kwargs):  # type: ignore[no-untyped-def]
+                logger.info("[%s] FromDonna: skipping Telegram polling (Worker injects updates)", self_adapter.name)
+                return True
+
+            self._adapter._start_polling_resilient = _skip_polling.__get__(self._adapter, type(self._adapter))  # type: ignore[method-assign]
+
+            async def _connect() -> None:
+                ok = await self._adapter.connect()
+                if not ok:
+                    raise RuntimeError("TelegramAdapter.connect() returned False")
+                # Treat as webhook-like: no polling heartbeat needed against getUpdates.
+                self._adapter._webhook_mode = True
+                self._adapter._connected = True
+                self._adapter._running = True
+
+            self._loop.run_until_complete(_connect())
             self._ready.set()
             self._loop.run_forever()
-        except BaseException as exc:  # noqa: BLE001 — surface startup failure to caller
+        except BaseException as exc:  # noqa: BLE001
             self._start_error = exc
             self._ready.set()
             logger.exception("fromdonna gateway runtime failed")
 
-    def handle_turn(
-        self,
-        *,
-        text: str,
-        user_id: str,
-        chat_id: str,
-        message_id: str | None = None,
-        reply_to_message_id: str | None = None,
-        reply_to_text: str | None = None,
-        callback_data: str | None = None,
-        callback_id: str | None = None,
-        capability: str | None = None,
-    ) -> list[dict[str, Any]]:
-        """Run one inbound event through the official Telegram gateway path.
-
-        Returns Worker-neutral actions: sendMessage / inlineButtons / sendMedia-ish.
-        """
+    def inject_update(self, update: dict[str, Any], *, capability: str | None = None) -> dict[str, Any]:
+        """Feed one raw Telegram Update through the official adapter Application."""
         self.start()
         if capability:
             os.environ["FROMDONNA_LLM_CAPABILITY"] = capability
-            # Also mirror into the gateway thread env (same process).
-        assert self._loop is not None and self._adapter is not None and self._bot is not None
+        assert self._loop is not None and self._adapter is not None
 
-        async def _run() -> list[dict[str, Any]]:
-            from gateway.config import Platform
-            from gateway.platforms.base import MessageEvent, MessageType
-            from gateway.session import SessionSource, build_session_key
+        async def _run() -> dict[str, Any]:
+            from telegram import Update
 
-            self._bot.calls.clear()
-            source = SessionSource(
-                platform=Platform.TELEGRAM,
-                chat_id=str(chat_id),
-                user_id=str(user_id),
-                user_name=str(user_id),
-                chat_type="dm",
-                message_id=message_id,
-                # Worker already authenticated the Telegram user.
-                role_authorized=True,
-            )
-            if callback_data is not None:
-                # Prefer official callback handling when the adapter exposes it.
-                event = MessageEvent(
-                    text=callback_data if not text else text,
-                    message_type=MessageType.TEXT,
-                    source=source,
-                    message_id=message_id,
-                    metadata={
-                        "callback_query_id": callback_id,
-                        "callback_data": callback_data,
-                        "fromdonna_callback": True,
-                    },
-                    internal=False,
-                )
-            else:
-                event = MessageEvent(
-                    text=text or "",
-                    message_type=MessageType.TEXT,
-                    source=source,
-                    message_id=message_id,
-                    reply_to_message_id=reply_to_message_id,
-                    reply_to_text=reply_to_text,
-                )
-            # Official adapter entrypoint (same as real Telegram updates).
-            # CRITICAL: handle_message() returns immediately after spawning the
-            # per-session background task. If we collect bot.calls right away,
-            # the Worker gets an empty action list and the user sees silence.
-            await self._adapter.handle_message(event)
-            await self._wait_for_session_turn(source)
-            return _calls_to_actions(self._bot.calls)
+            app = getattr(self._adapter, "_app", None)
+            bot = getattr(self._adapter, "_bot", None)
+            if app is None or bot is None:
+                raise RuntimeError("Telegram Application not ready")
+
+            tg_update = Update.de_json(update, bot)
+            if tg_update is None:
+                raise RuntimeError("Invalid Telegram update payload")
+
+            # Snapshot active session tasks before process_update.
+            before = set(getattr(self._adapter, "_session_tasks", {}).keys())
+            await app.process_update(tg_update)
+            await self._wait_for_new_or_active_sessions(before)
+            return {"ok": True}
 
         future = asyncio.run_coroutine_threadsafe(_run(), self._loop)
         return future.result(timeout=840)
 
-    async def _wait_for_session_turn(self, source: Any) -> None:
-        """Block until the adapter finishes the session task for this inbound."""
-        from gateway.session import build_session_key
-
+    async def _wait_for_new_or_active_sessions(self, before_keys: set[str]) -> None:
+        """Wait until official handle_message background work finishes."""
         assert self._adapter is not None
-        extra = getattr(self._adapter.config, "extra", {}) or {}
-        session_key = build_session_key(
-            source,
-            group_sessions_per_user=extra.get("group_sessions_per_user", True),
-            thread_sessions_per_user=extra.get("thread_sessions_per_user", False),
-        )
 
+        # Allow handlers to schedule session tasks.
         task = None
-        for _ in range(100):  # up to ~2s for task registration
-            task = self._adapter._session_tasks.get(session_key)
-            if task is not None:
+        session_key = None
+        for _ in range(150):  # up to ~3s
+            tasks = getattr(self._adapter, "_session_tasks", {}) or {}
+            active = getattr(self._adapter, "_active_sessions", {}) or {}
+            # Prefer a newly created session key.
+            new_keys = [k for k in tasks.keys() if k not in before_keys]
+            if new_keys:
+                session_key = new_keys[0]
+                task = tasks.get(session_key)
                 break
-            # Inline command paths may complete without a session task.
-            if session_key not in self._adapter._active_sessions and not self._adapter._session_tasks:
-                if self._bot and self._bot.calls:
+            if tasks:
+                session_key = next(iter(tasks.keys()))
+                task = tasks.get(session_key)
+                break
+            if not active and not tasks:
+                # Command paths may finish inline with no session task.
+                await asyncio.sleep(0.02)
+                tasks = getattr(self._adapter, "_session_tasks", {}) or {}
+                if not tasks and not getattr(self._adapter, "_active_sessions", {}):
                     return
             await asyncio.sleep(0.02)
 
@@ -293,96 +209,25 @@ class GatewayRuntime:
                 logger.warning("gateway session task cancelled for %s", session_key)
             except Exception:
                 logger.exception("gateway session task failed for %s", session_key)
+            # Drain cascaded follow-ups briefly.
+            for _ in range(50):
+                tasks = getattr(self._adapter, "_session_tasks", {}) or {}
+                active = getattr(self._adapter, "_active_sessions", {}) or {}
+                if not tasks and not active:
+                    return
+                if session_key and session_key in tasks:
+                    try:
+                        await tasks[session_key]
+                    except Exception:
+                        logger.exception("gateway follow-up session task failed")
+                await asyncio.sleep(0.05)
             return
 
-        # Fallback: wait until the session guard clears (inline/busy paths).
         deadline = asyncio.get_event_loop().time() + 840
-        while session_key in self._adapter._active_sessions:
+        while getattr(self._adapter, "_active_sessions", {}):
             if asyncio.get_event_loop().time() >= deadline:
-                raise TimeoutError(f"gateway session still active after timeout: {session_key}")
+                raise TimeoutError("gateway session still active after timeout")
             await asyncio.sleep(0.05)
-
-
-def _inline_keyboard_to_buttons(reply_markup: Any) -> list[list[dict[str, str]]] | None:
-    if reply_markup is None:
-        return None
-    # python-telegram-bot InlineKeyboardMarkup or dict-shaped markup
-    inline = getattr(reply_markup, "inline_keyboard", None)
-    if inline is None and isinstance(reply_markup, dict):
-        inline = reply_markup.get("inline_keyboard")
-    if not inline:
-        return None
-    rows: list[list[dict[str, str]]] = []
-    for row in inline:
-        out_row: list[dict[str, str]] = []
-        for button in row:
-            text = getattr(button, "text", None) or (button.get("text") if isinstance(button, dict) else None)
-            if not text:
-                continue
-            callback = getattr(button, "callback_data", None)
-            url = getattr(button, "url", None)
-            if isinstance(button, dict):
-                callback = button.get("callback_data", callback)
-                url = button.get("url", url)
-            entry: dict[str, str] = {"text": str(text)}
-            if callback:
-                entry["callbackData"] = str(callback)
-            elif url:
-                entry["url"] = str(url)
-            else:
-                continue
-            out_row.append(entry)
-        if out_row:
-            rows.append(out_row)
-    return rows or None
-
-
-def _calls_to_actions(calls: list[CapturedOutbound]) -> list[dict[str, Any]]:
-    actions: list[dict[str, Any]] = []
-    for call in calls:
-        method = call.method
-        kw = call.kwargs
-        if method in {"send_message", "edit_message_text"}:
-            text = (kw.get("text") or "").strip()
-            buttons = _inline_keyboard_to_buttons(kw.get("reply_markup"))
-            if text:
-                actions.append({"type": "sendMessage", "text": text})
-            if buttons:
-                actions.append(
-                    {
-                        "type": "inlineButtons",
-                        "buttons": buttons,
-                        "targetActionIndex": len(actions) - 1 if text else None,
-                    }
-                )
-        elif method in {"send_photo", "send_document", "send_audio", "send_video", "send_voice", "send_animation"}:
-            # Prefer local path / URL if present; Worker can only fetch https/r2 today.
-            file = kw.get("photo") or kw.get("document") or kw.get("audio") or kw.get("video") or kw.get("voice") or kw.get("animation")
-            uri = None
-            if isinstance(file, str) and (file.startswith("https://") or file.startswith("r2://")):
-                uri = file
-            elif hasattr(file, "name") and isinstance(getattr(file, "name", None), str):
-                # Local file path — not yet Worker-addressable; surface as text notice.
-                caption = (kw.get("caption") or "").strip()
-                note = caption or f"(media attached: {getattr(file, 'name', 'file')})"
-                actions.append({"type": "sendMessage", "text": note})
-                continue
-            if uri:
-                actions.append(
-                    {
-                        "type": "sendMedia",
-                        "artifact": {"uri": uri},
-                        "caption": (kw.get("caption") or None),
-                    }
-                )
-            elif kw.get("caption"):
-                actions.append({"type": "sendMessage", "text": str(kw["caption"])})
-        elif method == "edit_message_reply_markup":
-            buttons = _inline_keyboard_to_buttons(kw.get("reply_markup"))
-            if buttons:
-                actions.append({"type": "inlineButtons", "buttons": buttons})
-        # answer_callback_query / send_chat_action intentionally ignored
-    return actions
 
 
 _RUNTIME: Optional[GatewayRuntime] = None
@@ -394,5 +239,10 @@ def get_gateway_runtime(hermes_home: str) -> GatewayRuntime:
     with _RUNTIME_LOCK:
         if _RUNTIME is None:
             _RUNTIME = GatewayRuntime(hermes_home)
-            _RUNTIME.start()
         return _RUNTIME
+
+
+def reset_gateway_runtime_for_tests() -> None:
+    global _RUNTIME
+    with _RUNTIME_LOCK:
+        _RUNTIME = None

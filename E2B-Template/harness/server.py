@@ -52,6 +52,7 @@ MAX_ACTIONS_PER_TURN = 50
 _state_lock = threading.Lock()
 _turn_lock = threading.Lock()
 _worker_secret: str | None = os.environ.get("WORKER_TO_HARNESS_SECRET") or None
+_telegram_proxy: dict | None = None
 
 
 class ReplyContext(BaseModel):
@@ -660,28 +661,114 @@ def _response(
 def health():
     with _state_lock:
         ready = bool(_worker_secret)
-    return {"ok": True, "service": "fromdonna-harness", "auth_ready": ready}
+        proxy_ready = bool(_telegram_proxy)
+    return {
+        "ok": True,
+        "service": "fromdonna-harness",
+        "auth_ready": ready,
+        "telegram_proxy_ready": proxy_ready,
+        "mode": "official-telegram-gateway",
+    }
+
+
+class TelegramProxyBootstrap(BaseModel):
+    """Worker-issued Bot API proxy credentials for official TelegramAdapter."""
+
+    token: str = Field(min_length=16, max_length=512)
+    baseUrl: str = Field(min_length=8, max_length=512)
+    baseFileUrl: str = Field(min_length=8, max_length=512)
+    userId: str = Field(min_length=1, max_length=128)
+    chatId: str = Field(min_length=1, max_length=128)
+    gatewayUserId: str = Field(min_length=1, max_length=128)
 
 
 class Bootstrap(BaseModel):
     secret: str = Field(min_length=16, max_length=256)
+    telegramProxy: TelegramProxyBootstrap | None = None
+
+
+class TelegramUpdateEnvelope(BaseModel):
+    """Raw Telegram Update JSON from the Worker webhook (official gateway inject)."""
+
+    update: dict
+
+
+def _apply_telegram_proxy(proxy: TelegramProxyBootstrap, *, start: bool = False) -> None:
+    """Configure official Hermes Telegram gateway against Worker proxy."""
+    from gateway_runtime import TelegramProxyConfig, get_gateway_runtime
+
+    runtime = get_gateway_runtime(str(HERMES_HOME))
+    runtime.configure_proxy(
+        TelegramProxyConfig(
+            token=proxy.token,
+            base_url=proxy.baseUrl,
+            base_file_url=proxy.baseFileUrl,
+            user_id=proxy.userId,
+            chat_id=proxy.chatId,
+            gateway_user_id=proxy.gatewayUserId,
+        )
+    )
+    if start:
+        runtime.start()
 
 
 @app.post("/bootstrap")
 def bootstrap(body: Bootstrap):
-    """One-time auth setup after sandbox create. Template warm-start cannot see create envVars."""
-    global _worker_secret
+    """Auth + official Telegram proxy config after sandbox create."""
+    global _worker_secret, _telegram_proxy
     secret = body.secret.strip()
     if len(secret) < 16:
         raise HTTPException(status_code=400, detail="invalid_secret")
+    proxy_to_apply: TelegramProxyBootstrap | None = None
     with _state_lock:
         if _worker_secret is not None:
-            # Idempotent if the same secret is re-sent; reject secret rotation attempts.
-            if secrets.compare_digest(_worker_secret, secret):
-                return {"ok": True, "already": True}
-            raise HTTPException(status_code=409, detail="already_bootstrapped")
-        _worker_secret = secret
-    return {"ok": True, "already": False}
+            if not secrets.compare_digest(_worker_secret, secret):
+                raise HTTPException(status_code=409, detail="already_bootstrapped")
+            already = True
+        else:
+            _worker_secret = secret
+            already = False
+
+        if body.telegramProxy is not None:
+            _telegram_proxy = body.telegramProxy.model_dump()
+            proxy_to_apply = body.telegramProxy
+
+    if proxy_to_apply is not None:
+        try:
+            _apply_telegram_proxy(proxy_to_apply)
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=f"telegram_gateway_start_failed: {exc}") from exc
+
+    return {"ok": True, "already": already, "telegram_proxy": bool(_telegram_proxy)}
+
+
+@app.post("/telegram/update")
+def telegram_update(
+    body: TelegramUpdateEnvelope,
+    authorization: str | None = Header(default=None),
+    x_llm_capability: str | None = Header(default=None),
+):
+    """Inject one raw Telegram Update into the official Hermes Telegram gateway."""
+    if not _authorized(authorization):
+        raise HTTPException(status_code=401, detail="unauthorized")
+    if not x_llm_capability or not x_llm_capability.strip():
+        raise HTTPException(status_code=401, detail="missing_llm_capability")
+    with _state_lock:
+        if not _telegram_proxy:
+            raise HTTPException(status_code=503, detail="telegram_proxy_not_configured")
+
+    os.environ["HERMES_HOME"] = str(HERMES_HOME)
+    os.environ["FROMDONNA_LLM_CAPABILITY"] = x_llm_capability.strip()
+
+    with _serialized_turns():
+        try:
+            from gateway_runtime import get_gateway_runtime
+
+            runtime = get_gateway_runtime(str(HERMES_HOME))
+            result = runtime.inject_update(body.update, capability=x_llm_capability.strip())
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=f"telegram_update_failed: {exc}") from exc
+    return {"ok": True, **(result if isinstance(result, dict) else {})}
 
 
 @app.post("/turn", response_model=TurnResponse)
