@@ -14,7 +14,7 @@ See also: [telegram.md](./telegram.md), [gateway.md](./gateway.md), [llm-proxy-w
     ▼
 fromdonna-telegram-gateway  (Cloudflare Worker)
     │  secrets: TELEGRAM_*, E2B_API_KEY, WORKER_TO_HARNESS_SECRET
-    │  D1: fromdonna-routing.telegram_user_sandboxes
+    │  D1: fromdonna-routing.user_agents (gateway-neutral)
     │
     ├─ provision ──► E2B Sandbox.create(fromdonna-hermes)
     │                   │
@@ -44,7 +44,7 @@ fromdonna-telegram-gateway  (Cloudflare Worker)
 | Telegram gateway | `https://fromdonna-telegram-gateway.code-df4.workers.dev` | `GET /health` |
 | LLM proxy | `https://fromdonna-llm-proxy.code-df4.workers.dev` | `GET /health` + chat completion |
 | Telegram webhook | Bot API `getWebhookInfo` | URL matches gateway; `last_error` null |
-| D1 | `fromdonna-routing` | `SELECT … FROM telegram_user_sandboxes` |
+| D1 | `fromdonna-routing` | `SELECT … FROM user_agents` |
 | E2B template | alias `fromdonna-hermes` | `npm run smoke` in `E2B-Template` |
 | Per-user harness | `https://8788-{id}.e2b.dev/health` | `auth_ready: true` after bootstrap |
 | Codex relay | `CODEX_RELAY_URL` in llm-proxy `wrangler.toml` | process up; proxy completion works |
@@ -70,7 +70,7 @@ curl -sS "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getWebhookInfo" \
 
 cd ~/FromDonna/cloudflare/gateway
 npx wrangler d1 execute fromdonna-routing --remote --command \
-  "SELECT telegram_user_id, status, e2b_sandbox_id, updated_at FROM telegram_user_sandboxes ORDER BY updated_at DESC LIMIT 10;"
+  "SELECT gateway, gateway_user_id, status, runtime_provider, runtime_id, updated_at FROM user_agents ORDER BY updated_at DESC LIMIT 10;"
 ```
 
 ---

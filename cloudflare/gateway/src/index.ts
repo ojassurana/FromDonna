@@ -28,12 +28,14 @@ export interface Env {
   E2B_SANDBOX_DOMAIN?: string;
 }
 
-type SandboxRow = {
-  telegram_user_id: string;
-  telegram_chat_id: string;
+type UserAgentRow = {
   user_id: string;
-  e2b_sandbox_id: string;
-  e2b_sandbox_domain: string | null;
+  gateway: string;
+  gateway_user_id: string;
+  gateway_conversation_id: string;
+  runtime_provider: "e2b";
+  runtime_id: string;
+  runtime_domain: string | null;
   status: "provisioning" | "ready" | "failed";
 };
 
@@ -43,8 +45,8 @@ const json = (body: unknown, status = 200) => Response.json(body, { status });
 const DEFAULT_SANDBOX_DOMAIN = "e2b.dev";
 const SANDBOX_TTL_SECONDS = 3600;
 
-function internalUserId(telegramUserId: string): string {
-  return `telegram:${telegramUserId}`;
+function internalUserId(gateway: string, gatewayUserId: string): string {
+  return `${gateway}:${gatewayUserId}`;
 }
 
 function required(env: Env, key: keyof Env): string {
@@ -88,7 +90,7 @@ async function telegram(env: Env, method: string, body: Record<string, unknown>)
   }
 }
 
-async function createSandbox(env: Env, telegramUserId: string): Promise<E2bSandbox> {
+async function createSandbox(env: Env, userId: string): Promise<E2bSandbox> {
   const response = await fetch("https://api.e2b.app/sandboxes", {
     method: "POST",
     headers: {
@@ -107,7 +109,7 @@ async function createSandbox(env: Env, telegramUserId: string): Promise<E2bSandb
         WORKER_TO_HARNESS_SECRET: required(env, "WORKER_TO_HARNESS_SECRET"),
         FROMDONNA_RUNTIME: "e2b",
       },
-      metadata: { fromdonna_user_id: internalUserId(telegramUserId) },
+      metadata: { fromdonna_user_id: userId },
     }),
   });
   if (!response.ok) {
@@ -166,89 +168,103 @@ async function bootstrapHarness(env: Env, sandboxId: string, domain: string | nu
   }
 }
 
-async function lookup(env: Env, telegramUserId: string): Promise<SandboxRow | null> {
+async function lookup(env: Env, gateway: string, gatewayUserId: string): Promise<UserAgentRow | null> {
   return env.FROMDONNA_ROUTING
     .prepare(
-      `SELECT telegram_user_id, telegram_chat_id, user_id, e2b_sandbox_id, e2b_sandbox_domain, status
-       FROM telegram_user_sandboxes WHERE telegram_user_id = ?1`,
+      `SELECT user_id, gateway, gateway_user_id, gateway_conversation_id,
+              runtime_provider, runtime_id, runtime_domain, status
+       FROM user_agents WHERE gateway = ?1 AND gateway_user_id = ?2`,
     )
-    .bind(telegramUserId)
-    .first<SandboxRow>();
+    .bind(gateway, gatewayUserId)
+    .first<UserAgentRow>();
 }
 
-/** Claim first-message provisioning atomically. Only the request that inserted the row may create E2B. */
-async function claimProvisioning(env: Env, telegramUserId: string, chatId: string): Promise<boolean> {
+/** Claim first-message provisioning atomically. Only the inserted user-agent row may create a runtime. */
+async function claimProvisioning(
+  env: Env,
+  gateway: string,
+  gatewayUserId: string,
+  gatewayConversationId: string,
+): Promise<boolean> {
   const placeholder = `provisioning:${crypto.randomUUID()}`;
   const result = await env.FROMDONNA_ROUTING
     .prepare(
-      `INSERT INTO telegram_user_sandboxes
-        (telegram_user_id, telegram_chat_id, user_id, e2b_sandbox_id, status, provisioning_started_at)
-       VALUES (?1, ?2, ?3, ?4, 'provisioning', CURRENT_TIMESTAMP)
-       ON CONFLICT(telegram_user_id) DO NOTHING`,
+      `INSERT INTO user_agents
+        (user_id, gateway, gateway_user_id, gateway_conversation_id, runtime_provider, runtime_id, status, provisioning_started_at)
+       VALUES (?1, ?2, ?3, ?4, 'e2b', ?5, 'provisioning', CURRENT_TIMESTAMP)
+       ON CONFLICT(gateway, gateway_user_id) DO NOTHING`,
     )
-    .bind(telegramUserId, chatId, internalUserId(telegramUserId), placeholder)
+    .bind(internalUserId(gateway, gatewayUserId), gateway, gatewayUserId, gatewayConversationId, placeholder)
     .run();
   return result.meta.changes === 1;
 }
 
 /** Recover from a previous failed provision so the user is not permanently stuck. */
-async function claimFailedRecovery(env: Env, telegramUserId: string, chatId: string): Promise<boolean> {
+async function claimFailedRecovery(
+  env: Env,
+  gateway: string,
+  gatewayUserId: string,
+  gatewayConversationId: string,
+): Promise<boolean> {
   const placeholder = `provisioning:${crypto.randomUUID()}`;
   const result = await env.FROMDONNA_ROUTING
     .prepare(
-      `UPDATE telegram_user_sandboxes
-       SET telegram_chat_id = ?2,
-           e2b_sandbox_id = ?3,
-           e2b_sandbox_domain = NULL,
+      `UPDATE user_agents
+       SET gateway_conversation_id = ?3,
+           runtime_id = ?4,
+           runtime_domain = NULL,
            status = 'provisioning',
            provisioning_started_at = CURRENT_TIMESTAMP,
            updated_at = CURRENT_TIMESTAMP
-       WHERE telegram_user_id = ?1 AND status = 'failed'`,
+       WHERE gateway = ?1 AND gateway_user_id = ?2 AND status = 'failed'`,
     )
-    .bind(telegramUserId, chatId, placeholder)
+    .bind(gateway, gatewayUserId, gatewayConversationId, placeholder)
     .run();
   return result.meta.changes === 1;
 }
 
-async function markFailed(env: Env, telegramUserId: string): Promise<void> {
+async function markFailed(env: Env, gateway: string, gatewayUserId: string): Promise<void> {
   await env.FROMDONNA_ROUTING
     .prepare(
-      `UPDATE telegram_user_sandboxes SET status = 'failed', updated_at = CURRENT_TIMESTAMP WHERE telegram_user_id = ?1`,
+      `UPDATE user_agents SET status = 'failed', updated_at = CURRENT_TIMESTAMP
+       WHERE gateway = ?1 AND gateway_user_id = ?2`,
     )
-    .bind(telegramUserId)
+    .bind(gateway, gatewayUserId)
     .run();
 }
 
-async function provision(env: Env, telegramUserId: string): Promise<SandboxRow> {
-  const sandbox = await createSandbox(env, telegramUserId);
+async function provision(env: Env, gateway: string, gatewayUserId: string): Promise<UserAgentRow> {
+  const userId = internalUserId(gateway, gatewayUserId);
+  const sandbox = await createSandbox(env, userId);
   const domain = sandbox.domain || DEFAULT_SANDBOX_DOMAIN;
   await waitForHarness(env, sandbox.sandboxID, domain);
   await bootstrapHarness(env, sandbox.sandboxID, domain);
 
   await env.FROMDONNA_ROUTING
     .prepare(
-      `UPDATE telegram_user_sandboxes
-       SET e2b_sandbox_id = ?2, e2b_sandbox_domain = ?3, status = 'ready', updated_at = CURRENT_TIMESTAMP
-       WHERE telegram_user_id = ?1 AND status = 'provisioning'`,
+      `UPDATE user_agents
+       SET runtime_id = ?3, runtime_domain = ?4, status = 'ready', updated_at = CURRENT_TIMESTAMP
+       WHERE gateway = ?1 AND gateway_user_id = ?2 AND status = 'provisioning'`,
     )
-    .bind(telegramUserId, sandbox.sandboxID, domain)
+    .bind(gateway, gatewayUserId, sandbox.sandboxID, domain)
     .run();
 
-  const row = await lookup(env, telegramUserId);
-  if (!row || row.status !== "ready") throw new Error("Sandbox was created but routing row was not finalized.");
+  const row = await lookup(env, gateway, gatewayUserId);
+  if (!row || row.status !== "ready") throw new Error("Runtime was created but the user-agent row was not finalized.");
   return row;
 }
 
-async function sendTurn(env: Env, row: SandboxRow, event: NormalizedTelegramEvent): Promise<HarnessReply> {
-  await ensureSandboxRunning(env, row.e2b_sandbox_id);
+async function sendTurn(env: Env, row: UserAgentRow, event: NormalizedTelegramEvent): Promise<HarnessReply> {
+  if (row.runtime_provider !== "e2b") throw new Error(`Unsupported runtime provider: ${row.runtime_provider}`);
+  await ensureSandboxRunning(env, row.runtime_id);
   // Best-effort re-bootstrap: no-ops if already configured with the same secret.
   try {
-    await bootstrapHarness(env, row.e2b_sandbox_id, row.e2b_sandbox_domain);
+    await bootstrapHarness(env, row.runtime_id, row.runtime_domain);
   } catch {
     // Harness may reject if already bootstrapped with a different secret after template rebuilds.
   }
 
-  const url = `${harnessBaseUrl(env, row.e2b_sandbox_id, row.e2b_sandbox_domain)}/turn`;
+  const url = `${harnessBaseUrl(env, row.runtime_id, row.runtime_domain)}/turn`;
   const capability = await mintLlmCapability(env, row.user_id);
   const response = await fetch(url, {
     method: "POST",
@@ -259,11 +275,9 @@ async function sendTurn(env: Env, row: SandboxRow, event: NormalizedTelegramEven
     },
     body: JSON.stringify({
       userId: row.user_id,
-      // `event` is the transport contract. Keep the legacy fields while the
-      // current template rolls forward so ordinary text turns remain live.
       event,
-      gateway: "telegram",
-      gatewayChatId: event.conversationId,
+      gateway: row.gateway,
+      gatewayChatId: row.gateway_conversation_id,
       gatewayMessageId: event.type === "message" ? event.message.id : (event.callback.messageId ?? ""),
       text: event.type === "message" ? (event.message.text ?? "") : (event.callback.data ?? ""),
     }),
@@ -275,37 +289,42 @@ async function sendTurn(env: Env, row: SandboxRow, event: NormalizedTelegramEven
   return response.json<HarnessReply>();
 }
 
-async function resolveReadyRow(env: Env, telegramUserId: string, chatId: string): Promise<SandboxRow | "provisioning"> {
-  let row = await lookup(env, telegramUserId);
+async function resolveReadyRow(
+  env: Env,
+  gateway: string,
+  gatewayUserId: string,
+  gatewayConversationId: string,
+): Promise<UserAgentRow | "provisioning"> {
+  let row = await lookup(env, gateway, gatewayUserId);
 
   if (!row) {
-    const claimed = await claimProvisioning(env, telegramUserId, chatId);
+    const claimed = await claimProvisioning(env, gateway, gatewayUserId, gatewayConversationId);
     if (claimed) {
       try {
-        return await provision(env, telegramUserId);
+        return await provision(env, gateway, gatewayUserId);
       } catch (error) {
-        await markFailed(env, telegramUserId);
+        await markFailed(env, gateway, gatewayUserId);
         throw error;
       }
     }
-    row = await lookup(env, telegramUserId);
+    row = await lookup(env, gateway, gatewayUserId);
   }
 
   if (row?.status === "failed") {
-    const claimed = await claimFailedRecovery(env, telegramUserId, chatId);
+    const claimed = await claimFailedRecovery(env, gateway, gatewayUserId, gatewayConversationId);
     if (claimed) {
       try {
-        return await provision(env, telegramUserId);
+        return await provision(env, gateway, gatewayUserId);
       } catch (error) {
-        await markFailed(env, telegramUserId);
+        await markFailed(env, gateway, gatewayUserId);
         throw error;
       }
     }
-    row = await lookup(env, telegramUserId);
+    row = await lookup(env, gateway, gatewayUserId);
   }
 
   if (!row || row.status === "provisioning") return "provisioning";
-  if (row.status !== "ready") throw new Error(`Unexpected sandbox status: ${row.status}`);
+  if (row.status !== "ready") throw new Error(`Unexpected agent runtime status: ${row.status}`);
   return row;
 }
 
@@ -313,28 +332,29 @@ async function processTelegramUpdate(env: Env, update: TelegramUpdate): Promise<
   const event = normalizeTelegramUpdate(update);
   if (!event) return;
 
-  const telegramUserId = event.actorId;
-  const chatId = event.conversationId;
+  const gateway = "telegram";
+  const gatewayUserId = event.actorId;
+  const gatewayConversationId = event.conversationId;
 
   try {
-    const resolved = await resolveReadyRow(env, telegramUserId, chatId);
+    const resolved = await resolveReadyRow(env, gateway, gatewayUserId, gatewayConversationId);
     if (resolved === "provisioning") {
       await telegram(env, "sendMessage", {
-        chat_id: chatId,
+        chat_id: gatewayConversationId,
         text: "Setting up your private assistant — one moment, then send that again.",
       });
       return;
     }
 
     const reply = await sendTurn(env, resolved, event);
-    const calls = renderTelegramActions(reply, chatId, event.type === "callback" ? event.callback.id : undefined);
+    const calls = renderTelegramActions(reply, gatewayConversationId, event.type === "callback" ? event.callback.id : undefined);
     if (calls.length > 0) {
       for (const call of calls) await telegram(env, call.method, call.body);
     } else if (!Array.isArray(reply.actions)) {
       // Preserve the old `{ text: "" }` harness response behavior. An explicit
       // empty action list is intentionally silent (useful for callback turns).
       await telegram(env, "sendMessage", {
-        chat_id: chatId,
+        chat_id: gatewayConversationId,
         text: "I got that, but had nothing to say back. Try again?",
       });
     }
@@ -342,7 +362,7 @@ async function processTelegramUpdate(env: Env, update: TelegramUpdate): Promise<
     console.error(error instanceof Error ? error.message : "processTelegramUpdate failed");
     try {
       await telegram(env, "sendMessage", {
-        chat_id: chatId,
+        chat_id: gatewayConversationId,
         text: "Something went wrong on my side. Please try again in a moment.",
       });
     } catch {

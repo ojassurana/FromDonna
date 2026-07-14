@@ -18,7 +18,7 @@ Source: `cloudflare/gateway/`
 | Webhook | `POST /telegram/webhook` |
 | Health | `GET /health` |
 | D1 database | `fromdonna-routing` (`FROMDONNA_ROUTING` binding) |
-| D1 table | `telegram_user_sandboxes` |
+| D1 table | `user_agents` (gateway-neutral) |
 | E2B template | `fromdonna-hermes` |
 | Sandbox domain default | `e2b.dev` |
 | Harness port | `8788` |
@@ -48,8 +48,8 @@ Source: `cloudflare/gateway/`
 From the user side: **DM the bot → get a private Hermes**. No setup, no “pick a sandbox,” no extra friction.
 
 1. User texts `@fromdonna_bot`
-2. Worker looks up `telegram_user_id` in D1
-3. **No row / failed** → create E2B sandbox, health-check harness, `/bootstrap` auth, mark `ready`
+2. Worker looks up their `(gateway, gateway_user_id)` identity in D1
+3. **No row / failed** → create the user’s E2B runtime, health-check harness, `/bootstrap` auth, mark `ready`
 4. **Ready** → `POST /turn` on that user’s harness with capability header
 5. Hermes calls the LLM proxy; Worker sends the reply via Bot API
 
@@ -64,7 +64,7 @@ User DMs @fromdonna_bot
   → Telegram servers
   → POST /telegram/webhook (secret header verified)
   → Worker ACKs Telegram immediately (ctx.waitUntil)
-  → D1 lookup telegram_user_id
+  → D1 lookup (gateway, gateway_user_id)
        ├─ missing / failed → claim row → E2B create → wait /health → POST /bootstrap → status=ready
        └─ ready           → E2B connect (resume + TTL) → POST /turn
   → Harness runs Hermes oneshot (capability = OPENAI_API_KEY)
@@ -103,13 +103,16 @@ Headers:
 Migrations: `cloudflare/gateway/migrations/`
 
 ```sql
--- telegram_user_sandboxes
-telegram_user_id TEXT PRIMARY KEY
-telegram_chat_id TEXT NOT NULL
-user_id TEXT NOT NULL UNIQUE          -- e.g. telegram:1063008785
-e2b_sandbox_id TEXT NOT NULL
-e2b_sandbox_domain TEXT                 -- usually e2b.dev
+-- user_agents: gateway-neutral user → runtime routing
+user_id TEXT PRIMARY KEY                -- stable product identity, e.g. telegram:1063008785
+gateway TEXT NOT NULL                   -- telegram | whatsapp | discord | ...
+gateway_user_id TEXT NOT NULL           -- identity native to that gateway
+gateway_conversation_id TEXT NOT NULL   -- current delivery/conversation target
+runtime_provider TEXT NOT NULL           -- currently e2b
+runtime_id TEXT NOT NULL                 -- currently the E2B sandbox id
+runtime_domain TEXT                      -- runtime host domain, e.g. e2b.dev
 status TEXT NOT NULL                    -- provisioning | ready | failed
+UNIQUE (gateway, gateway_user_id)
 provisioning_started_at TEXT
 created_at / updated_at
 ```
@@ -231,7 +234,7 @@ curl -sS "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getWebhookInfo"
 # D1 rows
 cd cloudflare/gateway
 npx wrangler d1 execute fromdonna-routing --remote --command \
-  "SELECT telegram_user_id, status, e2b_sandbox_id, updated_at FROM telegram_user_sandboxes ORDER BY updated_at DESC LIMIT 10;"
+  "SELECT gateway, gateway_user_id, status, runtime_provider, runtime_id, updated_at FROM user_agents ORDER BY updated_at DESC LIMIT 10;"
 
 # Harness for a known sandbox
 curl -sS "https://8788-<sandboxId>.e2b.dev/health"
@@ -242,7 +245,7 @@ curl -sS "https://8788-<sandboxId>.e2b.dev/health"
 ## Why one bot works for many users
 
 Telegram already scopes traffic by `chat_id` / user id.  
-Multi-tenant = **routing table** on the Worker (`telegram identity → user → sandbox`), not multiple bots.
+Multi-tenant = **gateway-neutral routing table** on the Worker (`gateway identity → user → runtime`), not multiple bots.
 
 ## What does *not* run in the sandbox
 

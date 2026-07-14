@@ -105,11 +105,12 @@ Agent code path does **not** branch on “Telegram vs WhatsApp” for core reaso
 
 ## Routing table (D1)
 
-One durable row per messaging identity (Telegram today):
+One durable `user_agents` row per gateway identity (Telegram today):
 
+- gateway identity: `gateway` + `gateway_user_id` + `gateway_conversation_id`
 - status: `provisioning` | `ready` | `failed`
-- `e2b_sandbox_id` + domain
-- internal `user_id` (e.g. `telegram:<id>`)
+- runtime: `runtime_provider` + `runtime_id` + `runtime_domain` (currently E2B)
+- stable internal `user_id` (e.g. `telegram:<id>`)
 
 Atomic first-message claim prevents double-create. Failed rows re-provision on the next inbound message.
 
