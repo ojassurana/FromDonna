@@ -10,6 +10,7 @@ Architecture and ops notes for the multi-user Hermes product: one Telegram bot, 
 |-----|----------|
 | [gateway/gateway.md](./gateway/gateway.md) | Channel-agnostic design: Worker owns I/O + routing; sandbox is agent-only |
 | [gateway/telegram.md](./gateway/telegram.md) | **Live Telegram adapter** — webhook, D1 schema, provision, harness contract, deploy |
+| [gateway/telegram-auth.md](./gateway/telegram-auth.md) | **Telegram auth** — Worker ↔ sandbox secrets, proxy tokens, threat model (not LLM) |
 | [gateway/llm-proxy-worker.md](./gateway/llm-proxy-worker.md) | LLM proxy Worker, streaming SSE shim, Codex relay, capability tokens |
 | [gateway/ops.md](./gateway/ops.md) | **Ops runbook** — status checks, logs, failures, secret rotation, deploy matrix |
 

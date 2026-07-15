@@ -48,4 +48,25 @@ platforms:
       # Do not let @mentions bypass the empty group whitelist (guest_mode).
       guest_mode: false
 
+      # Official Hermes slash-command access control (gateway/slash_access.py).
+      # Gating turns ON only when allow_admin_from is non-empty. FromDonna is
+      # 1 user / 1 sandbox with no operator admin on Telegram, so use a
+      # non-matching sentinel: every real user is a non-admin.
+      # Non-admins may only run user_allowed_commands (+ Hermes floor /help,/whoami).
+      allow_admin_from:
+        - "__fromdonna_no_admin__"
+      user_allowed_commands:
+        - new
+      group_allow_admin_from:
+        - "__fromdonna_no_admin__"
+      group_user_allowed_commands:
+        - new
+
+      # Telegram / menu: show only /new (dispatch still gated above).
+      command_menu:
+        max_commands: 1
+        priority_mode: replace
+        priority:
+          - new
+
 agent: {}

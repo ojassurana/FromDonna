@@ -222,6 +222,11 @@ class GatewayRuntime:
                 "guest_mode",
                 "observe_unmentioned_group_messages",
                 "require_mention",
+                "allow_admin_from",
+                "user_allowed_commands",
+                "group_allow_admin_from",
+                "group_user_allowed_commands",
+                "command_menu",
             ):
                 if key in existing.extra:
                     extra[key] = existing.extra[key]

@@ -6,6 +6,8 @@ Telegram-specific adapter on the **shared Cloudflare Worker** (see [gateway.md](
 
 All users share **one Telegram bot** (`@fromdonna_bot`). The bot token lives **only on the Worker**, never in E2B / Hermes sandboxes.
 
+**Auth detail (Worker ↔ sandbox, Bot API proxy, threat model):** [telegram-auth.md](./telegram-auth.md).
+
 Source: `cloudflare/gateway/`
 
 ---

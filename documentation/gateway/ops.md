@@ -108,6 +108,8 @@ Note: the success path is quiet; `console.error` surfaces failures (harness HTTP
 
 ## Rotate secrets
 
+Full Telegram Worker↔sandbox auth model: [telegram-auth.md](./telegram-auth.md).
+
 ```bash
 cd ~/FromDonna/cloudflare/gateway
 
@@ -118,7 +120,8 @@ printf '%s' 'NEW_BOT_TOKEN' | npx wrangler secret put TELEGRAM_BOT_TOKEN
 # Webhook secret (must match setWebhook secret_token)
 printf '%s' 'NEW_WEBHOOK_SECRET' | npx wrangler secret put TELEGRAM_WEBHOOK_SECRET
 
-# Harness shared secret (existing sandboxes need re-bootstrap on next turn or re-provision)
+# Harness shared secret (existing sandboxes need re-bootstrap on next turn or re-provision).
+# Leak of this secret = treat Telegram bridge as compromised until rotated + sandboxes recreated.
 printf '%s' 'NEW_HARNESS_SECRET' | npx wrangler secret put WORKER_TO_HARNESS_SECRET
 ```
 
