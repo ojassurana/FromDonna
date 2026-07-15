@@ -195,10 +195,16 @@ class GatewayRuntime:
         except Exception:
             config = GatewayConfig()
 
-        platform_config = PlatformConfig(
-            enabled=True,
-            token=proxy.token,
-            extra={
+        # Preserve official settings from ~/.hermes/config.yaml (platforms.telegram
+        # / bridged extra keys like allowed_chats, guest_mode). Runtime only
+        # overlays FromDonna Worker proxy fields so template policy sticks.
+        existing = config.platforms.get(Platform.TELEGRAM)
+        extra: dict[str, Any] = {}
+        if existing is not None and isinstance(getattr(existing, "extra", None), dict):
+            extra.update(existing.extra)
+
+        extra.update(
+            {
                 "group_sessions_per_user": True,
                 "allow_all_users": True,
                 # Official PTB/Hermes hook for local Bot API servers — we point at Worker.
@@ -206,7 +212,24 @@ class GatewayRuntime:
                 # so base must end with `.../bot` → `.../bot{token}/getMe`.
                 "base_url": proxy.base_url.rstrip("/"),
                 "base_file_url": proxy.base_file_url.rstrip("/"),
-            },
+            }
+        )
+        # Re-apply template policy keys that must win over accidental empty overrides.
+        if existing is not None and isinstance(getattr(existing, "extra", None), dict):
+            for key in (
+                "allowed_chats",
+                "group_allowed_chats",
+                "guest_mode",
+                "observe_unmentioned_group_messages",
+                "require_mention",
+            ):
+                if key in existing.extra:
+                    extra[key] = existing.extra[key]
+
+        platform_config = PlatformConfig(
+            enabled=True,
+            token=proxy.token,
+            extra=extra,
         )
         config.platforms[Platform.TELEGRAM] = platform_config
         for plat in list(config.platforms.keys()):
