@@ -57,19 +57,71 @@ class GatewayRuntime:
             raise RuntimeError("Telegram proxy config required before starting gateway")
         with self._lock:
             if self._thread and self._thread.is_alive():
-                return
-            self._ready.clear()
-            self._start_error = None
-            self._thread = threading.Thread(
-                target=self._run_loop,
-                name="fromdonna-hermes-gateway",
-                daemon=True,
-            )
-            self._thread.start()
+                # Another caller is already starting/running — wait for readiness
+                # instead of returning early with a half-built adapter.
+                wait_existing = True
+            else:
+                wait_existing = False
+                self._ready.clear()
+                self._start_error = None
+                self._thread = threading.Thread(
+                    target=self._run_loop,
+                    name="fromdonna-hermes-gateway",
+                    daemon=True,
+                )
+                self._thread.start()
         if not self._ready.wait(timeout=120):
             raise RuntimeError("Hermes Telegram gateway failed to start within 120s")
         if self._start_error is not None:
-            raise RuntimeError(f"Hermes Telegram gateway failed to start: {self._start_error}") from self._start_error
+            # Allow a subsequent start after a failed boot (stale lock, etc.).
+            if not wait_existing:
+                with self._lock:
+                    if self._thread and not self._thread.is_alive():
+                        self._thread = None
+            raise RuntimeError(
+                f"Hermes Telegram gateway failed to start: {self._start_error}"
+            ) from self._start_error
+
+    def _clear_stale_telegram_lock(self) -> None:
+        """Drop dead PID locks for this sandbox's proxy token so connect can proceed."""
+        assert self._proxy is not None
+        try:
+            from gateway.status import _get_scope_lock_path, _pid_exists, release_scoped_lock
+            import json
+            from pathlib import Path
+
+            lock_path = _get_scope_lock_path("telegram-bot-token", self._proxy.token)
+            if not lock_path.exists():
+                return
+            try:
+                data = json.loads(lock_path.read_text())
+            except Exception:
+                lock_path.unlink(missing_ok=True)
+                logger.warning("removed unreadable telegram platform lock %s", lock_path)
+                return
+            pid = data.get("pid")
+            try:
+                pid_i = int(pid) if pid is not None else None
+            except (TypeError, ValueError):
+                pid_i = None
+            if pid_i is None or not _pid_exists(pid_i):
+                lock_path.unlink(missing_ok=True)
+                logger.warning(
+                    "cleared stale telegram platform lock pid=%s path=%s",
+                    pid_i,
+                    lock_path,
+                )
+                return
+            # Same process (uvicorn) can hold a lock from a previous failed adapter
+            # that never released — force release for this identity.
+            if pid_i == os.getpid():
+                try:
+                    release_scoped_lock("telegram-bot-token", self._proxy.token)
+                except Exception:
+                    lock_path.unlink(missing_ok=True)
+                logger.warning("released same-process telegram platform lock")
+        except Exception:
+            logger.exception("failed clearing telegram platform lock")
 
     def _run_loop(self) -> None:
         os.environ["HERMES_HOME"] = self.hermes_home
@@ -86,6 +138,7 @@ class GatewayRuntime:
 
             assert self._proxy is not None
             proxy = self._proxy
+            self._clear_stale_telegram_lock()
 
             try:
                 config = load_gateway_config()
@@ -99,8 +152,10 @@ class GatewayRuntime:
                     "group_sessions_per_user": True,
                     "allow_all_users": True,
                     # Official PTB/Hermes hook for local Bot API servers — we point at Worker.
-                    "base_url": proxy.base_url if proxy.base_url.endswith("/") else proxy.base_url,
-                    "base_file_url": proxy.base_file_url if proxy.base_file_url.endswith("/") else proxy.base_file_url,
+                    # IMPORTANT: no trailing slash. PTB concatenates `{token}/{method}`
+                    # so base must end with `.../bot` → `.../bot{token}/getMe`.
+                    "base_url": proxy.base_url.rstrip("/"),
+                    "base_file_url": proxy.base_file_url.rstrip("/"),
                 },
             )
             for plat in list(config.platforms.keys()):
@@ -130,13 +185,32 @@ class GatewayRuntime:
             self._adapter._start_polling_resilient = _skip_polling.__get__(self._adapter, type(self._adapter))  # type: ignore[method-assign]
 
             async def _connect() -> None:
-                ok = await self._adapter.connect()
-                if not ok:
-                    raise RuntimeError("TelegramAdapter.connect() returned False")
-                # Treat as webhook-like: no polling heartbeat needed against getUpdates.
-                self._adapter._webhook_mode = True
-                self._adapter._connected = True
-                self._adapter._running = True
+                last_err: Optional[BaseException] = None
+                for attempt in range(2):
+                    self._clear_stale_telegram_lock()
+                    try:
+                        ok = await self._adapter.connect()
+                    except BaseException as exc:  # noqa: BLE001
+                        last_err = exc
+                        logger.exception("TelegramAdapter.connect raised (attempt %d)", attempt + 1)
+                        ok = False
+                    if ok:
+                        # Treat as webhook-like: no polling heartbeat against getUpdates.
+                        self._adapter._webhook_mode = True
+                        self._adapter._connected = True
+                        self._adapter._running = True
+                        return
+                    # connect() returns False on lock contention without raising.
+                    fatal = getattr(self._adapter, "_fatal_error", None) or getattr(
+                        self._adapter, "_last_fatal_error", None
+                    )
+                    last_err = RuntimeError(
+                        f"TelegramAdapter.connect() returned False"
+                        + (f" ({fatal})" if fatal else "")
+                    )
+                    logger.error("%s (attempt %d)", last_err, attempt + 1)
+                    await asyncio.sleep(0.2)
+                raise last_err or RuntimeError("TelegramAdapter.connect() returned False")
 
             self._loop.run_until_complete(_connect())
             self._ready.set()
