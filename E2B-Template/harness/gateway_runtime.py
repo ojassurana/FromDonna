@@ -21,6 +21,7 @@ import os
 import threading
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Optional
 
 logger = logging.getLogger("fromdonna.gateway_runtime")
@@ -36,6 +37,26 @@ class TelegramProxyConfig:
     gateway_user_id: str
 
 
+def _adapter_fatal_detail(adapter: Any) -> str:
+    """Hermes stores fatal state on ``_fatal_error_message`` / ``_fatal_error_code``."""
+    if adapter is None:
+        return ""
+    message = (
+        getattr(adapter, "fatal_error_message", None)
+        or getattr(adapter, "_fatal_error_message", None)
+        or getattr(adapter, "_fatal_error", None)
+        or getattr(adapter, "_last_fatal_error", None)
+    )
+    code = getattr(adapter, "fatal_error_code", None) or getattr(adapter, "_fatal_error_code", None)
+    if message and code:
+        return f"{code}: {message}"
+    if message:
+        return str(message)
+    if code:
+        return str(code)
+    return ""
+
+
 class GatewayRuntime:
     """One long-lived official Hermes Telegram gateway for this sandbox user."""
 
@@ -49,30 +70,32 @@ class GatewayRuntime:
         self._ready = threading.Event()
         self._start_error: Optional[BaseException] = None
         self._proxy: Optional[TelegramProxyConfig] = None
+        self._platform_config = None
 
     def configure_proxy(self, proxy: TelegramProxyConfig) -> None:
         self._proxy = proxy
+
+    def is_running(self) -> bool:
+        return bool(
+            self._thread
+            and self._thread.is_alive()
+            and self._start_error is None
+            and self._ready.is_set()
+            and self._adapter is not None
+            and self._loop is not None
+        )
 
     def start(self) -> None:
         if not self._proxy:
             raise RuntimeError("Telegram proxy config required before starting gateway")
         last_error: Optional[BaseException] = None
-        for attempt in range(2):
+        for attempt in range(3):
             with self._lock:
-                if self._thread and self._thread.is_alive() and self._start_error is None and self._ready.is_set():
+                if self.is_running():
                     return
-                if self._thread and self._thread.is_alive() and not self._ready.is_set():
-                    wait_existing = True
-                else:
-                    wait_existing = False
-                    # Hard reset after a failed or dead boot so connect can retry
-                    # (stale same-PID platform locks are a common failure mode).
-                    self._clear_stale_telegram_lock()
-                    self._ready.clear()
-                    self._start_error = None
-                    self._runner = None
-                    self._adapter = None
-                    self._loop = None
+                wait_existing = bool(self._thread and self._thread.is_alive() and not self._ready.is_set())
+                if not wait_existing:
+                    self._hard_reset_locked()
                     self._thread = threading.Thread(
                         target=self._run_loop,
                         name="fromdonna-hermes-gateway",
@@ -81,60 +104,137 @@ class GatewayRuntime:
                     self._thread.start()
             if not self._ready.wait(timeout=120):
                 last_error = RuntimeError("Hermes Telegram gateway failed to start within 120s")
+                with self._lock:
+                    self._hard_reset_locked()
             elif self._start_error is not None:
                 last_error = self._start_error
-                if not wait_existing:
-                    with self._lock:
-                        if self._thread and not self._thread.is_alive():
-                            self._thread = None
+                with self._lock:
+                    self._hard_reset_locked()
             else:
                 return
             logger.warning("gateway start attempt %d failed: %s", attempt + 1, last_error)
-            time.sleep(0.3)
+            time.sleep(0.4 * (attempt + 1))
         raise RuntimeError(
             f"Hermes Telegram gateway failed to start: {last_error}"
         ) from last_error
 
-    def _clear_stale_telegram_lock(self) -> None:
-        """Drop dead PID locks for this sandbox's proxy token so connect can proceed."""
-        assert self._proxy is not None
-        try:
-            from gateway.status import _get_scope_lock_path, _pid_exists, release_scoped_lock
-            import json
-            from pathlib import Path
-
-            lock_path = _get_scope_lock_path("telegram-bot-token", self._proxy.token)
-            if not lock_path.exists():
-                return
+    def _hard_reset_locked(self) -> None:
+        """Stop any previous gateway thread and drop platform locks (single-user box)."""
+        loop = self._loop
+        thread = self._thread
+        if loop is not None:
             try:
-                data = json.loads(lock_path.read_text())
+                loop.call_soon_threadsafe(loop.stop)
             except Exception:
-                lock_path.unlink(missing_ok=True)
-                logger.warning("removed unreadable telegram platform lock %s", lock_path)
-                return
-            pid = data.get("pid")
-            try:
-                pid_i = int(pid) if pid is not None else None
-            except (TypeError, ValueError):
-                pid_i = None
-            if pid_i is None or not _pid_exists(pid_i):
-                lock_path.unlink(missing_ok=True)
-                logger.warning(
-                    "cleared stale telegram platform lock pid=%s path=%s",
-                    pid_i,
-                    lock_path,
-                )
-                return
-            # Same process (uvicorn) can hold a lock from a previous failed adapter
-            # that never released — force release for this identity.
-            if pid_i == os.getpid():
-                try:
-                    release_scoped_lock("telegram-bot-token", self._proxy.token)
-                except Exception:
-                    lock_path.unlink(missing_ok=True)
-                logger.warning("released same-process telegram platform lock")
+                pass
+        if thread is not None and thread.is_alive() and thread is not threading.current_thread():
+            thread.join(timeout=5.0)
+        self._force_clear_telegram_locks()
+        self._ready.clear()
+        self._start_error = None
+        self._runner = None
+        self._adapter = None
+        self._loop = None
+        self._thread = None
+        self._platform_config = None
+
+    def _force_clear_telegram_locks(self) -> None:
+        """FromDonna sandboxes are 1 user / 1 process — always clear local TG locks.
+
+        Hermes platform locks are machine-local files under
+        ``~/.local/state/hermes/gateway-locks``. Stale same-PID or dead-PID
+        locks are the dominant cause of ``connect() returned False``.
+        """
+        try:
+            from gateway.status import _get_scope_lock_path, release_scoped_lock
         except Exception:
-            logger.exception("failed clearing telegram platform lock")
+            _get_scope_lock_path = None  # type: ignore[assignment]
+            release_scoped_lock = None  # type: ignore[assignment]
+
+        if self._proxy is not None and release_scoped_lock is not None:
+            try:
+                release_scoped_lock("telegram-bot-token", self._proxy.token)
+            except Exception:
+                pass
+            if _get_scope_lock_path is not None:
+                try:
+                    lock_path = _get_scope_lock_path("telegram-bot-token", self._proxy.token)
+                    lock_path.unlink(missing_ok=True)
+                except Exception:
+                    pass
+
+        # Nuclear option for this single-user sandbox: wipe every TG bot lock.
+        for root in (
+            Path(self.hermes_home).expanduser().parent / ".local" / "state" / "hermes" / "gateway-locks",
+            Path.home() / ".local" / "state" / "hermes" / "gateway-locks",
+            Path("/home/user/.local/state/hermes/gateway-locks"),
+        ):
+            try:
+                if not root.is_dir():
+                    continue
+                for path in root.glob("telegram-bot-token-*.lock"):
+                    try:
+                        path.unlink(missing_ok=True)
+                        logger.warning("removed telegram platform lock %s", path)
+                    except Exception:
+                        logger.exception("failed removing lock %s", path)
+            except Exception:
+                logger.exception("failed scanning lock dir %s", root)
+
+    def _build_adapter(self):
+        """Construct a fresh TelegramAdapter + GatewayRunner for one connect attempt."""
+        from gateway.config import GatewayConfig, Platform, PlatformConfig, load_gateway_config
+        from gateway.run import GatewayRunner
+        from plugins.platforms.telegram.adapter import TelegramAdapter
+
+        assert self._proxy is not None
+        proxy = self._proxy
+
+        try:
+            config = load_gateway_config()
+        except Exception:
+            config = GatewayConfig()
+
+        platform_config = PlatformConfig(
+            enabled=True,
+            token=proxy.token,
+            extra={
+                "group_sessions_per_user": True,
+                "allow_all_users": True,
+                # Official PTB/Hermes hook for local Bot API servers — we point at Worker.
+                # IMPORTANT: no trailing slash. PTB concatenates `{token}/{method}`
+                # so base must end with `.../bot` → `.../bot{token}/getMe`.
+                "base_url": proxy.base_url.rstrip("/"),
+                "base_file_url": proxy.base_file_url.rstrip("/"),
+            },
+        )
+        config.platforms[Platform.TELEGRAM] = platform_config
+        for plat in list(config.platforms.keys()):
+            if plat != Platform.TELEGRAM:
+                config.platforms[plat].enabled = False
+
+        runner = GatewayRunner(config)
+        adapter = TelegramAdapter(config.platforms[Platform.TELEGRAM])
+        adapter.set_message_handler(runner._handle_message)
+        if hasattr(adapter, "set_busy_session_handler") and hasattr(runner, "_handle_busy_session"):
+            try:
+                adapter.set_busy_session_handler(runner._handle_busy_session)
+            except Exception:
+                pass
+        runner.adapters[Platform.TELEGRAM] = adapter
+        runner._running = True
+
+        # Skip polling/webhook transport: Worker injects raw Updates.
+        async def _skip_polling(self_adapter, **_kwargs):  # type: ignore[no-untyped-def]
+            logger.info(
+                "[%s] FromDonna: skipping Telegram polling (Worker injects updates)",
+                self_adapter.name,
+            )
+            return True
+
+        adapter._start_polling_resilient = _skip_polling.__get__(adapter, type(adapter))  # type: ignore[method-assign]
+        self._platform_config = platform_config
+        return runner, adapter
 
     def _run_loop(self) -> None:
         os.environ["HERMES_HOME"] = self.hermes_home
@@ -142,87 +242,55 @@ class GatewayRuntime:
         os.environ.setdefault("TELEGRAM_ALLOW_ALL_USERS", "true")
         # Custom base_url points at Worker — do NOT rewrite traffic to Telegram IPs.
         os.environ["HERMES_TELEGRAM_DISABLE_FALLBACK_IPS"] = "1"
+        # Fail faster on proxy errors (Worker auth / network) instead of 8×30s.
+        os.environ.setdefault("HERMES_TELEGRAM_INIT_TIMEOUT", "12")
+        os.environ.setdefault("HERMES_TELEGRAM_HTTP_CONNECT_TIMEOUT", "8")
+        os.environ.setdefault("HERMES_TELEGRAM_HTTP_READ_TIMEOUT", "15")
         # Never let the adapter open a real Telegram webhook/poll on the shared bot.
         os.environ.pop("TELEGRAM_WEBHOOK_URL", None)
         try:
-            from gateway.config import GatewayConfig, Platform, PlatformConfig, load_gateway_config
-            from gateway.run import GatewayRunner
-            from plugins.platforms.telegram.adapter import TelegramAdapter
-
             assert self._proxy is not None
-            proxy = self._proxy
-            self._clear_stale_telegram_lock()
-
-            try:
-                config = load_gateway_config()
-            except Exception:
-                config = GatewayConfig()
-
-            config.platforms[Platform.TELEGRAM] = PlatformConfig(
-                enabled=True,
-                token=proxy.token,
-                extra={
-                    "group_sessions_per_user": True,
-                    "allow_all_users": True,
-                    # Official PTB/Hermes hook for local Bot API servers — we point at Worker.
-                    # IMPORTANT: no trailing slash. PTB concatenates `{token}/{method}`
-                    # so base must end with `.../bot` → `.../bot{token}/getMe`.
-                    "base_url": proxy.base_url.rstrip("/"),
-                    "base_file_url": proxy.base_file_url.rstrip("/"),
-                },
-            )
-            for plat in list(config.platforms.keys()):
-                if plat != Platform.TELEGRAM:
-                    config.platforms[plat].enabled = False
+            self._force_clear_telegram_locks()
 
             self._loop = asyncio.new_event_loop()
             asyncio.set_event_loop(self._loop)
 
-            self._runner = GatewayRunner(config)
-            self._adapter = TelegramAdapter(config.platforms[Platform.TELEGRAM])
-            self._adapter.set_message_handler(self._runner._handle_message)
-            if hasattr(self._adapter, "set_busy_session_handler") and hasattr(self._runner, "_handle_busy_session"):
-                try:
-                    self._adapter.set_busy_session_handler(self._runner._handle_busy_session)
-                except Exception:
-                    pass
-            self._runner.adapters[Platform.TELEGRAM] = self._adapter
-            self._runner._running = True
-
-            # Skip polling/webhook transport: Worker injects raw Updates.
-            # Still run official Application.initialize/start + handlers via connect().
-            async def _skip_polling(self_adapter, **_kwargs):  # type: ignore[no-untyped-def]
-                logger.info("[%s] FromDonna: skipping Telegram polling (Worker injects updates)", self_adapter.name)
-                return True
-
-            self._adapter._start_polling_resilient = _skip_polling.__get__(self._adapter, type(self._adapter))  # type: ignore[method-assign]
-
             async def _connect() -> None:
                 last_err: Optional[BaseException] = None
-                for attempt in range(2):
-                    self._clear_stale_telegram_lock()
+                for attempt in range(3):
+                    self._force_clear_telegram_locks()
+                    # Fresh adapter each attempt — half-initialized adapters are poison.
+                    self._runner, self._adapter = self._build_adapter()
+                    assert self._adapter is not None
                     try:
                         ok = await self._adapter.connect()
                     except BaseException as exc:  # noqa: BLE001
                         last_err = exc
                         logger.exception("TelegramAdapter.connect raised (attempt %d)", attempt + 1)
                         ok = False
+                        try:
+                            self._adapter._release_platform_lock()
+                        except Exception:
+                            pass
                     if ok:
                         # Treat as webhook-like: no polling heartbeat against getUpdates.
                         self._adapter._webhook_mode = True
                         self._adapter._connected = True
                         self._adapter._running = True
+                        logger.info("FromDonna Telegram gateway connected (attempt %d)", attempt + 1)
                         return
-                    # connect() returns False on lock contention without raising.
-                    fatal = getattr(self._adapter, "_fatal_error", None) or getattr(
-                        self._adapter, "_last_fatal_error", None
-                    )
+                    detail = _adapter_fatal_detail(self._adapter)
                     last_err = RuntimeError(
-                        f"TelegramAdapter.connect() returned False"
-                        + (f" ({fatal})" if fatal else "")
+                        "TelegramAdapter.connect() returned False"
+                        + (f" ({detail})" if detail else "")
                     )
                     logger.error("%s (attempt %d)", last_err, attempt + 1)
-                    await asyncio.sleep(0.2)
+                    try:
+                        self._adapter._release_platform_lock()
+                    except Exception:
+                        pass
+                    self._force_clear_telegram_locks()
+                    await asyncio.sleep(0.3 * (attempt + 1))
                 raise last_err or RuntimeError("TelegramAdapter.connect() returned False")
 
             self._loop.run_until_complete(_connect())
@@ -230,8 +298,13 @@ class GatewayRuntime:
             self._loop.run_forever()
         except BaseException as exc:  # noqa: BLE001
             self._start_error = exc
+            self._force_clear_telegram_locks()
             self._ready.set()
             logger.exception("fromdonna gateway runtime failed")
+        finally:
+            # If we exit run_forever (stop), release locks for a later restart.
+            if self._start_error is not None:
+                self._force_clear_telegram_locks()
 
     def inject_update(self, update: dict[str, Any], *, capability: str | None = None) -> dict[str, Any]:
         """Feed one raw Telegram Update through the official adapter Application."""
@@ -380,4 +453,10 @@ def get_gateway_runtime(hermes_home: str) -> GatewayRuntime:
 def reset_gateway_runtime_for_tests() -> None:
     global _RUNTIME
     with _RUNTIME_LOCK:
+        if _RUNTIME is not None:
+            try:
+                with _RUNTIME._lock:
+                    _RUNTIME._hard_reset_locked()
+            except Exception:
+                pass
         _RUNTIME = None

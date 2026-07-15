@@ -24,12 +24,18 @@ function encodeBase64Url(bytes: Uint8Array): string {
   return btoa(binary).replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/, "");
 }
 
-function decodeBase64Url(text: string): Uint8Array {
-  const padded = text.replaceAll("-", "+").replaceAll("_", "/") + "===".slice((text.length + 3) % 4);
-  const binary = atob(padded);
-  const out = new Uint8Array(binary.length);
-  for (let i = 0; i < binary.length; i++) out[i] = binary.charCodeAt(i);
-  return out;
+function decodeBase64Url(text: string): Uint8Array | null {
+  try {
+    const padded = text.replaceAll("-", "+").replaceAll("_", "/") + "===".slice((text.length + 3) % 4);
+    const binary = atob(padded);
+    const out = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) out[i] = binary.charCodeAt(i);
+    return out;
+  } catch {
+    // Malformed base64url must not 500 the whole Worker (that made Hermes
+    // retry connect 8× and surface as "connect() returned False").
+    return null;
+  }
 }
 
 /** Deterministic per-user proxy token: fd1.<b64url(userId)>.<b64url(chatId)>.<b64url(hmac16)>. */
@@ -54,8 +60,12 @@ export async function mintBotProxyToken(
 export async function verifyBotProxyToken(secret: string, token: string): Promise<ProxyIdentity | null> {
   const parts = token.split(".");
   if (parts.length !== 4 || parts[0] !== "fd1") return null;
-  const userId = new TextDecoder().decode(decodeBase64Url(parts[1]));
-  const gatewayConversationId = new TextDecoder().decode(decodeBase64Url(parts[2]));
+  const userIdBytes = decodeBase64Url(parts[1]);
+  const chatIdBytes = decodeBase64Url(parts[2]);
+  if (!userIdBytes || !chatIdBytes) return null;
+  const userId = new TextDecoder().decode(userIdBytes);
+  const gatewayConversationId = new TextDecoder().decode(chatIdBytes);
+  if (!userId || !gatewayConversationId) return null;
   const expected = await mintBotProxyToken(secret, userId, gatewayConversationId);
   if (expected.length !== token.length) return null;
   let diff = 0;

@@ -22,7 +22,13 @@ export const template = Template()
   .copy("harness", "/opt/fromdonna/harness")
   .copy("extensions/plugins", "/home/user/.hermes/plugins")
   .copy("config/hermes/config.yaml", "/home/user/.hermes/config.yaml")
-  .runCmd("uv venv /home/user/venv --python python3 && uv pip install --python /home/user/venv/bin/python /opt/fromdonna/hermes && mkdir -p /home/user/workspace")
+  // messaging extra pulls python-telegram-bot — required for official TelegramAdapter
+  // inside the sandbox (without it connect() returns False immediately).
+  .runCmd(
+    "uv venv /home/user/venv --python python3 && " +
+      "uv pip install --python /home/user/venv/bin/python '/opt/fromdonna/hermes[messaging]' && " +
+      "mkdir -p /home/user/workspace",
+  )
   .setStartCmd(
     "/home/user/venv/bin/uvicorn server:app --app-dir /opt/fromdonna/harness --host 0.0.0.0 --port 8788",
     waitForPort(8788),

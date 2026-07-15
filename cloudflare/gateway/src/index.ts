@@ -276,24 +276,71 @@ async function markFailed(env: Env, gateway: string, gatewayUserId: string): Pro
     .run();
 }
 
+/** Steal a provisioning row stuck longer than ~90s (crashed waitUntil / failed bootstrap). */
+async function claimStuckProvisioning(
+  env: Env,
+  gateway: string,
+  gatewayUserId: string,
+  gatewayConversationId: string,
+): Promise<boolean> {
+  const placeholder = `provisioning:${crypto.randomUUID()}`;
+  const result = await env.FROMDONNA_ROUTING.prepare(
+    `UPDATE user_agents
+     SET gateway_conversation_id = ?3,
+         runtime_id = ?4,
+         runtime_domain = NULL,
+         status = 'provisioning',
+         provisioning_started_at = CURRENT_TIMESTAMP,
+         updated_at = CURRENT_TIMESTAMP
+     WHERE gateway = ?1 AND gateway_user_id = ?2 AND status = 'provisioning'
+       AND (
+         provisioning_started_at IS NULL
+         OR provisioning_started_at < datetime('now', '-90 seconds')
+       )`,
+  )
+    .bind(gateway, gatewayUserId, gatewayConversationId, placeholder)
+    .run();
+  return result.meta.changes === 1;
+}
+
 async function provision(env: Env, gateway: string, gatewayUserId: string): Promise<UserAgentRow> {
   const userId = internalUserId(gateway, gatewayUserId);
   const sandbox = await createSandbox(env, userId);
   const domain = sandbox.domain || DEFAULT_SANDBOX_DOMAIN;
-  await waitForHarness(env, sandbox.sandboxID, domain);
+  try {
+    await waitForHarness(env, sandbox.sandboxID, domain);
 
-  await env.FROMDONNA_ROUTING.prepare(
-    `UPDATE user_agents
-     SET runtime_id = ?3, runtime_domain = ?4, status = 'ready', updated_at = CURRENT_TIMESTAMP
-     WHERE gateway = ?1 AND gateway_user_id = ?2 AND status = 'provisioning'`,
-  )
-    .bind(gateway, gatewayUserId, sandbox.sandboxID, domain)
-    .run();
+    // Stash runtime while still provisioning — only flip ready after bootstrap
+    // succeeds so a broken Telegram gateway never looks "ready" in D1.
+    await env.FROMDONNA_ROUTING.prepare(
+      `UPDATE user_agents
+       SET runtime_id = ?3, runtime_domain = ?4, updated_at = CURRENT_TIMESTAMP
+       WHERE gateway = ?1 AND gateway_user_id = ?2 AND status = 'provisioning'`,
+    )
+      .bind(gateway, gatewayUserId, sandbox.sandboxID, domain)
+      .run();
 
-  const row = await lookup(env, gateway, gatewayUserId);
-  if (!row || row.status !== "ready") throw new Error("Runtime was created but the user-agent row was not finalized.");
-  await bootstrapHarness(env, row);
-  return row;
+    const pending = await lookup(env, gateway, gatewayUserId);
+    if (!pending || pending.status !== "provisioning") {
+      throw new Error("Runtime was created but the user-agent row was not in provisioning state.");
+    }
+    await bootstrapHarness(env, pending);
+
+    await env.FROMDONNA_ROUTING.prepare(
+      `UPDATE user_agents
+       SET status = 'ready', updated_at = CURRENT_TIMESTAMP
+       WHERE gateway = ?1 AND gateway_user_id = ?2 AND status = 'provisioning'`,
+    )
+      .bind(gateway, gatewayUserId)
+      .run();
+
+    const row = await lookup(env, gateway, gatewayUserId);
+    if (!row || row.status !== "ready") throw new Error("Runtime was bootstrapped but the user-agent row was not finalized.");
+    return row;
+  } catch (error) {
+    await killSandboxBestEffort(env, sandbox.sandboxID);
+    throw error;
+  }
 }
 
 /**
@@ -304,24 +351,48 @@ async function replaceRuntime(env: Env, row: UserAgentRow): Promise<UserAgentRow
   const oldId = row.runtime_id;
   const sandbox = await createSandbox(env, row.user_id);
   const domain = sandbox.domain || DEFAULT_SANDBOX_DOMAIN;
-  await waitForHarness(env, sandbox.sandboxID, domain);
+  try {
+    await waitForHarness(env, sandbox.sandboxID, domain);
 
-  await env.FROMDONNA_ROUTING.prepare(
-    `UPDATE user_agents
-     SET runtime_id = ?3, runtime_domain = ?4, status = 'ready', updated_at = CURRENT_TIMESTAMP
-     WHERE gateway = ?1 AND gateway_user_id = ?2`,
-  )
-    .bind(row.gateway, row.gateway_user_id, sandbox.sandboxID, domain)
-    .run();
+    // Keep status non-ready until Telegram gateway bootstrap succeeds.
+    await env.FROMDONNA_ROUTING.prepare(
+      `UPDATE user_agents
+       SET runtime_id = ?3, runtime_domain = ?4, status = 'provisioning',
+           provisioning_started_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+       WHERE gateway = ?1 AND gateway_user_id = ?2`,
+    )
+      .bind(row.gateway, row.gateway_user_id, sandbox.sandboxID, domain)
+      .run();
 
-  if (oldId && oldId !== sandbox.sandboxID && !oldId.startsWith("provisioning:")) {
-    await killSandboxBestEffort(env, oldId);
+    const pending: UserAgentRow = {
+      ...row,
+      runtime_id: sandbox.sandboxID,
+      runtime_domain: domain,
+      status: "provisioning",
+    };
+    await bootstrapHarness(env, pending);
+
+    await env.FROMDONNA_ROUTING.prepare(
+      `UPDATE user_agents
+       SET status = 'ready', updated_at = CURRENT_TIMESTAMP
+       WHERE gateway = ?1 AND gateway_user_id = ?2`,
+    )
+      .bind(row.gateway, row.gateway_user_id)
+      .run();
+
+    if (oldId && oldId !== sandbox.sandboxID && !oldId.startsWith("provisioning:")) {
+      await killSandboxBestEffort(env, oldId);
+    }
+
+    const next = await lookup(env, row.gateway, row.gateway_user_id);
+    if (!next || next.status !== "ready") throw new Error("Runtime replace failed to finalize D1 row.");
+    return next;
+  } catch (error) {
+    await killSandboxBestEffort(env, sandbox.sandboxID);
+    // Leave a failed row (not half-provisioned) so the next message reclaims cleanly.
+    await markFailed(env, row.gateway, row.gateway_user_id).catch(() => {});
+    throw error;
   }
-
-  const next = await lookup(env, row.gateway, row.gateway_user_id);
-  if (!next || next.status !== "ready") throw new Error("Runtime replace failed to finalize D1 row.");
-  await bootstrapHarness(env, next);
-  return next;
 }
 
 async function postTelegramUpdate(env: Env, row: UserAgentRow, update: TelegramUpdate): Promise<Response> {
@@ -379,12 +450,18 @@ async function injectTelegramUpdate(env: Env, row: UserAgentRow, update: Telegra
       return;
     } catch (error) {
       lastError = error instanceof Error ? error.message : String(error);
-      if (attempt === 0 && /missing|harness health|bootstrap failed|telegram inject|connect failed/i.test(lastError)) {
+      if (
+        attempt === 0 &&
+        /missing|harness health|bootstrap failed|telegram inject|connect failed|telegram gateway|gateway start/i.test(
+          lastError,
+        )
+      ) {
         try {
           current = await replaceRuntime(env, current);
           continue;
         } catch (replaceError) {
           lastError = replaceError instanceof Error ? replaceError.message : String(replaceError);
+          await markFailed(env, current.gateway, current.gateway_user_id).catch(() => {});
         }
       }
       throw new Error(lastError);
@@ -427,6 +504,20 @@ async function resolveReadyRow(
     row = await lookup(env, gateway, gatewayUserId);
   }
 
+  // Stuck provisioning (e.g. Worker waitUntil died mid-bootstrap): reclaim after 90s.
+  if (row?.status === "provisioning") {
+    const claimed = await claimStuckProvisioning(env, gateway, gatewayUserId, gatewayConversationId);
+    if (claimed) {
+      try {
+        return await provision(env, gateway, gatewayUserId);
+      } catch (error) {
+        await markFailed(env, gateway, gatewayUserId);
+        throw error;
+      }
+    }
+    return "provisioning";
+  }
+
   // Keep conversation id fresh (user may message from same account in same DM).
   if (row && row.gateway_conversation_id !== gatewayConversationId && row.status === "ready") {
     await env.FROMDONNA_ROUTING.prepare(
@@ -438,7 +529,7 @@ async function resolveReadyRow(
     row = { ...row, gateway_conversation_id: gatewayConversationId };
   }
 
-  if (!row || row.status === "provisioning") return "provisioning";
+  if (!row) return "provisioning";
   if (row.status !== "ready") throw new Error(`Unexpected agent runtime status: ${row.status}`);
   return row;
 }

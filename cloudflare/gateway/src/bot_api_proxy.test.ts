@@ -17,5 +17,7 @@ describe("bot proxy tokens", () => {
     });
     expect(await verifyBotProxyToken(secret, token + "x")).toBeNull();
     expect(await verifyBotProxyToken("other-secret-other-secret-other", token)).toBeNull();
+    // Malformed base64url segments must return null, not throw (Worker 500).
+    expect(await verifyBotProxyToken(secret, "fd1.invalid.token.xx")).toBeNull();
   });
 });

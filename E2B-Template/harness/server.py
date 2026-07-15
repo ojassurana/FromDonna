@@ -661,12 +661,21 @@ def _response(
 def health():
     with _state_lock:
         ready = bool(_worker_secret)
-        proxy_ready = bool(_telegram_proxy)
+        proxy_configured = bool(_telegram_proxy)
+    gateway_running = False
+    try:
+        from gateway_runtime import get_gateway_runtime
+
+        gateway_running = get_gateway_runtime(str(HERMES_HOME)).is_running()
+    except Exception:
+        gateway_running = False
     return {
         "ok": True,
         "service": "fromdonna-harness",
         "auth_ready": ready,
-        "telegram_proxy_ready": proxy_ready,
+        # Only true when proxy is configured AND Hermes TG gateway thread is up.
+        "telegram_proxy_ready": proxy_configured and gateway_running,
+        "gateway_running": gateway_running,
         "mode": "official-telegram-gateway",
     }
 
@@ -710,6 +719,8 @@ def _apply_telegram_proxy(proxy: TelegramProxyBootstrap, *, start: bool = False)
     )
     if start:
         runtime.start()
+        if not runtime.is_running():
+            raise RuntimeError("Telegram gateway start completed but runtime is not running")
 
 
 @app.post("/bootstrap")
@@ -730,16 +741,31 @@ def bootstrap(body: Bootstrap):
             already = False
 
         if body.telegramProxy is not None:
-            _telegram_proxy = body.telegramProxy.model_dump()
             proxy_to_apply = body.telegramProxy
 
     if proxy_to_apply is not None:
         try:
             # Start early so first user message does not pay cold connect cost,
             # and so connect/lock failures surface at bootstrap instead of inject.
+            # Only mark telegram_proxy configured after start succeeds — health
+            # used to lie (proxy stored, gateway dead).
             _apply_telegram_proxy(proxy_to_apply, start=True)
+            with _state_lock:
+                _telegram_proxy = proxy_to_apply.model_dump()
         except Exception as exc:
-            raise HTTPException(status_code=502, detail=f"telegram_gateway_start_failed: {exc}") from exc
+            # One more attempt after full runtime reset (poisoned adapter / lock).
+            try:
+                from gateway_runtime import reset_gateway_runtime_for_tests
+
+                reset_gateway_runtime_for_tests()
+                _apply_telegram_proxy(proxy_to_apply, start=True)
+                with _state_lock:
+                    _telegram_proxy = proxy_to_apply.model_dump()
+            except Exception as retry_exc:
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"telegram_gateway_start_failed: {retry_exc}",
+                ) from retry_exc
 
     return {"ok": True, "already": already, "telegram_proxy": bool(_telegram_proxy)}
 
