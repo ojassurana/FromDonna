@@ -61,7 +61,7 @@ Hermes’s own state on the box (or `$HERMES_HOME` if set), typically:
 | `config.yaml` | Settings / tools policy |
 | `skills/` | Installed and agent-written skills |
 | `state.db` / sessions | Conversation store |
-| Memory / user profile files | Cross-session memory |
+| `SOUL.md`, `memories/MEMORY.md`, `memories/USER.md` | Identity + curated memory (see [../hermes/identity-and-memory.md](../hermes/identity-and-memory.md)) |
 | cron, plugins, etc. | Other Hermes runtime state |
 
 **Day to day:** this stays **on the sandbox** (pause/resume preserves it).

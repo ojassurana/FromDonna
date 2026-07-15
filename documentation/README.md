@@ -21,6 +21,13 @@ Architecture and ops notes for the multi-user Hermes product: one Telegram bot, 
 | [deployment/e2b-template.md](./deployment/e2b-template.md) | Template recipe, warm start, `/bootstrap` caveat, build commands |
 | [deployment/memorymanagement.md](./deployment/memorymanagement.md) | Sandbox vs `~/.hermes` vs R2 |
 
+### Hermes (in-sandbox agent)
+
+| Doc | Contents |
+|-----|----------|
+| [hermes/README.md](./hermes/README.md) | Index for Hermes agent-runtime notes |
+| [hermes/identity-and-memory.md](./hermes/identity-and-memory.md) | **SOUL / MEMORY / USER** — prompt order, freeze policy, `memory` tool |
+
 ### Tooling
 
 | Doc | Contents |
