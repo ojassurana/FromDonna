@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { fromCodexResponses, parseCodexResponsesSse, toCodexResponsesRequest } from "../src/codex";
+import { grokRelayUrl } from "../src/env";
+import { fromGrokChatCompletion, toGrokChatCompletionsRequest } from "../src/grok";
 import { isSupportedModel, providerForModel, SUPPORTED_MODELS } from "../src/models";
 import {
   normalizeChatCompletionRequest,
@@ -8,13 +10,40 @@ import {
   toChatCompletionSse,
 } from "../src/openai";
 
-test("only advertised model IDs route to Codex", () => {
-  assert.deepEqual(SUPPORTED_MODELS, ["gpt-5.6-terra"]);
+test("catalog advertises Codex and Grok models with correct providers", () => {
+  assert.deepEqual(SUPPORTED_MODELS, [
+    "gpt-5.6-terra",
+    "grok-4.5",
+    "grok-4.3",
+    "grok-4.20-0309-reasoning",
+    "grok-4.20-0309-non-reasoning",
+  ]);
   assert.equal(isSupportedModel("gpt-5.6-terra"), true);
   assert.equal(providerForModel("gpt-5.6-terra"), "openai-codex");
+  assert.equal(providerForModel("grok-4.5"), "xai-oauth");
+  assert.equal(providerForModel("grok-4.3"), "xai-oauth");
   assert.equal(providerForModel("gpt-5.6-luna"), null);
-  assert.equal(providerForModel("grok-4"), null);
   assert.equal(providerForModel("default"), null);
+});
+
+test("derives Grok relay URL from Codex responses path", () => {
+  assert.equal(
+    grokRelayUrl({
+      CODEX_RELAY_URL: "https://example.ngrok-free.app/v1/responses",
+      RELAY_SHARED_SECRET: "x",
+      LLM_CAPABILITY_SECRET: "y",
+    }),
+    "https://example.ngrok-free.app/v1/chat/completions",
+  );
+  assert.equal(
+    grokRelayUrl({
+      CODEX_RELAY_URL: "https://example.ngrok-free.app/v1/responses",
+      GROK_RELAY_URL: "https://explicit.example/v1/chat/completions",
+      RELAY_SHARED_SECRET: "x",
+      LLM_CAPABILITY_SECRET: "y",
+    }),
+    "https://explicit.example/v1/chat/completions",
+  );
 });
 
 test("normalizes multipart messages and tool calls without flattening them", () => {
@@ -40,6 +69,44 @@ test("normalizes multipart messages and tool calls without flattening them", () 
   assert.equal(input[1].type, "function_call");
   assert.equal(input[2].type, "function_call_output");
   assert.equal((codex.tools as Array<Record<string, unknown>>)[0].name, "inspect_image");
+});
+
+test("maps Grok tool-call chat completions into the neutral contract", () => {
+  const request = normalizeChatCompletionRequest({
+    model: "grok-4.5",
+    messages: [{ role: "user", content: "Call ping" }],
+    tools: [{ type: "function", function: { name: "ping", parameters: { type: "object" } } }],
+    tool_choice: "required",
+    max_completion_tokens: 20,
+  });
+  const body = toGrokChatCompletionsRequest(request);
+  assert.equal(body.model, "grok-4.5");
+  assert.equal(body.stream, false);
+  assert.equal(body.max_tokens, 20);
+  assert.equal((body.tools as Array<Record<string, unknown>>)[0].type, "function");
+
+  const normalized = fromGrokChatCompletion({
+    id: "chatcmpl_g",
+    created: 1,
+    choices: [
+      {
+        index: 0,
+        finish_reason: "tool_calls",
+        message: {
+          role: "assistant",
+          content: "",
+          tool_calls: [{ id: "call_g1", type: "function", function: { name: "ping", arguments: "{}" } }],
+        },
+      },
+    ],
+    usage: { prompt_tokens: 3, completion_tokens: 2 },
+  });
+  const output = toChatCompletion("grok-4.5", normalized) as {
+    choices: Array<{ message: { tool_calls: Array<{ function: { name: string } }>; content: string | null }; finish_reason: string }>;
+  };
+  assert.equal(output.choices[0].finish_reason, "tool_calls");
+  assert.equal(output.choices[0].message.tool_calls[0].function.name, "ping");
+  assert.equal(output.choices[0].message.content, null);
 });
 
 test("converts Codex function calls back to OpenAI chat-completion format", () => {

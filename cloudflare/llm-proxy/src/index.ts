@@ -1,4 +1,4 @@
-import type { Env } from "./codex";
+import type { Env } from "./env";
 import { adapterForModel, SUPPORTED_MODELS } from "./models";
 import {
   ChatCompletionRequestError,

@@ -38,6 +38,8 @@ type E2bSandbox = { sandboxID: string; domain?: string | null };
 
 const json = (body: unknown, status = 200) => Response.json(body, { status });
 const DEFAULT_SANDBOX_DOMAIN = "e2b.dev";
+/** Idle auto-pause keeps the VM disk; this is max lifetime / each connect extension.
+ * E2B rejects timeout > 1 hour (HTTP 400). Every message extends by this amount. */
 const SANDBOX_TTL_SECONDS = 3600;
 const DEFAULT_WORKER_URL = "https://fromdonna-telegram-gateway.code-df4.workers.dev";
 
@@ -128,7 +130,8 @@ async function createSandbox(env: Env, userId: string): Promise<E2bSandbox> {
   return payload;
 }
 
-async function ensureSandboxRunning(env: Env, sandboxId: string): Promise<void> {
+/** Resume + extend TTL. Returns false when the sandbox no longer exists (expired/killed). */
+async function ensureSandboxRunning(env: Env, sandboxId: string): Promise<boolean> {
   const response = await fetch(`https://api.e2b.app/sandboxes/${sandboxId}/connect`, {
     method: "POST",
     headers: {
@@ -137,14 +140,26 @@ async function ensureSandboxRunning(env: Env, sandboxId: string): Promise<void> 
     },
     body: JSON.stringify({ timeout: SANDBOX_TTL_SECONDS }),
   });
-  if (!response.ok && response.status !== 404) {
+  if (response.status === 404) return false;
+  if (!response.ok) {
     const detail = await response.text().catch(() => "");
     throw new Error(`E2B connect failed with HTTP ${response.status}${detail ? `: ${detail.slice(0, 200)}` : ""}`);
   }
-  if (response.status === 404) throw new Error("E2B sandbox missing; needs re-provision.");
+  return true;
 }
 
-async function waitForHarness(env: Env, sandboxId: string, domain: string | null | undefined, attempts = 60): Promise<void> {
+async function killSandboxBestEffort(env: Env, sandboxId: string): Promise<void> {
+  try {
+    await fetch(`https://api.e2b.app/sandboxes/${sandboxId}`, {
+      method: "DELETE",
+      headers: { "X-API-KEY": required(env, "E2B_API_KEY") },
+    });
+  } catch {
+    // ignore — missing/already dead is fine
+  }
+}
+
+async function waitForHarness(env: Env, sandboxId: string, domain: string | null | undefined, attempts = 90): Promise<void> {
   const url = `${harnessBaseUrl(env, sandboxId, domain)}/health`;
   let lastError = "harness not ready";
   for (let i = 0; i < attempts; i++) {
@@ -281,19 +296,38 @@ async function provision(env: Env, gateway: string, gatewayUserId: string): Prom
   return row;
 }
 
-/** Push a raw Telegram update into the sandbox official Hermes Telegram gateway. */
-async function injectTelegramUpdate(env: Env, row: UserAgentRow, update: TelegramUpdate): Promise<void> {
-  if (row.runtime_provider !== "e2b") throw new Error(`Unsupported runtime provider: ${row.runtime_provider}`);
-  await ensureSandboxRunning(env, row.runtime_id);
-  try {
-    await bootstrapHarness(env, row);
-  } catch {
-    // already bootstrapped
+/**
+ * Ready row points at a dead/expired sandbox (or irreparable harness).
+ * Spin a fresh VM for the same user and remap D1 — then deliver the original turn.
+ */
+async function replaceRuntime(env: Env, row: UserAgentRow): Promise<UserAgentRow> {
+  const oldId = row.runtime_id;
+  const sandbox = await createSandbox(env, row.user_id);
+  const domain = sandbox.domain || DEFAULT_SANDBOX_DOMAIN;
+  await waitForHarness(env, sandbox.sandboxID, domain);
+
+  await env.FROMDONNA_ROUTING.prepare(
+    `UPDATE user_agents
+     SET runtime_id = ?3, runtime_domain = ?4, status = 'ready', updated_at = CURRENT_TIMESTAMP
+     WHERE gateway = ?1 AND gateway_user_id = ?2`,
+  )
+    .bind(row.gateway, row.gateway_user_id, sandbox.sandboxID, domain)
+    .run();
+
+  if (oldId && oldId !== sandbox.sandboxID && !oldId.startsWith("provisioning:")) {
+    await killSandboxBestEffort(env, oldId);
   }
 
+  const next = await lookup(env, row.gateway, row.gateway_user_id);
+  if (!next || next.status !== "ready") throw new Error("Runtime replace failed to finalize D1 row.");
+  await bootstrapHarness(env, next);
+  return next;
+}
+
+async function postTelegramUpdate(env: Env, row: UserAgentRow, update: TelegramUpdate): Promise<Response> {
   const url = `${harnessBaseUrl(env, row.runtime_id, row.runtime_domain)}/telegram/update`;
   const capability = await mintLlmCapability(env, row.user_id);
-  const response = await fetch(url, {
+  return fetch(url, {
     method: "POST",
     headers: {
       "content-type": "application/json",
@@ -302,10 +336,61 @@ async function injectTelegramUpdate(env: Env, row: UserAgentRow, update: Telegra
     },
     body: JSON.stringify({ update }),
   });
-  if (!response.ok) {
-    const detail = await response.text().catch(() => "");
-    throw new Error(`Sandbox telegram inject failed with HTTP ${response.status}${detail ? `: ${detail.slice(0, 300)}` : ""}`);
+}
+
+/** Push a raw Telegram update into the sandbox official Hermes Telegram gateway. */
+async function injectTelegramUpdate(env: Env, row: UserAgentRow, update: TelegramUpdate): Promise<void> {
+  if (row.runtime_provider !== "e2b") throw new Error(`Unsupported runtime provider: ${row.runtime_provider}`);
+
+  let current = row;
+  let lastError = "inject failed";
+
+  // Attempt 0: resume existing box. Attempt 1: replace runtime if gone/broken.
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const alive = await ensureSandboxRunning(env, current.runtime_id);
+      if (!alive) {
+        lastError = "E2B sandbox missing";
+        current = await replaceRuntime(env, current);
+        // fall through to inject on the new box
+      } else {
+        // Pause→resume: wait for harness, then re-bootstrap proxy + start gateway.
+        await waitForHarness(env, current.runtime_id, current.runtime_domain, 90);
+        await bootstrapHarness(env, current);
+      }
+
+      let response = await postTelegramUpdate(env, current, update);
+      if (!response.ok) {
+        const detail = await response.text().catch(() => "");
+        lastError = `Sandbox telegram inject failed with HTTP ${response.status}${detail ? `: ${detail.slice(0, 300)}` : ""}`;
+        // One soft retry on same box after re-bootstrap (stale gateway thread / lock).
+        await bootstrapHarness(env, current);
+        response = await postTelegramUpdate(env, current, update);
+        if (!response.ok) {
+          const detail2 = await response.text().catch(() => "");
+          lastError = `Sandbox telegram inject failed with HTTP ${response.status}${detail2 ? `: ${detail2.slice(0, 300)}` : ""}`;
+          if (attempt === 0) {
+            current = await replaceRuntime(env, current);
+            continue;
+          }
+          throw new Error(lastError);
+        }
+      }
+      return;
+    } catch (error) {
+      lastError = error instanceof Error ? error.message : String(error);
+      if (attempt === 0 && /missing|harness health|bootstrap failed|telegram inject|connect failed/i.test(lastError)) {
+        try {
+          current = await replaceRuntime(env, current);
+          continue;
+        } catch (replaceError) {
+          lastError = replaceError instanceof Error ? replaceError.message : String(replaceError);
+        }
+      }
+      throw new Error(lastError);
+    }
   }
+  throw new Error(lastError);
 }
 
 async function resolveReadyRow(
@@ -382,6 +467,8 @@ async function processTelegramUpdate(env: Env, update: TelegramUpdate): Promise<
   } catch (error) {
     console.error(error instanceof Error ? error.message : "processTelegramUpdate failed");
     try {
+      const detail = error instanceof Error ? error.message : "processTelegramUpdate failed";
+      console.error("processTelegramUpdate", detail);
       await telegram(env, "sendMessage", {
         chat_id: gatewayConversationId,
         text: "Something went wrong on my side. Please try again in a moment.",

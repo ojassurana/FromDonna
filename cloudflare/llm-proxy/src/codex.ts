@@ -1,3 +1,4 @@
+import type { Env } from "./env";
 import {
   ChatCompletionRequestError,
   type ChatContentPart,
@@ -8,12 +9,7 @@ import {
   UpstreamError,
 } from "./openai";
 
-export type Env = {
-  CODEX_RELAY_URL: string;
-  RELAY_SHARED_SECRET: string;
-  /** HMAC key shared with the Telegram gateway, never exposed to sandboxes. */
-  LLM_CAPABILITY_SECRET: string;
-};
+export type { Env };
 
 /**
  * The Worker never owns Codex OAuth state. The trusted relay resolves Hermes's

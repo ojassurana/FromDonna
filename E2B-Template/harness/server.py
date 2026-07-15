@@ -36,7 +36,7 @@ app = FastAPI()
 HOME = Path.home()
 HERMES_HOME = HOME / ".hermes"
 HERMES_BINARY = "/home/user/venv/bin/hermes"
-HERMES_MODEL = "gpt-5.6-terra"
+HERMES_MODEL = "grok-4.5"
 LLM_PROXY_BASE_URL = os.environ.get(
     "FROMDONNA_LLM_PROXY_BASE_URL",
     "https://fromdonna-llm-proxy.code-df4.workers.dev/v1",
@@ -735,7 +735,9 @@ def bootstrap(body: Bootstrap):
 
     if proxy_to_apply is not None:
         try:
-            _apply_telegram_proxy(proxy_to_apply)
+            # Start early so first user message does not pay cold connect cost,
+            # and so connect/lock failures surface at bootstrap instead of inject.
+            _apply_telegram_proxy(proxy_to_apply, start=True)
         except Exception as exc:
             raise HTTPException(status_code=502, detail=f"telegram_gateway_start_failed: {exc}") from exc
 

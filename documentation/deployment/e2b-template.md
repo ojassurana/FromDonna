@@ -14,7 +14,7 @@ Source tree: `E2B-Template/`
 | Dev template alias | `fromdonna-hermes-dev` |
 | Gateway var | `E2B_TEMPLATE=fromdonna-hermes` |
 | Harness port | `8788` (uvicorn warm start) |
-| Hermes config | `config/hermes/config.yaml` → LLM proxy base URL + `gpt-5.6-terra` |
+| Hermes config | `config/hermes/config.yaml` → LLM proxy base URL + `grok-4.5` |
 | Harness code | `E2B-Template/harness/server.py` |
 
 ### What is baked today

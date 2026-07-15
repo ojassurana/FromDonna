@@ -19,6 +19,7 @@ import asyncio
 import logging
 import os
 import threading
+import time
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -55,32 +56,44 @@ class GatewayRuntime:
     def start(self) -> None:
         if not self._proxy:
             raise RuntimeError("Telegram proxy config required before starting gateway")
-        with self._lock:
-            if self._thread and self._thread.is_alive():
-                # Another caller is already starting/running — wait for readiness
-                # instead of returning early with a half-built adapter.
-                wait_existing = True
+        last_error: Optional[BaseException] = None
+        for attempt in range(2):
+            with self._lock:
+                if self._thread and self._thread.is_alive() and self._start_error is None and self._ready.is_set():
+                    return
+                if self._thread and self._thread.is_alive() and not self._ready.is_set():
+                    wait_existing = True
+                else:
+                    wait_existing = False
+                    # Hard reset after a failed or dead boot so connect can retry
+                    # (stale same-PID platform locks are a common failure mode).
+                    self._clear_stale_telegram_lock()
+                    self._ready.clear()
+                    self._start_error = None
+                    self._runner = None
+                    self._adapter = None
+                    self._loop = None
+                    self._thread = threading.Thread(
+                        target=self._run_loop,
+                        name="fromdonna-hermes-gateway",
+                        daemon=True,
+                    )
+                    self._thread.start()
+            if not self._ready.wait(timeout=120):
+                last_error = RuntimeError("Hermes Telegram gateway failed to start within 120s")
+            elif self._start_error is not None:
+                last_error = self._start_error
+                if not wait_existing:
+                    with self._lock:
+                        if self._thread and not self._thread.is_alive():
+                            self._thread = None
             else:
-                wait_existing = False
-                self._ready.clear()
-                self._start_error = None
-                self._thread = threading.Thread(
-                    target=self._run_loop,
-                    name="fromdonna-hermes-gateway",
-                    daemon=True,
-                )
-                self._thread.start()
-        if not self._ready.wait(timeout=120):
-            raise RuntimeError("Hermes Telegram gateway failed to start within 120s")
-        if self._start_error is not None:
-            # Allow a subsequent start after a failed boot (stale lock, etc.).
-            if not wait_existing:
-                with self._lock:
-                    if self._thread and not self._thread.is_alive():
-                        self._thread = None
-            raise RuntimeError(
-                f"Hermes Telegram gateway failed to start: {self._start_error}"
-            ) from self._start_error
+                return
+            logger.warning("gateway start attempt %d failed: %s", attempt + 1, last_error)
+            time.sleep(0.3)
+        raise RuntimeError(
+            f"Hermes Telegram gateway failed to start: {last_error}"
+        ) from last_error
 
     def _clear_stale_telegram_lock(self) -> None:
         """Drop dead PID locks for this sandbox's proxy token so connect can proceed."""
@@ -258,7 +271,12 @@ class GatewayRuntime:
             except Exception:
                 logger.exception("Application.process_update failed for update_id=%s", update.get("update_id"))
                 raise
-            await self._wait_for_new_or_active_sessions(before)
+
+            # Live Bot API proxy already streams outbound mid-turn. Do NOT hold the
+            # Worker HTTP request for the full agent loop (CF subrequest timeouts
+            # caused "Something went wrong" after long idle / slow models).
+            # Wait briefly so handlers can schedule a session task, then return.
+            await self._wait_for_session_schedule(before, max_wait_s=2.0)
 
             if cq is not None:
                 # Ensure callback spinner is cleared even if a Hermes handler forgot answer().
@@ -275,6 +293,21 @@ class GatewayRuntime:
 
         future = asyncio.run_coroutine_threadsafe(_run(), self._loop)
         return future.result(timeout=840)
+
+    async def _wait_for_session_schedule(self, before_keys: set[str], max_wait_s: float = 2.0) -> None:
+        """Wait briefly for handle_message to schedule a session task, then return.
+
+        Outbound Telegram traffic already goes live via the Worker Bot API proxy,
+        so the inject HTTP call must not block for the whole agent turn.
+        """
+        assert self._adapter is not None
+        deadline = asyncio.get_event_loop().time() + max_wait_s
+        while asyncio.get_event_loop().time() < deadline:
+            tasks = getattr(self._adapter, "_session_tasks", {}) or {}
+            active = getattr(self._adapter, "_active_sessions", {}) or {}
+            if any(k not in before_keys for k in tasks.keys()) or tasks or active:
+                return
+            await asyncio.sleep(0.02)
 
     async def _wait_for_new_or_active_sessions(self, before_keys: set[str]) -> None:
         """Wait until official handle_message background work finishes."""

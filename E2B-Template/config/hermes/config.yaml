@@ -4,14 +4,14 @@
 
 model:
   provider: custom
-  default: "gpt-5.6-terra"
+  default: "grok-4.5"
 
 providers:
   custom:
     name: FromDonna LLM Proxy
     base_url: "https://fromdonna-llm-proxy.code-df4.workers.dev/v1"
     key_env: FROMDONNA_LLM_CAPABILITY
-    default_model: "gpt-5.6-terra"
+    default_model: "grok-4.5"
     api_mode: chat_completions
 
 display:
