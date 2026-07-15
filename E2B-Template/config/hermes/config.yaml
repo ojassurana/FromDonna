@@ -18,6 +18,17 @@ display:
   streaming: false
   tool_progress: false
 
+# Dangerous-command approvals (official Hermes approvals block).
+# FromDonna sandboxes are single-user isolated VMs — auto-approve by default
+# so Telegram turns are not blocked waiting for inline approval buttons.
+# mode: off ≡ --yolo (hardline blocklist + approvals.deny still apply).
+# Docs: hermes user-guide/security.md
+approvals:
+  mode: off
+  cron_mode: approve
+  destructive_slash_confirm: false
+  mcp_reload_confirm: false
+
 # Official Hermes Telegram tool surface inside the sandbox.
 platform_toolsets:
   telegram:
