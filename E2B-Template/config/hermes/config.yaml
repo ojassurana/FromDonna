@@ -17,10 +17,25 @@ providers:
 display:
   streaming: false   # CLI terminal only — does not control Telegram
   tool_progress: false
+  # Hide "💾 Self-improvement review: …" chat notices (review still runs).
+  memory_notifications: off
+  # Consumer UX: no mid-turn status spam or "I'm busy" / first-time busy tips.
+  # (busy tips are only attached to busy-ack messages, so this disables both.)
+  busy_ack_enabled: false
+  busy_steer_ack_enabled: false
+  interim_assistant_messages: false
+  # No "still working / heartbeat" status bubbles on long turns.
+  long_running_notifications: false
   # Telegram DMs: keep platform default streaming on once master switch is on.
   platforms:
     telegram:
       streaming: true
+      interim_assistant_messages: false
+      long_running_notifications: false
+
+# First-message profile-build offer off — plain intro / normal chat only.
+onboarding:
+  profile_build: off
 
 # Real-time replies on messaging platforms.
 # transport: auto → Telegram DMs use official Bot API sendMessageDraft

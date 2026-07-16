@@ -10209,6 +10209,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             command,
                             source.platform.value if source.platform else "?",
                         )
+                        # FromDonna: no "Unknown command /commands" bubbles for end users.
+                        if os.environ.get("FROMDONNA_RUNTIME") == "e2b":
+                            return ""
                         return (
                             f"Unknown command `/{command}`. "
                             f"Type /commands to see what's available, "
@@ -12470,6 +12473,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             source.platform.value if source.platform else "?",
             source.user_id,
         )
+        # FromDonna: silent deny for consumer UX (no "admin-only" / allowlist spam).
+        # Gate still enforces; user just sees no error bubble.
+        if os.environ.get("FROMDONNA_RUNTIME") == "e2b":
+            return ""
         allowed_preview = sorted(policy.user_allowed_commands)
         if allowed_preview:
             suffix = (
