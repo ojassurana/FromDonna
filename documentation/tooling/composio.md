@@ -129,7 +129,7 @@ Ops can also mint a link without Hermes:
 
 `POST /internal/connect` on the proxy (gateway-authenticated) → `redirect_url`.
 
-Donna SOUL includes a short **CONNECTED APPS** rule (template `config/hermes/SOUL.md`).
+Composio wiring lives in Hermes `mcp_servers.composio` + tool schemas (not SOUL — SOUL stays persona-only).
 
 ---
 
