@@ -749,22 +749,32 @@ def _apply_identity_env(
 
 
 def _apply_composio_mcp(mcp: ComposioMcpBootstrap) -> None:
-    """Point Hermes MCP client at composio-proxy (Bearer session token only; product key stays on Worker)."""
+    """Point Hermes MCP client at composio-proxy (Bearer session token only; product key stays on Worker).
+
+    Production: shared MCP URL for all users; identity is the per-user Bearer
+    (30d TTL, re-minted on every gateway bootstrap). Never stores COMPOSIO_API_KEY.
+    """
     url = (mcp.url or "").strip()
     token = (mcp.token or "").strip()
     if not url or not token:
         return
     os.environ["FROMDONNA_COMPOSIO_MCP_URL"] = url
-    # Token is short-lived; do not treat as a product secret for logging.
+    # Production-duration session token; do not treat as a product secret for logging.
     os.environ["FROMDONNA_COMPOSIO_MCP_TOKEN"] = token
     if mcp.toolkits:
         os.environ["FROMDONNA_COMPOSIO_TOOLKITS"] = ",".join(mcp.toolkits)
 
     HERMES_HOME.mkdir(parents=True, exist_ok=True)
     config_path = HERMES_HOME / "config.yaml"
+    # Match Hermes streamable-HTTP MCP shape (url + headers).
+    # Longer timeouts: Composio tool_router can be slow on first tools/list.
     server_entry = {
         "url": url,
         "headers": {"Authorization": f"Bearer {token}"},
+        "timeout": 180,
+        "connect_timeout": 60,
+        # Composio MCP answers streamable HTTP over POST; HEAD/GET probes can mis-detect.
+        "skip_preflight": True,
     }
     try:
         import yaml  # type: ignore
@@ -794,6 +804,9 @@ def _apply_composio_mcp(mcp: ComposioMcpBootstrap) -> None:
             f"    url: {_json.dumps(url)}\n"
             "    headers:\n"
             f"      Authorization: {_json.dumps('Bearer ' + token)}\n"
+            "    timeout: 180\n"
+            "    connect_timeout: 60\n"
+            "    skip_preflight: true\n"
         )
         # If a config already exists, append is wrong; write sidecar for ops
         sidecar = HERMES_HOME / "fromdonna-composio-mcp.yaml"

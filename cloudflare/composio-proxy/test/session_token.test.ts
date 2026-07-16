@@ -13,10 +13,11 @@ import { DEFAULT_SESSION_TTL_SECONDS, sessionTtlSeconds } from "../src/env";
 const SECRET = "test-session-secret-at-least-16-chars";
 
 test("defaultToolkits matches product allowlist length", () => {
-  assert.equal(defaultToolkits().length, 16);
+  assert.equal(defaultToolkits().length, 12);
   assert.ok(defaultToolkits().includes("gmail"));
+  assert.ok(defaultToolkits().includes("googledrive"));
   assert.ok(defaultToolkits().includes("dropbox_sign"));
-  assert.equal(DEFAULT_COMPOSIO_TOOLKITS.length, 16);
+  assert.equal(DEFAULT_COMPOSIO_TOOLKITS.length, 12);
 });
 
 test("resolveToolkits never expands beyond default allowlist", () => {

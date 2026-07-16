@@ -13,21 +13,17 @@ export type ComposioEnv = {
 
 const DEFAULT_COMPOSIO_PROXY = "https://fromdonna-composio-proxy.code-df4.workers.dev";
 
-/** Keep in sync with cloudflare/composio-proxy/src/toolkits.ts */
+/** Keep in sync with cloudflare/composio-proxy/src/toolkits.ts (Composio Tool Router slugs). */
 export const DEFAULT_COMPOSIO_TOOLKITS = [
   "gmail",
-  "google_drive",
-  "google_calendar",
-  "google_sheets",
-  "google_docs",
+  "googledrive",
+  "googlecalendar",
+  "googlesheets",
+  "googledocs",
   "github",
   "notion",
   "linkedin",
   "dropbox",
-  "onedrive",
-  "sharepoint",
-  "docusign",
-  "strava",
   "splitwise",
   "outlook",
   "dropbox_sign",

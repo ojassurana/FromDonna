@@ -40,14 +40,19 @@ composio-proxy Worker
 
 ## Default toolkit allowlist (new users)
 
+Composio **Tool Router slugs** (validated live). Underscore forms like `google_drive` are **invalid**.
+
 ```yaml
-gmail, google_drive, google_calendar, google_sheets, google_docs,
-github, notion, linkedin, dropbox, onedrive, sharepoint,
-docusign, strava, splitwise, outlook, dropbox_sign
+gmail, googledrive, googlecalendar, googlesheets, googledocs,
+github, notion, linkedin, dropbox, splitwise, outlook, dropbox_sign
 ```
 
-Source of truth in code: `cloudflare/composio-proxy/src/toolkits.ts`  
-(gateway keeps a copy for D1 seeding: `cloudflare/gateway/src/composio.ts`).
+Aliases (`google_drive` → `googledrive`, etc.) are canonicalized in the proxy.
+
+**Not in default** (need Composio project auth configs or invalid slugs): `docusign`, `strava`, `onedrive`, `sharepoint`.
+
+Source of truth: `cloudflare/composio-proxy/src/toolkits.ts`  
+(gateway copy for D1 seeding: `cloudflare/gateway/src/composio.ts`).
 
 ## Lifecycle
 
@@ -93,9 +98,36 @@ curl -sS -X POST "$COMPOSIO_PROXY/internal/session" \
 
 ## Verification checklist
 
-- [ ] No `COMPOSIO_API_KEY` under `E2B-Template/`  
-- [ ] New Telegram user → `user_composio` row with default toolkits  
-- [ ] Bootstrap sets Hermes `mcp_servers.composio`  
-- [ ] MCP `tools/list` scoped to allowlist (after live key)  
-- [ ] Connect Gmail → tool call succeeds  
-- [ ] New E2B for same user reuses connections  
+- [x] No `COMPOSIO_API_KEY` under `E2B-Template/`  
+- [x] Proxy health + default toolkits  
+- [x] MCP Bearer TTL = 30d (`SESSION_TTL_SECONDS=2592000`); sticky `trs_` in D1  
+- [x] Live MCP `tools/list` returns Composio tool-router tools (`COMPOSIO_MANAGE_CONNECTIONS`, search/execute, …)  
+- [x] Live `POST /internal/connect` → `connect.composio.dev` login URL  
+- [x] Sticky session re-mint sets `reused_composio_session: true`  
+- [x] Prod E2B template rebuilt with Composio harness (`fromdonna-hermes`)  
+- [x] Sandbox bootstrap writes Hermes `mcp_servers.composio` (url + Bearer, timeout/skip_preflight)  
+- [x] Default toolkit slugs validated live (incl. `googledrive`, `googlecalendar`, …)  
+- [ ] New Telegram user → `user_composio` row with default toolkits (gateway path on real DM)  
+- [ ] User completes browser OAuth → Gmail tool call succeeds  
+- [ ] New E2B for same user reuses OAuth connections  
+
+### Production deploy order
+
+```bash
+# 1) composio-proxy secrets + deploy
+cd cloudflare/composio-proxy
+npx wrangler secret put COMPOSIO_API_KEY
+npx wrangler secret put COMPOSIO_SESSION_SECRET
+npx wrangler deploy
+
+# 2) gateway (same COMPOSIO_SESSION_SECRET) + D1 migrations
+cd ../gateway
+npx wrangler secret put COMPOSIO_SESSION_SECRET
+npx wrangler d1 migrations apply fromdonna-routing --remote
+npx wrangler deploy
+
+# 3) E2B template (harness writes mcp_servers.composio)
+cd ../../E2B-Template
+npm run build:prod   # alias fromdonna-hermes
+# Existing user sandboxes keep the old image until recreated/reclaimed.
+```

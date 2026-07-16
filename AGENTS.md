@@ -13,7 +13,24 @@ When adding or changing a **plain HTTP API** connector (product API key; not cha
 
 **Live Exa:** sandbox `web.backend: exa`, `EXA_API_KEY=STUB`, `EXA_BASE_URL=https://fromdonna-api-proxy.code-df4.workers.dev/v1/exa`.
 
-**Not this bucket:** channel tokens → gateway; model credentials → llm-proxy; OAuth multi-user apps → tooling docs (connector pattern).
+**Not this bucket:** channel tokens → gateway; model credentials → llm-proxy; **OAuth multi-user apps (Gmail etc.) → Composio** (below).
+
+## Composio (OAuth apps + MCP for Hermes/Donna)
+
+Production multi-user Gmail/Drive/GitHub/… via **Composio**. Full write-up: [documentation/tooling/composio.md](./documentation/tooling/composio.md).
+
+| Piece | Where | Rule |
+|--------|--------|------|
+| `COMPOSIO_API_KEY` | **`fromdonna-composio-proxy` secret only** | Never gateway, never E2B, never git |
+| Shared MCP URL | `https://fromdonna-composio-proxy…/mcp` | Same for all users |
+| Per-user identity | Bearer HMAC session token | Minted by gateway at bootstrap; **30d TTL** default |
+| Sticky tool-router session | D1 `user_composio.composio_session_id` | Reuse across E2B recreate |
+| Toolkit allowlist | D1 `user_composio.toolkits_json` | Forever policy (seeded once) |
+
+1. **Gateway** `ensureUserComposio` + `mintComposioMcpAccess` on harness bootstrap → injects `composioMcp` into sandbox.
+2. **Harness** writes Hermes `mcp_servers.composio` (url + Bearer only).
+3. **User connects** via Composio `COMPOSIO_MANAGE_CONNECTIONS` / `POST /internal/connect` → `connect.composio.dev` login URL (browser once).
+4. After **any** harness/composio template change: **`cd E2B-Template && npm run build:prod`** (alias `fromdonna-hermes`). Existing sandboxes keep old image until recreated.
 
 ## AWS CLI (this server)
 
