@@ -156,9 +156,11 @@ New users get the new image immediately. Existing sandboxes keep the old filesys
 | Gateway Worker | `cd cloudflare/gateway && npx wrangler deploy` |
 | D1 migrations | `npx wrangler d1 migrations apply fromdonna-routing --remote` |
 | LLM proxy | `cd cloudflare/llm-proxy && npx wrangler deploy` |
-| API proxy | `cd cloudflare/api-proxy && npx wrangler secret put EXA_API_KEY && npx wrangler deploy` |
+| API proxy | `cd cloudflare/api-proxy && npx wrangler secret put <VENDOR>_API_KEY && npx wrangler deploy` |
 | E2B template | `cd E2B-Template && npm run build:prod` |
 | Telegram webhook | Bot API `setWebhook` (see [telegram.md](./telegram.md)) |
+
+Adding a new product HTTP API: follow **Protocol: adding another API connector** in [../tooling/api-proxy-worker.md](../tooling/api-proxy-worker.md) (not gateway secrets).
 
 ---
 

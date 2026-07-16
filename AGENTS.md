@@ -1,5 +1,20 @@
 # FromDonna — Agent Notes
 
+## API connectors (api-proxy)
+
+When adding or changing a **plain HTTP API** connector (product API key; not channel bots, not LLM inference):
+
+1. **Put the real key only on `fromdonna-api-proxy`** (`cloudflare/api-proxy/`). Never on gateway, llm-proxy, E2B template, or git.
+2. **Sandbox** gets a placeholder (`STUB` today) + public base URL to api-proxy; reverse-proxy by swapping auth (prefer official SDK + `base_url` when available).
+3. **Routes:** `POST /v1/<vendor>/…` on api-proxy with an explicit path allowlist.
+4. **Auth:** stub for now; leave a TODO for real capability HMAC (same family as LLM proxy) — do not invent a third model.
+5. Wire template/harness env + agent config if the tool must be on by default; **rebuild E2B template** after sandbox-facing changes.
+6. Full checklist: [documentation/tooling/api-proxy-worker.md](./documentation/tooling/api-proxy-worker.md) (section *Protocol: adding another API connector*). Connector buckets overview: [documentation/tooling/general.md](./documentation/tooling/general.md).
+
+**Live Exa:** sandbox `web.backend: exa`, `EXA_API_KEY=STUB`, `EXA_BASE_URL=https://fromdonna-api-proxy.code-df4.workers.dev/v1/exa`.
+
+**Not this bucket:** channel tokens → gateway; model credentials → llm-proxy; OAuth multi-user apps → Nango pattern in tooling docs.
+
 ## AWS CLI (this server)
 
 - AWS CLI is installed; config lives in `~/.aws/`.

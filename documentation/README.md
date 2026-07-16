@@ -34,7 +34,7 @@ Architecture and ops notes for the multi-user Hermes product: one Telegram bot, 
 | Doc | Contents |
 |-----|----------|
 | [tooling/general.md](./tooling/general.md) | Connectors (Nango / CLI / MCP / API); three Worker doors |
-| [tooling/api-proxy-worker.md](./tooling/api-proxy-worker.md) | **API proxy Worker** — Exa (and future HTTP APIs); keys never in E2B |
+| [tooling/api-proxy-worker.md](./tooling/api-proxy-worker.md) | **API proxy Worker** — Exa + **how to add more API connectors**; keys never in E2B |
 
 ## Live path (one sentence)
 

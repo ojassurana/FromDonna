@@ -20,7 +20,7 @@ Any external action → E2B → dedicated Worker door → backend
 - **API keys for product connectors** = **api-proxy only**, never gateway, never sandbox.
 - Sandbox never gets long-lived provider secrets (Gmail, Zepto, Exa, Nango keys, etc.).
 
-See [api-proxy-worker.md](./api-proxy-worker.md) for the API door.
+See [api-proxy-worker.md](./api-proxy-worker.md) for the API door and the **protocol for adding more API connectors**.
 
 ## Four connector buckets
 
