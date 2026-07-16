@@ -15,7 +15,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from gateway.config import Platform, PlatformConfig
-from gateway.platforms.base import MessageEvent, MessageType, ProcessingOutcome, SendResult
+from gateway.platforms.base import MessageEvent, MessageType, ProcessingOutcome
 from gateway.session import SessionSource
 
 
@@ -143,7 +143,10 @@ async def test_on_processing_start_does_not_set_eyes_lifecycle(monkeypatch):
     monkeypatch.setenv("TELEGRAM_REACTIONS", "true")
     monkeypatch.setenv("FROMDONNA_TELEGRAM_UX", "true")
     adapter = _make_adapter()
-    adapter.send = AsyncMock(return_value=SendResult(success=True, message_id="900"))
+    adapter._bot.send_message = AsyncMock(
+        return_value=SimpleNamespace(message_id=900)
+    )
+    adapter._disable_link_previews = False
     event = _make_event(text="this is amazing")
 
     with patch(
@@ -157,6 +160,7 @@ async def test_on_processing_start_does_not_set_eyes_lifecycle(monkeypatch):
     for call in adapter._bot.set_message_reaction.await_args_list:
         assert call.kwargs.get("reaction") != "\U0001f440"
         assert call.kwargs.get("reaction") != "👀"
+    await adapter._fromdonna_clear_thinking_dots("123")
 
 
 @pytest.mark.asyncio
@@ -166,7 +170,10 @@ async def test_on_processing_start_applies_context_emoji(monkeypatch):
 
     monkeypatch.setenv("FROMDONNA_TELEGRAM_UX", "true")
     adapter = _make_adapter()
-    adapter.send = AsyncMock(return_value=SendResult(success=True, message_id="900"))
+    adapter._bot.send_message = AsyncMock(
+        return_value=SimpleNamespace(message_id=900)
+    )
+    adapter._disable_link_previews = False
     event = _make_event(text="thank you so much")
 
     with patch(
@@ -189,12 +196,12 @@ async def test_on_processing_start_skipped_when_fromdonna_ux_disabled(monkeypatc
     monkeypatch.setenv("FROMDONNA_TELEGRAM_UX", "false")
     monkeypatch.setenv("TELEGRAM_REACTIONS", "true")
     adapter = _make_adapter()
-    adapter.send = AsyncMock()
+    adapter._bot.send_message = AsyncMock()
     event = _make_event()
 
     await adapter.on_processing_start(event)
 
-    adapter.send.assert_not_awaited()
+    adapter._bot.send_message.assert_not_awaited()
     adapter._bot.set_message_reaction.assert_not_awaited()
 
 
@@ -203,7 +210,7 @@ async def test_on_processing_start_handles_missing_ids(monkeypatch):
     """Should handle events without chat_id or message_id gracefully."""
     monkeypatch.setenv("FROMDONNA_TELEGRAM_UX", "true")
     adapter = _make_adapter()
-    adapter.send = AsyncMock()
+    adapter._bot.send_message = AsyncMock()
     event = MessageEvent(
         text="hello",
         message_type=MessageType.TEXT,
@@ -214,7 +221,7 @@ async def test_on_processing_start_handles_missing_ids(monkeypatch):
     await adapter.on_processing_start(event)
     await asyncio.sleep(0.02)
 
-    adapter.send.assert_not_awaited()
+    adapter._bot.send_message.assert_not_awaited()
     adapter._bot.set_message_reaction.assert_not_awaited()
 
 

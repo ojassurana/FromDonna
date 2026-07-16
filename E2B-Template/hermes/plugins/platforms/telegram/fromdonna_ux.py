@@ -7,12 +7,25 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import urllib.request
 from typing import Any, Callable, Optional
 
 # Temporary status bubble while the agent turn is in flight.
+# Frames stay the product-requested ". → .. → ..." cycle.
 DOTS_FRAMES: tuple[str, ...] = (".", "..", "...")
-DOTS_INTERVAL_SECONDS: float = 0.55
+# Snappy loop (~0.96s full cycle). Telegram soft-limits ~1 edit/s per chat
+# for sustained traffic; short bursts of ~3 edits/s are fine for a few seconds
+# (Hermes streaming uses 0.8s for long progressive text; we use a faster
+# cadence only for 1–3 char frames, then back off).
+DOTS_INTERVAL_SECONDS: float = 0.32
+# After DOTS_SLOW_AFTER_SECONDS of animating, drop to this interval so long
+# agent turns do not burn Bot API quota / trip flood control.
+DOTS_SLOW_INTERVAL_SECONDS: float = 0.85
+DOTS_SLOW_AFTER_SECONDS: float = 10.0
+# Stop issuing edits after this many seconds; leave a static "..." until the
+# real reply deletes the bubble. Caps worst-case API cost per turn.
+DOTS_MAX_ANIMATE_SECONDS: float = 60.0
 THINKING_DOTS_METADATA_KEY = "fromdonna_thinking_dots"
 THINKING_DOTS_STATUS_KEY = "fromdonna_thinking_dots"
 
@@ -49,6 +62,53 @@ def dots_sequence(length: int = 6) -> list[str]:
         frame, idx = next_dots_frame(idx)
         out.append(frame)
     return out
+
+
+def dots_edit_interval(elapsed_seconds: float) -> Optional[float]:
+    """Return sleep seconds before the next edit, or ``None`` to freeze.
+
+    Adaptive schedule used by the adapter animate loop:
+    - fast for the first ~10s (feels snappy)
+    - slow after that (long tool runs)
+    - ``None`` after the max animate window (static final frame, zero API)
+    """
+    try:
+        elapsed = float(elapsed_seconds)
+    except (TypeError, ValueError):
+        elapsed = 0.0
+    if elapsed < 0:
+        elapsed = 0.0
+    if elapsed >= DOTS_MAX_ANIMATE_SECONDS:
+        return None
+    if elapsed >= DOTS_SLOW_AFTER_SECONDS:
+        return DOTS_SLOW_INTERVAL_SECONDS
+    return DOTS_INTERVAL_SECONDS
+
+
+def dots_retry_after_seconds(exc: BaseException, *, default: float = 1.0) -> float:
+    """Extract Telegram flood ``retry_after`` from an exception when present."""
+    retry = getattr(exc, "retry_after", None)
+    if retry is None:
+        # python-telegram-bot wraps RetryAfter; also scan the message.
+        cause = getattr(exc, "__cause__", None)
+        retry = getattr(cause, "retry_after", None) if cause is not None else None
+    if retry is not None:
+        try:
+            return max(0.1, float(retry))
+        except (TypeError, ValueError):
+            pass
+    text = str(exc).lower()
+    if "retry after" in text:
+        m = re.search(r"retry after\s+(\d+(?:\.\d+)?)", text)
+        if m:
+            try:
+                return max(0.1, float(m.group(1)))
+            except ValueError:
+                pass
+    try:
+        return max(0.1, float(default))
+    except (TypeError, ValueError):
+        return 1.0
 
 
 def constrain_reaction_emoji(raw: Any, *, default: str = DEFAULT_REACTION_EMOJI) -> str:
@@ -235,11 +295,16 @@ __all__ = [
     "DEFAULT_REACTION_EMOJI",
     "DOTS_FRAMES",
     "DOTS_INTERVAL_SECONDS",
+    "DOTS_MAX_ANIMATE_SECONDS",
+    "DOTS_SLOW_AFTER_SECONDS",
+    "DOTS_SLOW_INTERVAL_SECONDS",
     "REACTION_EMOJIS",
     "THINKING_DOTS_METADATA_KEY",
     "THINKING_DOTS_STATUS_KEY",
     "classify_reaction_emoji",
     "constrain_reaction_emoji",
+    "dots_edit_interval",
+    "dots_retry_after_seconds",
     "dots_sequence",
     "heuristic_reaction_emoji",
     "is_thinking_dots_metadata",

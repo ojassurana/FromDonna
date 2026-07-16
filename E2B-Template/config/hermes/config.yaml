@@ -83,6 +83,11 @@ plugins:
 platforms:
   telegram:
     enabled: true
+    # Consumer DM UX: never quote the user's message on bot replies.
+    # Default Hermès "first" makes every send() re-attach a purple reply
+    # header ("Name / original text") — looks broken when the agent sends
+    # multiple bubbles or a thinking-dots status. FromDonna is 1:1 DMs.
+    reply_to_mode: "off"
     # Official Hermes group response whitelist (→ TELEGRAM_ALLOWED_CHATS).
     # When non-empty, group/supergroup messages outside this list are ignored.
     # DMs are never filtered. "0" is not a real Telegram group chat id, so this

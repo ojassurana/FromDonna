@@ -105,6 +105,29 @@ def test_dots_cycle_sequence():
     assert i3 == 0
 
 
+def test_dots_edit_interval_adaptive():
+    from plugins.platforms.telegram.fromdonna_ux import (
+        DOTS_INTERVAL_SECONDS,
+        DOTS_MAX_ANIMATE_SECONDS,
+        DOTS_SLOW_AFTER_SECONDS,
+        DOTS_SLOW_INTERVAL_SECONDS,
+        dots_edit_interval,
+        dots_retry_after_seconds,
+    )
+
+    assert DOTS_INTERVAL_SECONDS < 0.4  # snappy
+    assert dots_edit_interval(0.0) == DOTS_INTERVAL_SECONDS
+    assert dots_edit_interval(DOTS_SLOW_AFTER_SECONDS) == DOTS_SLOW_INTERVAL_SECONDS
+    assert dots_edit_interval(DOTS_MAX_ANIMATE_SECONDS) is None
+    assert dots_edit_interval(DOTS_MAX_ANIMATE_SECONDS + 5) is None
+
+    class _Flood(Exception):
+        retry_after = 2.5
+
+    assert dots_retry_after_seconds(_Flood()) == 2.5
+    assert dots_retry_after_seconds(RuntimeError("retry after 3"), default=1.0) == 3.0
+
+
 def test_reaction_allowlist_and_constraint():
     from plugins.platforms.telegram.fromdonna_ux import (
         REACTION_EMOJIS,
@@ -174,21 +197,12 @@ async def test_legacy_lifecycle_reactions_disabled(adapter):
 
 @pytest.mark.asyncio
 async def test_processing_start_posts_dots_and_reacts(adapter, monkeypatch):
-    from plugins.platforms.telegram.fromdonna_ux import (
-        REACTION_EMOJIS,
-        THINKING_DOTS_METADATA_KEY,
+    from plugins.platforms.telegram.fromdonna_ux import REACTION_EMOJIS
+
+    adapter._bot.send_message = AsyncMock(
+        return_value=SimpleNamespace(message_id=500)
     )
-    from gateway.platforms.base import SendResult
-
-    sent = {}
-
-    async def fake_send(chat_id, content, reply_to=None, metadata=None):
-        sent["chat_id"] = chat_id
-        sent["content"] = content
-        sent["metadata"] = metadata
-        return SendResult(success=True, message_id="500")
-
-    adapter.send = AsyncMock(side_effect=fake_send)
+    adapter._disable_link_previews = False
 
     # Deterministic classifier path (no network).
     monkeypatch.setattr(
@@ -201,8 +215,10 @@ async def test_processing_start_posts_dots_and_reacts(adapter, monkeypatch):
     # Allow parallel react task to finish.
     await asyncio.sleep(0.05)
 
-    assert sent["content"] == "."
-    assert sent["metadata"].get(THINKING_DOTS_METADATA_KEY) is True
+    adapter._bot.send_message.assert_awaited()
+    send_kwargs = adapter._bot.send_message.await_args.kwargs
+    assert send_kwargs.get("text") == "."
+    assert send_kwargs.get("disable_notification") is True
     assert "42" in adapter._fromdonna_thinking
     assert adapter._fromdonna_thinking["42"]["message_id"] == "500"
 
@@ -278,32 +294,41 @@ async def test_processing_complete_deletes_thinking_dots(adapter):
 @pytest.mark.asyncio
 async def test_dots_animation_cycles_frames(adapter, monkeypatch):
     from plugins.platforms.telegram.fromdonna_ux import DOTS_FRAMES
-    from gateway.platforms.base import SendResult
 
-    # Speed up animation for the test.
+    # Speed up animation for the test (fast + slow windows both short).
     monkeypatch.setattr(
         "plugins.platforms.telegram.fromdonna_ux.DOTS_INTERVAL_SECONDS",
         0.02,
     )
+    monkeypatch.setattr(
+        "plugins.platforms.telegram.fromdonna_ux.DOTS_SLOW_INTERVAL_SECONDS",
+        0.02,
+    )
+    monkeypatch.setattr(
+        "plugins.platforms.telegram.fromdonna_ux.DOTS_SLOW_AFTER_SECONDS",
+        10.0,
+    )
+    monkeypatch.setattr(
+        "plugins.platforms.telegram.fromdonna_ux.DOTS_MAX_ANIMATE_SECONDS",
+        60.0,
+    )
 
-    adapter.send = AsyncMock(return_value=SendResult(success=True, message_id="900"))
+    adapter._bot.send_message = AsyncMock(
+        return_value=SimpleNamespace(message_id=900)
+    )
+    adapter._bot.edit_message_text = AsyncMock()
+    adapter._disable_link_previews = False
     adapter.delete_message = AsyncMock(return_value=True)
 
     await adapter._fromdonna_start_thinking_dots(_make_event())
     # Wait for a few animation ticks.
     await asyncio.sleep(0.12)
 
-    texts = [
-        call.kwargs.get("text") or (call.args[0] if call.args else None)
-        for call in adapter._bot.edit_message_text.await_args_list
-    ]
-    # edit_message_text is called as keyword text=...
     edited = []
     for call in adapter._bot.edit_message_text.await_args_list:
         if call.kwargs.get("text") is not None:
             edited.append(call.kwargs["text"])
         elif call.args:
-            # positional form not expected, but tolerate
             edited.append(call.args[-1] if call.args else None)
 
     assert any(t in DOTS_FRAMES for t in edited), f"expected dots edits, got {edited}"
@@ -316,7 +341,7 @@ async def test_dots_animation_cycles_frames(adapter, monkeypatch):
 @pytest.mark.asyncio
 async def test_ux_can_be_disabled(adapter, monkeypatch):
     monkeypatch.setenv("FROMDONNA_TELEGRAM_UX", "false")
-    adapter.send = AsyncMock()
+    adapter._bot.send_message = AsyncMock()
     await adapter.on_processing_start(_make_event())
-    adapter.send.assert_not_awaited()
+    adapter._bot.send_message.assert_not_awaited()
     assert adapter._fromdonna_thinking == {}

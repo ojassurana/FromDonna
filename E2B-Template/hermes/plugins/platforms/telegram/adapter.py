@@ -8580,10 +8580,22 @@ class TelegramAdapter(BasePlatformAdapter):
         *,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> None:
-        """Post a temporary ``.`` bubble and animate ``.`` → ``..`` → ``...``."""
+        """Post a temporary ``.`` bubble and animate ``.`` → ``..`` → ``...``.
+
+        Efficiency notes (common Telegram bot practice):
+        - Plain-text Bot API only (no Markdown / rich / full ``send()`` path).
+        - Silent notification so the status bubble is not a push ping.
+        - Adaptive edit cadence: fast for ~10s, then slow, then freeze on ``...``.
+        - Flood-control aware (honor ``retry_after`` instead of spinning).
+        - Skip no-op edits; stop cleanly when the real reply deletes the bubble.
+        """
+        import time as _time
+
         from plugins.platforms.telegram.fromdonna_ux import (
-            DOTS_INTERVAL_SECONDS,
+            DOTS_FRAMES,
             THINKING_DOTS_METADATA_KEY,
+            dots_edit_interval,
+            dots_retry_after_seconds,
             next_dots_frame,
         )
 
@@ -8606,50 +8618,125 @@ class TelegramAdapter(BasePlatformAdapter):
                 dots_meta["thread_id"] = str(thread_id)
 
         first_frame, next_idx = next_dots_frame(0)
+        # Direct plain-text send — avoid format_message / rich / typing re-arm.
         try:
-            result = await self.send(chat_key, first_frame, metadata=dots_meta)
+            thread_id = self._metadata_thread_id(dots_meta)
+            thread_kwargs = self._thread_kwargs_for_send(
+                chat_key,
+                thread_id,
+                dots_meta,
+                reply_to_message_id=None,
+                reply_to_mode="off",
+            )
+            send_kwargs: Dict[str, Any] = {
+                "chat_id": normalize_telegram_chat_id(chat_key),
+                "text": first_frame,
+                "disable_notification": True,
+            }
+            send_kwargs.update(thread_kwargs)
+            # Prefer disabling link previews when the installed PTB supports it.
+            try:
+                send_kwargs.update(self._link_preview_kwargs())
+            except Exception:
+                pass
+            msg = await self._bot.send_message(**send_kwargs)
+            message_id = getattr(msg, "message_id", None)
+            if message_id is None and isinstance(msg, dict):
+                message_id = msg.get("message_id")
         except Exception as e:
-            logger.debug("[%s] thinking-dots send failed: %s", self.name, e)
+            logger.debug(
+                "[%s] thinking-dots send failed: %s",
+                getattr(self, "name", "telegram"),
+                e,
+            )
             return
-        if not result or not result.success or not result.message_id:
+        if message_id is None:
             return
 
         stop_event = asyncio.Event()
         state: Dict[str, Any] = {
-            "message_id": str(result.message_id),
+            "message_id": str(message_id),
             "stop_event": stop_event,
             "frame_index": next_idx,
             "task": None,
+            "last_text": first_frame,
         }
         self._fromdonna_thinking_map()[chat_key] = state
+        tg_chat_id = normalize_telegram_chat_id(chat_key)
+        msg_id_int = int(message_id)
 
         async def _animate() -> None:
             idx = next_idx
+            started = _time.monotonic()
             while not stop_event.is_set():
+                elapsed = _time.monotonic() - started
+                interval = dots_edit_interval(elapsed)
+                if interval is None:
+                    # Budget exhausted: pin on "..." once if needed, then idle.
+                    final = DOTS_FRAMES[-1] if DOTS_FRAMES else "..."
+                    if state.get("last_text") != final and self._bot:
+                        try:
+                            await self._bot.edit_message_text(
+                                chat_id=tg_chat_id,
+                                message_id=msg_id_int,
+                                text=final,
+                            )
+                            state["last_text"] = final
+                        except Exception:
+                            pass
+                    try:
+                        await stop_event.wait()
+                    except Exception:
+                        pass
+                    return
                 try:
-                    await asyncio.wait_for(stop_event.wait(), timeout=DOTS_INTERVAL_SECONDS)
-                    break
+                    await asyncio.wait_for(stop_event.wait(), timeout=interval)
+                    return
                 except asyncio.TimeoutError:
                     pass
-                if stop_event.is_set():
-                    break
+                if stop_event.is_set() or not self._bot:
+                    return
                 frame, idx = next_dots_frame(idx)
                 state["frame_index"] = idx
+                # Skip no-op edits (Telegram rejects "message is not modified").
+                if frame == state.get("last_text"):
+                    continue
                 try:
-                    if not self._bot:
-                        break
                     await self._bot.edit_message_text(
-                        chat_id=normalize_telegram_chat_id(chat_key),
-                        message_id=int(state["message_id"]),
+                        chat_id=tg_chat_id,
+                        message_id=msg_id_int,
                         text=frame,
                     )
+                    state["last_text"] = frame
+                except asyncio.CancelledError:
+                    raise
                 except Exception as e:
+                    err_l = str(e).lower()
+                    # Benign: content unchanged / message already gone.
+                    if "message is not modified" in err_l:
+                        state["last_text"] = frame
+                        continue
+                    if "message to edit not found" in err_l or "message can't be edited" in err_l:
+                        return
+                    # Flood control: back off, then resume (do not kill the loop).
+                    if (
+                        getattr(e, "retry_after", None) is not None
+                        or "retry after" in err_l
+                        or "flood" in err_l
+                        or "too many requests" in err_l
+                    ):
+                        delay = dots_retry_after_seconds(e, default=interval * 2)
+                        try:
+                            await asyncio.wait_for(stop_event.wait(), timeout=delay)
+                            return
+                        except asyncio.TimeoutError:
+                            continue
                     logger.debug(
                         "[%s] thinking-dots edit failed (stopping): %s",
-                        self.name,
+                        getattr(self, "name", "telegram"),
                         e,
                     )
-                    break
+                    return
 
         state["task"] = asyncio.create_task(_animate())
 
