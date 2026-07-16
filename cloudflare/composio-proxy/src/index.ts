@@ -1,0 +1,283 @@
+/**
+ * FromDonna Composio proxy Worker (fromdonna-composio-proxy).
+ *
+ * - Holds COMPOSIO_API_KEY
+ * - Mints short-lived MCP session tokens for Hermes
+ * - Proxies MCP HTTP to Composio tool-router session MCP
+ * - Internal APIs for gateway: ensure session + connect links
+ *
+ * Never put COMPOSIO_API_KEY in E2B.
+ */
+
+import type { Env } from "./env";
+import { internalSecret, sessionSecret, sessionTtlSeconds } from "./env";
+import {
+  createToolRouterSession,
+  createToolkitLink,
+  extractRedirectUrl,
+  proxyToComposioMcp,
+} from "./composio_api";
+import { defaultToolkits, resolveToolkits } from "./toolkits";
+import { bearerToken, mintSessionToken, verifySessionToken } from "./session_token";
+
+function json(body: unknown, status = 200): Response {
+  return Response.json(body, { status });
+}
+
+function requireInternalAuth(request: Request, env: Env): boolean {
+  const presented =
+    request.headers.get("x-fromdonna-internal") ||
+    bearerToken(request) ||
+    "";
+  try {
+    const expected = internalSecret(env);
+    if (presented.length !== expected.length) return false;
+    // constant-time-ish compare
+    let ok = 0;
+    for (let i = 0; i < expected.length; i++) {
+      ok |= presented.charCodeAt(i) ^ expected.charCodeAt(i);
+    }
+    return ok === 0;
+  } catch {
+    return false;
+  }
+}
+
+function publicBase(request: Request, env: Env): string {
+  const configured = (env.PUBLIC_BASE_URL || "").trim().replace(/\/$/, "");
+  if (configured) return configured;
+  const url = new URL(request.url);
+  return `${url.protocol}//${url.host}`;
+}
+
+async function handleInternalSession(request: Request, env: Env): Promise<Response> {
+  if (!requireInternalAuth(request, env)) {
+    return json({ error: { message: "Unauthorized.", code: "unauthorized" } }, 401);
+  }
+  if (!env.COMPOSIO_API_KEY?.trim()) {
+    return json({ error: { message: "COMPOSIO_API_KEY not configured.", code: "misconfigured" } }, 503);
+  }
+
+  let body: {
+    user_id?: string;
+    toolkits?: string[];
+    runtime_id?: string;
+    ttl_seconds?: number;
+  };
+  try {
+    body = (await request.json()) as typeof body;
+  } catch {
+    return json({ error: { message: "Invalid JSON.", code: "invalid_json" } }, 400);
+  }
+
+  const userId = (body.user_id || "").trim();
+  if (!userId) {
+    return json({ error: { message: "user_id required.", code: "invalid_body" } }, 400);
+  }
+
+  const toolkits = resolveToolkits(body.toolkits);
+  const ttl = body.ttl_seconds ?? sessionTtlSeconds(env);
+
+  try {
+    const session = await createToolRouterSession(env.COMPOSIO_API_KEY, userId, toolkits);
+    const token = await mintSessionToken(sessionSecret(env), {
+      user_id: userId,
+      toolkits,
+      runtime_id: body.runtime_id,
+      composio_session_id: session.session_id,
+      composio_mcp_url: session.mcp.url,
+      ttlSeconds: ttl,
+    });
+
+    const base = publicBase(request, env);
+    return json({
+      ok: true,
+      user_id: userId,
+      toolkits,
+      composio_session_id: session.session_id,
+      /** Shared product MCP URL (all sandboxes) */
+      mcp_url: `${base}/mcp`,
+      /** Per-user/sandbox Bearer for Hermes */
+      mcp_token: token,
+      exp: Math.floor(Date.now() / 1000) + ttl,
+      /** For ops/debug only — not for E2B long-term storage of product key */
+      composio_mcp_url: session.mcp.url,
+    });
+  } catch (error) {
+    console.error("internal/session error:", error instanceof Error ? error.message : error);
+    return json(
+      {
+        error: {
+          message: error instanceof Error ? error.message : "session create failed",
+          code: "composio_session_failed",
+        },
+      },
+      502,
+    );
+  }
+}
+
+async function handleInternalConnect(request: Request, env: Env): Promise<Response> {
+  if (!requireInternalAuth(request, env)) {
+    return json({ error: { message: "Unauthorized.", code: "unauthorized" } }, 401);
+  }
+  if (!env.COMPOSIO_API_KEY?.trim()) {
+    return json({ error: { message: "COMPOSIO_API_KEY not configured.", code: "misconfigured" } }, 503);
+  }
+
+  let body: {
+    user_id?: string;
+    toolkit?: string;
+    toolkits?: string[];
+    callback_url?: string;
+    composio_session_id?: string;
+  };
+  try {
+    body = (await request.json()) as typeof body;
+  } catch {
+    return json({ error: { message: "Invalid JSON.", code: "invalid_json" } }, 400);
+  }
+
+  const userId = (body.user_id || "").trim();
+  const toolkit = (body.toolkit || "").trim().toLowerCase();
+  if (!userId || !toolkit) {
+    return json({ error: { message: "user_id and toolkit required.", code: "invalid_body" } }, 400);
+  }
+
+  const allowed = resolveToolkits(body.toolkits);
+  if (!allowed.includes(toolkit)) {
+    return json(
+      { error: { message: `toolkit not in allowlist: ${toolkit}`, code: "toolkit_not_allowed" } },
+      403,
+    );
+  }
+
+  try {
+    let sessionId = (body.composio_session_id || "").trim();
+    if (!sessionId) {
+      const session = await createToolRouterSession(env.COMPOSIO_API_KEY, userId, allowed);
+      sessionId = session.session_id;
+    }
+    const link = await createToolkitLink(
+      env.COMPOSIO_API_KEY,
+      sessionId,
+      toolkit,
+      body.callback_url,
+    );
+    const redirectUrl = extractRedirectUrl(link);
+    if (!redirectUrl) {
+      return json(
+        { error: { message: "Composio link missing redirect_url", code: "composio_link_failed", raw: link } },
+        502,
+      );
+    }
+    return json({
+      ok: true,
+      user_id: userId,
+      toolkit,
+      composio_session_id: sessionId,
+      redirect_url: redirectUrl,
+    });
+  } catch (error) {
+    console.error("internal/connect error:", error instanceof Error ? error.message : error);
+    return json(
+      {
+        error: {
+          message: error instanceof Error ? error.message : "connect failed",
+          code: "composio_connect_failed",
+        },
+      },
+      502,
+    );
+  }
+}
+
+async function handleMcp(request: Request, env: Env): Promise<Response> {
+  const token = bearerToken(request);
+  if (!token) {
+    return json({ error: { message: "Missing Bearer token.", code: "unauthorized" } }, 401);
+  }
+  let claims;
+  try {
+    claims = await verifySessionToken(sessionSecret(env), token);
+  } catch {
+    return json({ error: { message: "Session secret misconfigured.", code: "misconfigured" } }, 503);
+  }
+  if (!claims) {
+    return json({ error: { message: "Invalid or expired session token.", code: "unauthorized" } }, 401);
+  }
+  if (!env.COMPOSIO_API_KEY?.trim()) {
+    return json({ error: { message: "COMPOSIO_API_KEY not configured.", code: "misconfigured" } }, 503);
+  }
+
+  let mcpUrl = claims.composio_mcp_url;
+  if (!mcpUrl) {
+    // Re-create Composio session if token lacks URL (older tokens)
+    try {
+      const session = await createToolRouterSession(
+        env.COMPOSIO_API_KEY,
+        claims.user_id,
+        claims.toolkits.length ? claims.toolkits : defaultToolkits(),
+      );
+      mcpUrl = session.mcp.url;
+    } catch (error) {
+      console.error("mcp re-session error:", error instanceof Error ? error.message : error);
+      return json({ error: { message: "Failed to resolve Composio MCP.", code: "composio_session_failed" } }, 502);
+    }
+  }
+
+  try {
+    return await proxyToComposioMcp(request, mcpUrl, env.COMPOSIO_API_KEY);
+  } catch (error) {
+    console.error("mcp proxy error:", error instanceof Error ? error.message : error);
+    return json({ error: { message: "Upstream MCP proxy failed.", code: "proxy_failed" } }, 502);
+  }
+}
+
+export async function handleRequest(request: Request, env: Env): Promise<Response> {
+  const url = new URL(request.url);
+  const path = url.pathname.replace(/\/+$/, "") || "/";
+
+  if (request.method === "GET" && path === "/health") {
+    return json({
+      ok: true,
+      service: "fromdonna-composio-proxy",
+      default_toolkits: defaultToolkits(),
+      auth: "session_hmac",
+    });
+  }
+
+  if (request.method === "GET" && path === "/v1/toolkits/default") {
+    return json({ toolkits: defaultToolkits() });
+  }
+
+  if (request.method === "POST" && path === "/internal/session") {
+    return handleInternalSession(request, env);
+  }
+
+  if (request.method === "POST" && path === "/internal/connect") {
+    return handleInternalConnect(request, env);
+  }
+
+  // MCP endpoint (Hermes)
+  if (path === "/mcp" || path.startsWith("/mcp/")) {
+    return handleMcp(request, env);
+  }
+
+  return json({ error: { message: "Not found.", code: "not_found" } }, 404);
+}
+
+export default {
+  async fetch(request: Request, env: Env): Promise<Response> {
+    try {
+      return await handleRequest(request, env);
+    } catch (error) {
+      console.error("composio-proxy error:", error instanceof Error ? error.message : error);
+      return json({ error: { message: "Internal error.", code: "internal_error" } }, 500);
+    }
+  },
+};
+
+// Re-exports for tests
+export { defaultToolkits, resolveToolkits } from "./toolkits";
+export { mintSessionToken, verifySessionToken, bearerToken } from "./session_token";

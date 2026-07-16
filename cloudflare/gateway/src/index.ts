@@ -14,6 +14,7 @@ import {
   handleCheckpointUpload,
   putCheckpoint,
 } from "./checkpoint";
+import { ensureUserComposio, mintComposioMcpAccess } from "./composio";
 import { normalizeTelegramUpdate, type TelegramUpdate } from "./telegram";
 
 export interface Env {
@@ -30,6 +31,10 @@ export interface Env {
   E2B_SANDBOX_DOMAIN?: string;
   /** Public URL of this Worker (no trailing slash). Used as Bot API base for sandboxes. */
   WORKER_PUBLIC_URL?: string;
+  /** Optional; defaults to WORKER_TO_HARNESS_SECRET for composio-proxy HMAC */
+  COMPOSIO_SESSION_SECRET?: string;
+  /** Optional; defaults to https://fromdonna-composio-proxy.code-df4.workers.dev */
+  COMPOSIO_PROXY_URL?: string;
 }
 
 type UserAgentRow = {
@@ -398,6 +403,19 @@ async function bootstrapHarness(
     row.gateway_conversation_id,
   );
   const base = workerPublicUrl(env);
+
+  // Composio: ensure forever user rules once; mint short-lived MCP access for this sandbox.
+  // Soft-fail: bootstrap still succeeds if composio-proxy is down.
+  try {
+    await ensureUserComposio(env, row.user_id);
+  } catch (error) {
+    console.error(
+      `composio ensure failed for ${row.user_id}:`,
+      error instanceof Error ? error.message : error,
+    );
+  }
+  const composioMcp = await mintComposioMcpAccess(env, row.user_id, row.runtime_id);
+
   const url = `${harnessBaseUrl(env, row.runtime_id, row.runtime_domain)}/bootstrap`;
   const response = await fetch(url, {
     method: "POST",
@@ -414,6 +432,15 @@ async function bootstrapHarness(
         chatId: row.gateway_conversation_id,
         gatewayUserId: row.gateway_user_id,
       },
+      ...(composioMcp
+        ? {
+            composioMcp: {
+              url: composioMcp.mcp_url,
+              token: composioMcp.mcp_token,
+              toolkits: composioMcp.toolkits,
+            },
+          }
+        : {}),
     }),
   });
   if (!response.ok) {

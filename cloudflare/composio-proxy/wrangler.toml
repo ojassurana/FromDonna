@@ -1,0 +1,14 @@
+name = "fromdonna-composio-proxy"
+main = "src/index.ts"
+compatibility_date = "2026-07-13"
+
+# Public vars only. Secrets are never committed.
+[vars]
+PUBLIC_BASE_URL = "https://fromdonna-composio-proxy.code-df4.workers.dev"
+# SESSION_TTL_SECONDS = "3600"
+
+# Secrets (wrangler secret put — never commit):
+# COMPOSIO_API_KEY           Real Composio project key
+# COMPOSIO_SESSION_SECRET    HMAC for Hermes MCP tokens (share with gateway)
+# INTERNAL_AUTH_SECRET       Optional; defaults to COMPOSIO_SESSION_SECRET
+# WORKER_TO_HARNESS_SECRET   Optional fallback for session/internal auth

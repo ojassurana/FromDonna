@@ -691,6 +691,14 @@ class TelegramProxyBootstrap(BaseModel):
     gatewayUserId: str = Field(min_length=1, max_length=128)
 
 
+class ComposioMcpBootstrap(BaseModel):
+    """Short-lived Composio MCP access via fromdonna-composio-proxy (no API key)."""
+
+    url: str = Field(min_length=8, max_length=512)
+    token: str = Field(min_length=16, max_length=4096)
+    toolkits: list[str] = Field(default_factory=list)
+
+
 class Bootstrap(BaseModel):
     secret: str = Field(min_length=16, max_length=256)
     # Product user id (channel-agnostic), e.g. telegram:123 — for R2 checkpoints.
@@ -700,6 +708,8 @@ class Bootstrap(BaseModel):
     # Dedicated API connectors Worker (public URL only; no secrets).
     apiProxyUrl: str | None = Field(default=None, max_length=512)
     telegramProxy: TelegramProxyBootstrap | None = None
+    # Optional Composio MCP (shared Worker URL + per-user Bearer).
+    composioMcp: ComposioMcpBootstrap | None = None
 
 
 class TelegramUpdateEnvelope(BaseModel):
@@ -736,6 +746,60 @@ def _apply_identity_env(
     if worker_url:
         os.environ["FROMDONNA_WORKER_URL"] = worker_url.rstrip("/")
     _apply_exa_proxy_env(api_proxy_url=api_proxy_url)
+
+
+def _apply_composio_mcp(mcp: ComposioMcpBootstrap) -> None:
+    """Point Hermes MCP client at composio-proxy (Bearer session token only; product key stays on Worker)."""
+    url = (mcp.url or "").strip()
+    token = (mcp.token or "").strip()
+    if not url or not token:
+        return
+    os.environ["FROMDONNA_COMPOSIO_MCP_URL"] = url
+    # Token is short-lived; do not treat as a product secret for logging.
+    os.environ["FROMDONNA_COMPOSIO_MCP_TOKEN"] = token
+    if mcp.toolkits:
+        os.environ["FROMDONNA_COMPOSIO_TOOLKITS"] = ",".join(mcp.toolkits)
+
+    HERMES_HOME.mkdir(parents=True, exist_ok=True)
+    config_path = HERMES_HOME / "config.yaml"
+    server_entry = {
+        "url": url,
+        "headers": {"Authorization": f"Bearer {token}"},
+    }
+    try:
+        import yaml  # type: ignore
+
+        config: dict = {}
+        if config_path.is_file():
+            loaded = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+            if isinstance(loaded, dict):
+                config = loaded
+        servers = config.get("mcp_servers")
+        if not isinstance(servers, dict):
+            servers = {}
+        servers["composio"] = server_entry
+        config["mcp_servers"] = servers
+        config_path.write_text(
+            yaml.safe_dump(config, default_flow_style=False, sort_keys=False),
+            encoding="utf-8",
+        )
+    except Exception:
+        # Fallback: minimal YAML without full merge
+        import json as _json
+
+        snippet = (
+            "# Auto-written by FromDonna harness bootstrap (Composio MCP)\n"
+            "mcp_servers:\n"
+            "  composio:\n"
+            f"    url: {_json.dumps(url)}\n"
+            "    headers:\n"
+            f"      Authorization: {_json.dumps('Bearer ' + token)}\n"
+        )
+        # If a config already exists, append is wrong; write sidecar for ops
+        sidecar = HERMES_HOME / "fromdonna-composio-mcp.yaml"
+        sidecar.write_text(snippet, encoding="utf-8")
+        if not config_path.is_file():
+            config_path.write_text(snippet, encoding="utf-8")
 
 
 def _apply_telegram_proxy(proxy: TelegramProxyBootstrap, *, start: bool = False) -> None:
@@ -802,6 +866,13 @@ def bootstrap(body: Bootstrap):
         api_proxy_url=api_proxy_url,
     )
 
+    if body.composioMcp is not None:
+        try:
+            _apply_composio_mcp(body.composioMcp)
+        except Exception as exc:
+            # Soft-fail: sandbox still usable without Composio MCP
+            print(f"composio mcp bootstrap failed: {exc}", flush=True)
+
     if proxy_to_apply is not None:
         try:
             # Start early so first user message does not pay cold connect cost,
@@ -826,7 +897,12 @@ def bootstrap(body: Bootstrap):
                     detail=f"telegram_gateway_start_failed: {retry_exc}",
                 ) from retry_exc
 
-    return {"ok": True, "already": already, "telegram_proxy": bool(_telegram_proxy)}
+    return {
+        "ok": True,
+        "already": already,
+        "telegram_proxy": bool(_telegram_proxy),
+        "composio_mcp": bool(body.composioMcp is not None),
+    }
 
 
 @app.post("/internal/restore")

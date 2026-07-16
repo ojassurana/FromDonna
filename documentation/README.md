@@ -34,6 +34,7 @@ Architecture and ops notes for the multi-user Hermes product: one Telegram bot, 
 | Doc | Contents |
 |-----|----------|
 | [tooling/general.md](./tooling/general.md) | Connectors (OAuth apps / CLI / MCP / API); three Worker doors |
+| [tooling/composio.md](./tooling/composio.md) | **Composio** — multi-user OAuth vault + MCP proxy for Hermes |
 | [tooling/api-proxy-worker.md](./tooling/api-proxy-worker.md) | **API proxy Worker** — Exa + **how to add more API connectors**; keys never in E2B |
 
 ## Live path (one sentence)

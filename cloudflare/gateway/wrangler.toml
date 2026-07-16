@@ -19,16 +19,20 @@ bucket_name = "fromdonna-user-state"
 E2B_TEMPLATE = "fromdonna-hermes"
 HARNESS_PORT = "8788"
 E2B_SANDBOX_DOMAIN = "e2b.dev"
+COMPOSIO_PROXY_URL = "https://fromdonna-composio-proxy.code-df4.workers.dev"
 
 # Secrets, never committed:
 # TELEGRAM_BOT_TOKEN       Telegram Bot API token
 # TELEGRAM_WEBHOOK_SECRET  Telegram webhook secret_token
 # E2B_API_KEY              Team API key used only to provision/resume sandboxes
 # WORKER_TO_HARNESS_SECRET Shared key presented to each sandbox harness after /bootstrap
+# COMPOSIO_SESSION_SECRET  Optional; HMAC shared with composio-proxy (else WORKER_TO_HARNESS_SECRET)
 #
 # Product API keys (EXA_API_KEY, …) belong on fromdonna-api-proxy — not here.
+# COMPOSIO_API_KEY belongs on fromdonna-composio-proxy only — not here.
 #
 # Vars:
 # E2B_TEMPLATE = "fromdonna-hermes"
 # HARNESS_PORT = "8788"
 # E2B_SANDBOX_DOMAIN = "e2b.dev"
+# COMPOSIO_PROXY_URL = "https://fromdonna-composio-proxy.<account>.workers.dev"

@@ -15,9 +15,11 @@ Any external action → E2B → dedicated Worker door → backend
 | **`fromdonna-gateway`** | Channels, D1 routing, E2B lifecycle, Bot API proxy | Telegram / harness / E2B |
 | **`fromdonna-llm-proxy`** | Model inference only | Relay + LLM capability HMAC |
 | **`fromdonna-api-proxy`** | Plain HTTP API connectors (Exa first) | `EXA_API_KEY`, future API keys |
+| **`fromdonna-composio-proxy`** | OAuth apps vault + MCP door (Composio) | `COMPOSIO_API_KEY`, session HMAC |
 
 - **E2B** = untrusted computer per user (code, shell, local files).
 - **API keys for product connectors** = **api-proxy only**, never gateway, never sandbox.
+- **Composio API key** = **composio-proxy only**, never gateway, never sandbox.
 - Sandbox never gets long-lived provider secrets (Gmail, Zepto, Exa, OAuth tokens, etc.).
 
 See [api-proxy-worker.md](./api-proxy-worker.md) for the API door and the **protocol for adding more API connectors**.
@@ -33,12 +35,14 @@ See [api-proxy-worker.md](./api-proxy-worker.md) for the API door and the **prot
 
 ## How each is managed
 
-### 1. OAuth apps
+### 1. OAuth apps (Composio)
 
-- Multi-user OAuth (Gmail, GitHub, …) lives **outside** E2B under a product-owned vault keyed by `user_id`.
-- Agent does not hold the vault secret or long-lived provider tokens in the sandbox.
-- Flow: E2B tool → Worker → vaulted connection for `user_id` → provider.
-- Concrete vault implementation (self-host / vendor SaaS) is an ops choice; the architecture only requires credentials off-sandbox and a Worker door.
+- Multi-user OAuth (Gmail, GitHub, …) lives **outside** E2B under **Composio**, keyed by Donna `user_id`.
+- Agent does not hold `COMPOSIO_API_KEY` or long-lived provider tokens in the sandbox.
+- Flow: Hermes **MCP client** → **composio-proxy** Worker (short-lived Bearer) → Composio → provider.
+- Same public MCP URL for all sandboxes; identity is in the session token.
+- Toolkit allowlist for new users (not full catalog): see [composio.md](./composio.md).
+- Connect once per app via Composio Connect link (Worker-minted).
 
 ### 2. CLI
 
