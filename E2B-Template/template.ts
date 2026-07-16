@@ -17,17 +17,21 @@ export const template = Template()
     PATH: "/home/user/.local/bin:/home/user/venv/bin:$PATH",
     FROMDONNA_RUNTIME: "e2b",
     HERMES_HOME: "/home/user/.hermes",
+    // Exa via dedicated API proxy (real key never in the image). Overridden at
+    // create/bootstrap with the live api-proxy URL when needed.
+    EXA_API_KEY: "STUB",
+    FROMDONNA_API_PROXY_URL: "https://fromdonna-api-proxy.code-df4.workers.dev",
+    EXA_BASE_URL: "https://fromdonna-api-proxy.code-df4.workers.dev/v1/exa",
   })
   .copy("hermes", "/opt/fromdonna/hermes")
   .copy("harness", "/opt/fromdonna/harness")
   .copy("extensions/plugins", "/home/user/.hermes/plugins")
   .copy("config/hermes/config.yaml", "/home/user/.hermes/config.yaml")
   .copy("config/hermes/SOUL.md", "/home/user/.hermes/SOUL.md")
-  // messaging extra pulls python-telegram-bot — required for official TelegramAdapter
-  // inside the sandbox (without it connect() returns False immediately).
+  // messaging: TelegramAdapter; exa: official web_search/web_extract backend.
   .runCmd(
     "uv venv /home/user/venv --python python3 && " +
-      "uv pip install --python /home/user/venv/bin/python '/opt/fromdonna/hermes[messaging]' && " +
+      "uv pip install --python /home/user/venv/bin/python '/opt/fromdonna/hermes[messaging,exa]' && " +
       "mkdir -p /home/user/workspace",
   )
   .setStartCmd(

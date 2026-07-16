@@ -33,17 +33,19 @@ Architecture and ops notes for the multi-user Hermes product: one Telegram bot, 
 
 | Doc | Contents |
 |-----|----------|
-| [tooling/general.md](./tooling/general.md) | Connectors (Nango / CLI / MCP / API); secrets stay on Worker |
+| [tooling/general.md](./tooling/general.md) | Connectors (Nango / CLI / MCP / API); three Worker doors |
+| [tooling/api-proxy-worker.md](./tooling/api-proxy-worker.md) | **API proxy Worker** — Exa (and future HTTP APIs); keys never in E2B |
 
 ## Live path (one sentence)
 
-**User DMs `@fromdonna_bot` → gateway Worker + D1 → dedicated E2B Hermes (official Telegram gateway) → LLM proxy (capability only) → reply via Bot API proxy; after use, Worker pulls a runtime checkpoint to R2 for restore if the box is replaced.**
+**User DMs `@fromdonna_bot` → gateway Worker + D1 → dedicated E2B Hermes → LLM proxy (capability) + API proxy (Exa stub) for tools → reply via Bot API proxy; after use, Worker pulls a runtime checkpoint to R2 if the box is replaced.**
 
 ## Repo map
 
 ```text
-cloudflare/gateway/     Telegram Worker + D1 + R2 USER_STATE checkpoints
+cloudflare/gateway/     Channel-agnostic gateway Worker + D1 + R2 checkpoints
 cloudflare/llm-proxy/   OpenAI-compatible inference Worker + host relay
+cloudflare/api-proxy/   HTTP API connectors (Exa first); product API keys
 E2B-Template/           Sandbox image (Hermes, harness, config)
 documentation/          This tree
 ```

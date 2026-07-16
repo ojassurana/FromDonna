@@ -14,25 +14,27 @@ Source tree: `E2B-Template/`
 | Dev template alias | `fromdonna-hermes-dev` |
 | Gateway var | `E2B_TEMPLATE=fromdonna-hermes` |
 | Harness port | `8788` (uvicorn warm start) |
-| Hermes config | `config/hermes/config.yaml` → LLM proxy base URL + `grok-4.5` |
+| Hermes config | `config/hermes/config.yaml` → LLM proxy + `grok-4.5` + **`web.backend: exa`** |
 | Hermes SOUL | `config/hermes/SOUL.md` → baked to `/home/user/.hermes/SOUL.md` (Donna persona) |
 | Harness code | `E2B-Template/harness/` (`server.py`, `gateway_runtime.py`, `checkpoint.py`) |
+| Web / Exa | Stub `EXA_API_KEY=STUB` + `EXA_BASE_URL` → [api-proxy](../tooling/api-proxy-worker.md); real key never in image |
 
 ### What is baked today
 
 - Vendored Hermes under `E2B-Template/hermes/`
-- Agent-only Hermes config (no channel tokens)
+- Agent-only Hermes config (no channel tokens; **Exa as default web backend**)
 - Default Donna `SOUL.md` (`config/hermes/SOUL.md` → `~/.hermes/SOUL.md`)
 - Product plugins under `extensions/plugins` (e.g. `fromdonna_transport`)
 - FastAPI harness: `/health`, `/bootstrap`, `/telegram/update`, `/internal/checkpoint/export`, `/internal/restore`, legacy `/turn`
 - Checkpoint pack/stage helpers (`checkpoint.py`)
+- `exa-py` (Hermes `[messaging,exa]`); Exa SDK base URL points at api-proxy
 - `setStartCmd` starts uvicorn and waits for port 8788
 
 ### What is *not* baked
 
-- Telegram bot token, E2B API key, Codex/OAuth, relay secret
+- Telegram bot token, E2B API key, Codex/OAuth, relay secret, **real `EXA_API_KEY`**
 - Per-user `WORKER_TO_HARNESS_SECRET` (injected post-create via `/bootstrap`)
-- Per-user capability tokens (injected per inject as short-lived capability)
+- Per-user LLM capability tokens (injected per inject as short-lived capability)
 - Per-user R2 data (restored after create if a checkpoint exists)
 
 ### Warm start + `/bootstrap` + restore

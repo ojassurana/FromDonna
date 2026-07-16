@@ -1,6 +1,6 @@
 # Agent-only configuration baked into every FromDonna sandbox.
-# Cloudflare Worker = Telegram edge (webhook + provision + Bot API delivery).
-# Sandbox = official Hermes Telegram gateway runtime (GatewayRunner + TelegramAdapter).
+# Cloudflare gateway Worker = channel-agnostic edge (webhooks + provision + API proxies).
+# Sandbox = Hermes runtime (Telegram adapter today; WhatsApp/etc. later).
 
 model:
   provider: custom
@@ -29,14 +29,21 @@ approvals:
   destructive_slash_confirm: false
   mcp_reload_confirm: false
 
-# Official Hermes Telegram tool surface inside the sandbox.
+# Channel-agnostic agent tool surface.
+# Do NOT use hermes-telegram / hermes-whatsapp composites here — those names
+# are transport-specific. Use hermes-cli (same _HERMES_CORE_TOOLS pack) for
+# every messaging channel so Telegram / WhatsApp / future platforms stay in
+# lockstep. Edit the anchor once; all listed platforms inherit it.
 platform_toolsets:
-  telegram:
-    - hermes-telegram
+  telegram: &agent_tools
+    - hermes-cli
+  whatsapp: *agent_tools
+  whatsapp_cloud: *agent_tools
+  # Add new messaging platforms here with: <name>: *agent_tools
+  cli: *agent_tools
+  cron: *agent_tools
   api_server:
     - hermes-api-server
-  cli:
-    - hermes-cli
 
 plugins:
   enabled:
@@ -81,3 +88,8 @@ platforms:
           - new
 
 agent: {}
+
+# Web research: Exa by default. Real EXA_API_KEY lives on fromdonna-api-proxy;
+# sandbox gets EXA_API_KEY=STUB + EXA_BASE_URL={api-proxy}/v1/exa (bootstrap/create).
+web:
+  backend: exa

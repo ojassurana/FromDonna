@@ -12,10 +12,11 @@ See also: [telegram.md](./telegram.md), [gateway.md](./gateway.md), [llm-proxy-w
 @fromdonna_bot
     │
     ▼
-fromdonna-telegram-gateway  (Cloudflare Worker)
+fromdonna-gateway  (Cloudflare Worker)
     │  secrets: TELEGRAM_*, E2B_API_KEY, WORKER_TO_HARNESS_SECRET, LLM_CAPABILITY_SECRET
     │  D1: fromdonna-routing.user_agents
     │  R2: USER_STATE → fromdonna-user-state (runtime checkpoints)
+    │  (no EXA_API_KEY — that lives on api-proxy)
     │
     ├─ provision ──► E2B Sandbox.create(fromdonna-hermes)
     │                   │
@@ -28,10 +29,11 @@ fromdonna-telegram-gateway  (Cloudflare Worker)
                          x-llm-capability: <HMAC capability>
                               │
                               ▼
-                         Official Hermes Telegram gateway in sandbox
+                         Official Hermes Telegram runtime in sandbox
                               │
-                              ├─ outbound Bot API via Worker /telegram-bot-api/*
-                              ├─ LLM via fromdonna-llm-proxy (capability only)
+                              ├─ outbound Bot API via gateway /telegram-bot-api/*
+                              ├─ LLM via fromdonna-llm-proxy (real capability)
+                              ├─ web_search via fromdonna-api-proxy (Exa, stub auth)
                               └─ after session: stage checkpoint → Worker pull → R2
 ```
 
@@ -41,8 +43,9 @@ fromdonna-telegram-gateway  (Cloudflare Worker)
 
 | Service | URL / location | Quick check |
 |---------|----------------|-------------|
-| Telegram gateway | `https://fromdonna-telegram-gateway.code-df4.workers.dev` | `GET /health` |
+| Gateway Worker | `https://fromdonna-gateway.code-df4.workers.dev` | `GET /health` |
 | LLM proxy | `https://fromdonna-llm-proxy.code-df4.workers.dev` | `GET /health` + chat completion |
+| API proxy | `https://fromdonna-api-proxy.code-df4.workers.dev` | `GET /health` + Exa search (stub) |
 | Telegram webhook | Bot API `getWebhookInfo` | URL matches gateway; `last_error` null |
 | D1 | `fromdonna-routing` | `SELECT … FROM user_agents` |
 | R2 checkpoints | `fromdonna-user-state` | manifest `users/{userId}/manifests/latest.json` |
@@ -61,8 +64,9 @@ set +a
 export CLOUDFLARE_API_KEY="$CLOUDFLARE_GLOBAL_API_KEY"
 export CLOUDFLARE_ACCOUNT_ID="df4acced87263715777b0c2068d03b22"
 
-echo "gateway:" && curl -sS https://fromdonna-telegram-gateway.code-df4.workers.dev/health
+echo "gateway:" && curl -sS https://fromdonna-gateway.code-df4.workers.dev/health
 echo "llm:" && curl -sS https://fromdonna-llm-proxy.code-df4.workers.dev/health
+echo "api:" && curl -sS https://fromdonna-api-proxy.code-df4.workers.dev/health
 
 # Webhook (requires TELEGRAM_BOT_TOKEN in env)
 curl -sS "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getWebhookInfo" \
@@ -80,11 +84,15 @@ npx wrangler d1 execute fromdonna-routing --remote --command \
 ```bash
 # Gateway (webhook + provision errors)
 cd ~/FromDonna/cloudflare/gateway
-npx wrangler tail fromdonna-telegram-gateway --format pretty
+npx wrangler tail fromdonna-gateway --format pretty
 
 # LLM proxy (inference / relay failures)
 cd ~/FromDonna/cloudflare/llm-proxy
 npx wrangler tail fromdonna-llm-proxy --format pretty
+
+# API proxy (Exa / HTTP connectors)
+cd ~/FromDonna/cloudflare/api-proxy
+npx wrangler tail fromdonna-api-proxy --format pretty
 ```
 
 Note: the success path is quiet; `console.error` surfaces failures (harness HTTP errors, E2B create failures, etc.).
@@ -148,6 +156,7 @@ New users get the new image immediately. Existing sandboxes keep the old filesys
 | Gateway Worker | `cd cloudflare/gateway && npx wrangler deploy` |
 | D1 migrations | `npx wrangler d1 migrations apply fromdonna-routing --remote` |
 | LLM proxy | `cd cloudflare/llm-proxy && npx wrangler deploy` |
+| API proxy | `cd cloudflare/api-proxy && npx wrangler secret put EXA_API_KEY && npx wrangler deploy` |
 | E2B template | `cd E2B-Template && npm run build:prod` |
 | Telegram webhook | Bot API `setWebhook` (see [telegram.md](./telegram.md)) |
 
@@ -160,7 +169,7 @@ After agent use, the sandbox **stages** a filtered tar; the Worker **pulls** to 
 ```bash
 # Status (needs WORKER_TO_HARNESS_SECRET)
 curl -sS -H "Authorization: Bearer $WORKER_TO_HARNESS_SECRET" \
-  "https://fromdonna-telegram-gateway.code-df4.workers.dev/internal/checkpoint/status?userId=telegram:<id>"
+  "https://fromdonna-gateway.code-df4.workers.dev/internal/checkpoint/status?userId=telegram:<id>"
 
 # Or wrangler
 npx wrangler r2 object get \
@@ -175,8 +184,9 @@ Details: [../deployment/memorymanagement.md](../deployment/memorymanagement.md).
 ## Change log (implementation snapshot)
 
 1. **Gateway Worker** — D1 routing, provision/replaceRuntime, E2B create/connect, bootstrap, inject `/telegram/update`, Bot API proxy, R2 checkpoint harvest/restore
-2. **Harness** — official Hermes Telegram gateway; `/health`, `/bootstrap`, `/telegram/update`, `/internal/checkpoint/export`, `/internal/restore`
-3. **E2B template** — `fromdonna-hermes` warm harness on 8788; checkpoint packer; agent-only config → llm-proxy
+2. **Harness** — official Hermes Telegram runtime; `/health`, `/bootstrap`, `/telegram/update`, `/internal/checkpoint/export`, `/internal/restore`
+3. **E2B template** — `fromdonna-hermes` warm harness on 8788; checkpoint packer; agent-only config → llm-proxy; **web.backend: exa** via api-proxy
+4. **API proxy** — `fromdonna-api-proxy`; Exa reverse proxy; real `EXA_API_KEY` only here; sandbox uses STUB + `EXA_BASE_URL`
 4. **LLM proxy** — capability tokens; credentials stay off sandbox
 5. **Secrets model** — no Telegram/Codex/R2 long-lived keys in sandboxes
 6. **Runtime persistence** — Architecture B stage + Worker pull to R2; verified on live traffic

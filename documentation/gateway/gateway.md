@@ -12,7 +12,10 @@ It is the only component that talks to those networks.
 They never receive channel tokens. They only run the per-user agent (Hermes).
 
 **Live Telegram implementation:** [telegram.md](./telegram.md) · source `cloudflare/gateway/`  
-**LLM door for sandboxes:** [llm-proxy-worker.md](./llm-proxy-worker.md) · source `cloudflare/llm-proxy/`
+**LLM door for sandboxes:** [llm-proxy-worker.md](./llm-proxy-worker.md) · source `cloudflare/llm-proxy/`  
+**API connectors door:** [../tooling/api-proxy-worker.md](../tooling/api-proxy-worker.md) · source `cloudflare/api-proxy/`
+
+The gateway holds **channel** secrets (bot tokens, etc.). It does **not** hold product API keys such as Exa — those live on **api-proxy** only.
 
 ## Core idea
 
@@ -42,6 +45,7 @@ User (any app)
 | Agent runtime | E2B (per user) | Harness + Hermes loop + tools; no channel secrets |
 | Checkpoint | Worker + R2 | Harvest staged tar after use; restore when runtime is replaced |
 | Inference | LLM proxy Worker | OpenAI-compatible edge; real credentials stay off sandbox |
+| API connectors | API proxy Worker | Exa (etc.); product HTTP keys off sandbox and off gateway |
 | Outbound | Worker / Bot API proxy | Agent replies via channel (Telegram: proxy) |
 
 ## Internal message shape (channel-agnostic)

@@ -33,7 +33,7 @@ Related: [telegram.md](./telegram.md) (how the gateway mints the capability per 
 | Secret | Purpose |
 |--------|---------|
 | `RELAY_SHARED_SECRET` | `X-Relay-Token` to the host relay |
-| `LLM_CAPABILITY_SECRET` | HMAC for short-lived sandbox capabilities (shared with Telegram gateway) |
+| `LLM_CAPABILITY_SECRET` | HMAC for short-lived sandbox capabilities (shared with gateway Worker) |
 | `CODEX_ACCESS_TOKEN` / `CODEX_REFRESH_TOKEN` | Legacy; **live path uses host Hermes OAuth** for Codex and Grok |
 
 ### Vars

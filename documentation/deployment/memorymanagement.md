@@ -156,7 +156,7 @@ Separate from the runtime checkpoint: durable docs/exports may later use agent t
 ```bash
 # Manifest for a user (Worker secret)
 curl -sS -H "Authorization: Bearer $WORKER_TO_HARNESS_SECRET" \
-  "https://fromdonna-telegram-gateway.code-df4.workers.dev/internal/checkpoint/status?userId=telegram:<id>"
+  "https://fromdonna-gateway.code-df4.workers.dev/internal/checkpoint/status?userId=telegram:<id>"
 
 # Or via wrangler
 npx wrangler r2 object get \

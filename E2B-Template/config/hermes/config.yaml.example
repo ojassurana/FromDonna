@@ -1,11 +1,15 @@
 # Default Hermes config baked into the template (agent-only).
 # Copy/adapt during template build to ~/.hermes/config.yaml.
 # NO product secrets here — use Worker / Nango for those.
+#
+# Tool surface is channel-agnostic: use platform_toolsets with a shared
+# YAML anchor (*agent_tools → hermes-cli), not hermes-telegram. See
+# config.yaml for the live list (telegram / whatsapp / cli / cron).
 
 # model: set at runtime via Worker-provided env or proxy if needed
 
 # Example tool posture (adjust when wiring real policy):
-# Disable gateway platforms inside the sandbox — Worker owns Telegram/WhatsApp.
+# Disable gateway platforms inside the sandbox — Worker owns channel delivery.
 # platforms: {}
 
 # Prefer product tools that call Worker over in-box secrets.

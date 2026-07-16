@@ -71,7 +71,10 @@ def _get_exa_client() -> Any:
 
     from exa_py import Exa  # noqa: WPS433 — deliberately lazy
 
-    client = Exa(api_key=api_key)
+    # FromDonna: route through api-proxy when EXA_BASE_URL is set so the real
+    # Exa key never lives in the sandbox (sandbox uses EXA_API_KEY=STUB).
+    base_url = (os.environ.get("EXA_BASE_URL") or "").strip().rstrip("/") or None
+    client = Exa(api_key=api_key, **({"base_url": base_url} if base_url else {}))
     client.headers["x-exa-integration"] = "hermes-agent"
     _wt._exa_client = client
     return client

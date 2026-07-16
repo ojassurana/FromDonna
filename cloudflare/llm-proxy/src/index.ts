@@ -47,7 +47,7 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
   }
   if (request.method !== "POST" || url.pathname !== "/v1/chat/completions") return errorResponse(404, "Not found.", "not_found");
 
-  // Only the Telegram gateway can mint this short-lived HMAC capability.
+  // Only the gateway Worker can mint this short-lived HMAC capability.
   if (!(await validCapability(env, request.headers.get("Authorization")))) {
     return errorResponse(401, "A valid capability token is required.", "invalid_capability_token");
   }

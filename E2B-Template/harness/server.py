@@ -697,6 +697,8 @@ class Bootstrap(BaseModel):
     userId: str | None = Field(default=None, max_length=200)
     # Worker public base URL (no trailing slash) for checkpoint uploads.
     workerUrl: str | None = Field(default=None, max_length=512)
+    # Dedicated API connectors Worker (public URL only; no secrets).
+    apiProxyUrl: str | None = Field(default=None, max_length=512)
     telegramProxy: TelegramProxyBootstrap | None = None
 
 
@@ -706,7 +708,26 @@ class TelegramUpdateEnvelope(BaseModel):
     update: dict
 
 
-def _apply_identity_env(*, user_id: str | None, worker_url: str | None, secret: str) -> None:
+def _apply_exa_proxy_env(*, api_proxy_url: str | None = None) -> None:
+    """Point Hermes Exa SDK at fromdonna-api-proxy (stub key only; real key on Worker)."""
+    base = (
+        (api_proxy_url or "").strip()
+        or (os.environ.get("FROMDONNA_API_PROXY_URL") or "").strip()
+        or "https://fromdonna-api-proxy.code-df4.workers.dev"
+    ).rstrip("/")
+    os.environ["FROMDONNA_API_PROXY_URL"] = base
+    os.environ["EXA_BASE_URL"] = f"{base}/v1/exa"
+    # MVP stub auth for api-proxy; never the real Exa cloud key.
+    os.environ["EXA_API_KEY"] = "STUB"
+
+
+def _apply_identity_env(
+    *,
+    user_id: str | None,
+    worker_url: str | None,
+    secret: str,
+    api_proxy_url: str | None = None,
+) -> None:
     """Export channel-agnostic identity for checkpoint pack/upload (and tools)."""
     os.environ["WORKER_TO_HARNESS_SECRET"] = secret
     os.environ["HERMES_HOME"] = str(HERMES_HOME)
@@ -714,6 +735,7 @@ def _apply_identity_env(*, user_id: str | None, worker_url: str | None, secret: 
         os.environ["FROMDONNA_USER_ID"] = user_id
     if worker_url:
         os.environ["FROMDONNA_WORKER_URL"] = worker_url.rstrip("/")
+    _apply_exa_proxy_env(api_proxy_url=api_proxy_url)
 
 
 def _apply_telegram_proxy(proxy: TelegramProxyBootstrap, *, start: bool = False) -> None:
@@ -764,7 +786,13 @@ def bootstrap(body: Bootstrap):
 
     user_id = (body.userId or (proxy_to_apply.userId if proxy_to_apply else None) or "").strip() or None
     worker_url = (body.workerUrl or "").strip() or None
-    _apply_identity_env(user_id=user_id, worker_url=worker_url, secret=secret)
+    api_proxy_url = (body.apiProxyUrl or "").strip() or None
+    _apply_identity_env(
+        user_id=user_id,
+        worker_url=worker_url,
+        secret=secret,
+        api_proxy_url=api_proxy_url,
+    )
 
     if proxy_to_apply is not None:
         try:

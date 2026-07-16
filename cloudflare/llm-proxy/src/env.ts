@@ -8,7 +8,7 @@ export type Env = {
    */
   GROK_RELAY_URL?: string;
   RELAY_SHARED_SECRET: string;
-  /** HMAC key shared with the Telegram gateway, never exposed to sandboxes. */
+  /** HMAC key shared with the gateway Worker, never exposed to sandboxes. */
   LLM_CAPABILITY_SECRET: string;
 };
 

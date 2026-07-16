@@ -1,4 +1,4 @@
-# Telegram gateway
+# Telegram channel (gateway Worker)
 
 ## Scope
 
@@ -16,7 +16,7 @@ Source: `cloudflare/gateway/`
 
 | Piece | Value |
 |-------|--------|
-| Gateway Worker | `https://fromdonna-telegram-gateway.code-df4.workers.dev` |
+| Gateway Worker | `https://fromdonna-gateway.code-df4.workers.dev` |
 | Webhook | `POST /telegram/webhook` |
 | Health | `GET /health` |
 | D1 database | `fromdonna-routing` (`FROMDONNA_ROUTING` binding) |
@@ -239,7 +239,7 @@ npx wrangler deploy
 curl -sS "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/setWebhook" \
   -H 'content-type: application/json' \
   -d "{
-    \"url\": \"https://fromdonna-telegram-gateway.code-df4.workers.dev/telegram/webhook\",
+    \"url\": \"https://fromdonna-gateway.code-df4.workers.dev/telegram/webhook\",
     \"secret_token\": \"${TELEGRAM_WEBHOOK_SECRET}\",
     \"allowed_updates\": [\"message\", \"edited_message\", \"callback_query\", \"inline_query\", \"chosen_inline_result\", \"my_chat_member\", \"chat_member\", \"chat_join_request\", \"message_reaction\", \"message_reaction_count\"],
     \"drop_pending_updates\": false
@@ -250,7 +250,7 @@ Or (uses Worker secrets, no token in shell):
 
 ```bash
 SECRET="$WORKER_TO_HARNESS_SECRET"
-curl -sS -X POST "https://fromdonna-telegram-gateway.code-df4.workers.dev/admin/rebind-webhook" \
+curl -sS -X POST "https://fromdonna-gateway.code-df4.workers.dev/admin/rebind-webhook" \
   -H "authorization: Bearer ${SECRET}"
 ```
 
@@ -260,7 +260,7 @@ curl -sS -X POST "https://fromdonna-telegram-gateway.code-df4.workers.dev/admin/
 
 ```bash
 cd cloudflare/gateway
-npx wrangler tail fromdonna-telegram-gateway --format pretty
+npx wrangler tail fromdonna-gateway --format pretty
 ```
 
 Success path is mostly quiet (errors use `console.error`). Pair with LLM proxy tail if diagnosing model path:
@@ -274,7 +274,7 @@ npx wrangler tail fromdonna-llm-proxy --format pretty
 
 ```bash
 # Gateway
-curl -sS https://fromdonna-telegram-gateway.code-df4.workers.dev/health
+curl -sS https://fromdonna-gateway.code-df4.workers.dev/health
 
 # Webhook
 curl -sS "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getWebhookInfo"

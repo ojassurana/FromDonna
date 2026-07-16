@@ -1,0 +1,11 @@
+name = "fromdonna-api-proxy"
+main = "src/index.ts"
+compatibility_date = "2026-07-13"
+
+# Public vars only. Secrets are never committed.
+[vars]
+# Expected sandbox x-api-key until real capability HMAC is wired.
+API_STUB_TOKEN = "STUB"
+
+# Secrets (wrangler secret put — never commit):
+# EXA_API_KEY   Real Exa cloud key; injected only on upstream requests to api.exa.ai

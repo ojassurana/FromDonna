@@ -1,9 +1,10 @@
 /**
- * FromDonna Telegram gateway Worker.
+ * FromDonna gateway Worker (channel-agnostic).
  *
- * Owns Telegram webhook + D1 routing + E2B lifecycle + Bot API proxy.
- * Never puts the real bot token into sandboxes. Official Hermes TelegramAdapter
- * in each sandbox uses base_url → this Worker's /telegram-bot-api/* proxy.
+ * Owns chat webhooks + D1 routing + E2B lifecycle + channel API proxies
+ * (Telegram first; WhatsApp/etc. later). Never puts real channel tokens into
+ * sandboxes. Per-channel adapters in each sandbox call this Worker as the
+ * privileged door (e.g. Hermes TelegramAdapter → /telegram-bot-api/*).
  */
 
 import { handleBotApiProxy, mintBotProxyToken } from "./bot_api_proxy";
@@ -49,7 +50,7 @@ const DEFAULT_SANDBOX_DOMAIN = "e2b.dev";
 /** Idle auto-pause keeps the VM disk; this is max lifetime / each connect extension.
  * E2B rejects timeout > 1 hour (HTTP 400). Every message extends by this amount. */
 const SANDBOX_TTL_SECONDS = 3600;
-const DEFAULT_WORKER_URL = "https://fromdonna-telegram-gateway.code-df4.workers.dev";
+const DEFAULT_WORKER_URL = "https://fromdonna-gateway.code-df4.workers.dev";
 
 function internalUserId(gateway: string, gatewayUserId: string): string {
   return `${gateway}:${gatewayUserId}`;
@@ -525,7 +526,7 @@ async function provision(env: Env, gateway: string, gatewayUserId: string): Prom
     await waitForHarness(env, sandbox.sandboxID, domain);
 
     // Stash runtime while still provisioning — only flip ready after bootstrap
-    // succeeds so a broken Telegram gateway never looks "ready" in D1.
+    // succeeds so a broken in-sandbox Telegram runtime never looks "ready" in D1.
     await env.FROMDONNA_ROUTING.prepare(
       `UPDATE user_agents
        SET runtime_id = ?3, runtime_domain = ?4, updated_at = CURRENT_TIMESTAMP
@@ -571,7 +572,7 @@ async function replaceRuntime(env: Env, row: UserAgentRow): Promise<UserAgentRow
   try {
     await waitForHarness(env, sandbox.sandboxID, domain);
 
-    // Keep status non-ready until Telegram gateway bootstrap succeeds.
+    // Keep status non-ready until in-sandbox Telegram runtime bootstrap succeeds.
     await env.FROMDONNA_ROUTING.prepare(
       `UPDATE user_agents
        SET runtime_id = ?3, runtime_domain = ?4, status = 'provisioning',
@@ -634,7 +635,7 @@ async function postTelegramUpdate(env: Env, row: UserAgentRow, update: TelegramU
 }
 
 /**
- * Push a raw Telegram update into the sandbox official Hermes Telegram gateway.
+ * Push a raw Telegram update into the sandbox Hermes Telegram runtime.
  * Returns the live runtime row after a successful inject (for checkpoint pull).
  */
 async function injectTelegramUpdate(env: Env, row: UserAgentRow, update: TelegramUpdate): Promise<UserAgentRow> {
@@ -785,7 +786,7 @@ async function processTelegramUpdate(
       return;
     }
 
-    // Official path: sandbox Hermes Telegram gateway sends via Bot API proxy.
+    // Official path: sandbox Hermes Telegram runtime sends via Bot API proxy.
     // Worker does not render agent text itself.
     const live = await injectTelegramUpdate(env, resolved, update);
     // Separate waitUntil so create/inject time does not starve checkpoint harvest.
@@ -847,7 +848,7 @@ export default {
     const url = new URL(request.url);
     try {
       if (request.method === "GET" && url.pathname === "/health") {
-        return json({ ok: true, service: "fromdonna-telegram-gateway", mode: "official-telegram-proxy" });
+        return json({ ok: true, service: "fromdonna-gateway", mode: "channel-agnostic" });
       }
 
       // Ops: rebind Telegram webhook with full allowed_updates (auth via harness secret).
