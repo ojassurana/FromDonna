@@ -231,10 +231,41 @@ class GatewayRuntime:
                 if key in existing.extra:
                     extra[key] = existing.extra[key]
 
+        # Preserve template policy from platforms.telegram (reply_to_mode etc.).
+        # Building a bare PlatformConfig() defaults reply_to_mode to "first", which
+        # re-quotes every user message — FromDonna sets reply_to_mode: off in config.
+        existing_reply_mode = (
+            getattr(existing, "reply_to_mode", None) if existing is not None else None
+        )
+        reply_to_mode = (
+            str(existing_reply_mode).strip().lower()
+            if existing_reply_mode
+            else "off"
+        )
+        if reply_to_mode not in {"off", "first", "all"}:
+            reply_to_mode = "off"
+
         platform_config = PlatformConfig(
             enabled=True,
             token=proxy.token,
             extra=extra,
+            reply_to_mode=reply_to_mode,
+            home_channel=getattr(existing, "home_channel", None) if existing else None,
+            gateway_restart_notification=(
+                bool(getattr(existing, "gateway_restart_notification", True))
+                if existing is not None
+                else True
+            ),
+            typing_indicator=(
+                bool(getattr(existing, "typing_indicator", True))
+                if existing is not None
+                else True
+            ),
+            channel_overrides=(
+                dict(getattr(existing, "channel_overrides", None) or {})
+                if existing is not None
+                else {}
+            ),
         )
         config.platforms[Platform.TELEGRAM] = platform_config
         for plat in list(config.platforms.keys()):
@@ -268,6 +299,11 @@ class GatewayRuntime:
         os.environ["HERMES_HOME"] = self.hermes_home
         # Single-user sandbox: Worker already authenticated the Telegram user.
         os.environ.setdefault("TELEGRAM_ALLOW_ALL_USERS", "true")
+        # Consumer DM UX: never re-quote the user's message on every bot bubble.
+        # (Hermes defaults to "first"; config.yaml also sets reply_to_mode: off.)
+        os.environ["TELEGRAM_REPLY_TO_MODE"] = "off"
+        # Do not enable Hermès lifecycle 👀/👍/👎 reactions unless explicitly opted in.
+        os.environ.setdefault("TELEGRAM_REACTIONS", "false")
         # Custom base_url points at Worker — do NOT rewrite traffic to Telegram IPs.
         os.environ["HERMES_TELEGRAM_DISABLE_FALLBACK_IPS"] = "1"
         # Fail faster on proxy errors (Worker auth / network) instead of 8×30s.

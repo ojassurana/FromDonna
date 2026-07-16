@@ -404,8 +404,9 @@ async function bootstrapHarness(
   );
   const base = workerPublicUrl(env);
 
-  // Composio: ensure forever user rules once; mint short-lived MCP access for this sandbox.
-  // Soft-fail: bootstrap still succeeds if composio-proxy is down.
+  // Composio: ensure forever user rules once; mint MCP access for this sandbox.
+  // Soft-fail: bootstrap still succeeds if composio-proxy is down — but we log hard
+  // so "tools aren't in my toolset" is diagnosable from wrangler tail.
   try {
     await ensureUserComposio(env, row.user_id);
   } catch (error) {
@@ -414,7 +415,25 @@ async function bootstrapHarness(
       error instanceof Error ? error.message : error,
     );
   }
-  const composioMcp = await mintComposioMcpAccess(env, row.user_id, row.runtime_id);
+  let composioMcp = await mintComposioMcpAccess(env, row.user_id, row.runtime_id);
+  if (!composioMcp) {
+    // One force-new retry (stale sticky session / transient Composio API).
+    console.error(`composio mint returned null for ${row.user_id}; retrying force-new`);
+    composioMcp = await mintComposioMcpAccess(env, row.user_id, row.runtime_id, {
+      forceNewComposioSession: true,
+    });
+  }
+  if (!composioMcp) {
+    console.error(
+      `composio MCP NOT injected for ${row.user_id} — Hermes will have no Gmail/Drive tools. ` +
+        `Check COMPOSIO_SESSION_SECRET match on gateway+composio-proxy and COMPOSIO_API_KEY on proxy.`,
+    );
+  } else {
+    console.log(
+      `composio MCP minted for ${row.user_id} toolkits=${(composioMcp.toolkits || []).join(",")} ` +
+        `reused=${!!composioMcp.reused_composio_session}`,
+    );
+  }
 
   const url = `${harnessBaseUrl(env, row.runtime_id, row.runtime_domain)}/bootstrap`;
   const response = await fetch(url, {
@@ -446,6 +465,14 @@ async function bootstrapHarness(
   if (!response.ok) {
     const detail = await response.text().catch(() => "");
     throw new Error(`Harness bootstrap failed with HTTP ${response.status}${detail ? `: ${detail.slice(0, 200)}` : ""}`);
+  }
+  try {
+    const body = (await response.json()) as { composio_mcp?: boolean };
+    if (composioMcp && body?.composio_mcp === false) {
+      console.error(`composio: harness accepted bootstrap but composio_mcp=false for ${row.user_id}`);
+    }
+  } catch {
+    // non-JSON ok
   }
 }
 
@@ -566,10 +593,16 @@ async function provision(env: Env, gateway: string, gatewayUserId: string): Prom
     if (!pending || pending.status !== "provisioning") {
       throw new Error("Runtime was created but the user-agent row was not in provisioning state.");
     }
+    // Hydrate agent-home BEFORE bootstrap when possible… but restore requires
+    // harness auth (bootstrap sets the secret). So: bootstrap first, restore,
+    // then re-bootstrap so composio MCP + reply_to policy win over any
+    // checkpoint-overwritten config.yaml.
     await bootstrapHarness(env, pending);
-    // Hydrate agent-home + workspace from R2 when this user has a prior checkpoint
-    // (create after loss/rebuild). No-op for first-time users.
     await restoreCheckpointToRuntime(env, pending);
+    // Second bootstrap is idempotent (same secret): re-applies composio token
+    // and restarts/reloads gateway tooling after restore may have overwritten
+    // ~/.hermes/config.yaml.
+    await bootstrapHarness(env, pending);
 
     await env.FROMDONNA_ROUTING.prepare(
       `UPDATE user_agents
@@ -621,8 +654,10 @@ async function replaceRuntime(env: Env, row: UserAgentRow): Promise<UserAgentRow
     }
 
     await bootstrapHarness(env, pending);
-    // Critical: replaceRuntime kills the old box — restore before marking ready.
+    // Critical: replaceRuntime kills the old box — restore then re-bootstrap so
+    // composio MCP / telegram proxy win over checkpoint-overwritten config.
     await restoreCheckpointToRuntime(env, pending);
+    await bootstrapHarness(env, pending);
 
     await env.FROMDONNA_ROUTING.prepare(
       `UPDATE user_agents
