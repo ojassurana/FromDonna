@@ -747,6 +747,14 @@ def _apply_telegram_proxy(proxy: TelegramProxyBootstrap, *, start: bool = False)
     if proxy.userId:
         os.environ["FROMDONNA_USER_ID"] = proxy.userId
 
+    # 1 user / 1 sandbox / 1 DM — auto-set Hermes home so cron/cross-platform
+    # deliver here and the "/sethome" setup notice is never shown.
+    # Must be set before gateway start so load_config() sees the env var.
+    chat_id = (proxy.chatId or "").strip()
+    if chat_id:
+        os.environ["TELEGRAM_HOME_CHANNEL"] = chat_id
+        os.environ.setdefault("TELEGRAM_HOME_CHANNEL_NAME", "Home")
+
     runtime = get_gateway_runtime(str(HERMES_HOME))
     runtime.configure_proxy(
         TelegramProxyConfig(
