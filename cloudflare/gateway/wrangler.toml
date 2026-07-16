@@ -8,6 +8,12 @@ binding = "FROMDONNA_ROUTING"
 database_name = "fromdonna-routing"
 database_id = "51aa8d76-1d4d-4dff-ac00-7712dcf502bc"
 
+# Per-user runtime checkpoints (agent-home + workspace). Channel-agnostic.
+# Create the bucket once: npx wrangler r2 bucket create fromdonna-user-state
+[[r2_buckets]]
+binding = "USER_STATE"
+bucket_name = "fromdonna-user-state"
+
 # Public runtime configuration. Secrets are provisioned separately.
 [vars]
 E2B_TEMPLATE = "fromdonna-hermes"

@@ -1,136 +1,169 @@
 # Memory & file management
 
-How a user’s data is stored across **E2B sandboxes**, **`~/.hermes`**, and **R2**.
+How a user’s data is stored across **E2B sandboxes**, **agent home (`~/.hermes`)**, **workspace**, and **R2**.
+
+**Architecture B (live):** after agent use, the sandbox **stages** a filtered checkpoint; the Worker **pulls** it into R2; on create/replace the Worker **restores** from R2.  
+Channel-agnostic keys use product `userId` (e.g. `telegram:123`), never a single-channel path layout.
+
+Related: [e2b-template.md](./e2b-template.md), [../gateway/telegram.md](../gateway/telegram.md), [fromdonna-persistence-technical-report.pdf](./fromdonna-persistence-technical-report.pdf).
 
 ## Big picture
 
 ```
 User (years)
-  ├── Account / routing          → Worker DB (user_id → sandbox_id)
+  ├── Account / routing          → Worker D1 (user_id → runtime_id)
   ├── Secrets / OAuth            → Worker + Nango (never long-lived in E2B)
-  ├── Product files & artifacts  → R2  (per-user prefix)
-  └── Live Hermes agent brain    → that user’s E2B sandbox: ~/.hermes
+  ├── Runtime checkpoint         → R2  users/{userId}/checkpoint.tar.gz
+  ├── Product files & artifacts  → R2  (tools path later; optional)
+  └── Live agent brain           → that user’s E2B: ~/.hermes + ~/workspace
 ```
 
-- **Sandbox** = that user’s current computer (Hermes runs here).
-- **R2** = durable place for files the product cares about day to day.
-- **`~/.hermes`** = live Hermes personalization (skills, memory, config, sessions).
+| Concern | Where |
+|---------|--------|
+| Day-to-day continuity | **E2B pause/resume** (same disk; memory/workspace **not** cleared on unpause) |
+| Survive missing / replaced sandbox | **R2 checkpoint** (agent-home + workspace) |
+| Channel tokens / E2B API key | **Worker only** |
 
 ## Sandbox lifecycle
 
-| Action | What happens to data on the box |
-|--------|----------------------------------|
-| **Create** from template | Fresh machine; Hermes installed base image; empty/new user brain until restore |
+| Action | Data on the box |
+|--------|------------------|
+| **Create** from template | Fresh image; then Worker **restores** R2 checkpoint if one exists |
 | **Pause** | Disk + memory **kept** (sleep). Not deleted. |
-| **Resume** | Same computer continues; `~/.hermes` as they left it |
-| **Delete / kill** | That VM’s disk is **gone** (unless you backed up) |
-| **New sandbox** (rebuild) | New computer; restore `~/.hermes` if you want the same agent brain |
+| **Resume** (`connect`) | Same computer continues; `~/.hermes` + workspace as left |
+| **replaceRuntime** (404 / broken harness) | New VM; **restore from R2**; old id killed |
+| **Delete / kill** without backup | That VM’s disk is **gone** |
 
-### Per-user allocation
+### When R2 restore is needed vs not
 
-- Product model: **one primary sandbox per user** for as long as practical.
-- DB maps `user_id → sandbox_id` (update if you ever recreate).
-- E2B is not free immortal hosting forever — pause while active; recreate when you must (limits, template upgrade, cost). Customer lifetime ≠ “never delete this VM no matter what,” but **prefer** the same sandbox when you can.
-
-### Template vs pause snapshot
-
-| Kind | Meaning |
-|------|---------|
-| **Template snapshot** | Shared base image (Hermes + deps). **No** one user’s personal data. Built once, used for creates. |
-| **Paused sandbox** | **That user’s** machine frozen at pause time (their files + `~/.hermes` + processes). |
+| Event | Same disk? | R2 restore? |
+|-------|------------|-------------|
+| Idle pause → next message | Yes | **No** |
+| connect 404 / failed resume → replace | No | **Yes** |
+| Failed / stuck provision → new create | No | **Yes** if prior checkpoint |
+| Template rebuild / deliberate kill | No | **Yes** if you care about continuity |
 
 ## What lives where
 
-### R2 (day-to-day product data)
+### Live agent home (`~/.hermes` / `$HERMES_HOME`)
 
-Store **here** under a per-user prefix, e.g. `users/{userId}/…`:
+Typically `/home/user/.hermes` on the sandbox:
 
-- Docs, exports, images, downloads  
-- Deliverables the agent or user “created as product files”  
-- Anything that must survive sandbox death without a special restore step  
-
-Access pattern: agent calls **tools** → Worker (capability + `userId`) → R2.  
-The agent does not hold raw R2 credentials.
-
-### `~/.hermes` on the sandbox (live agent brain)
-
-Hermes’s own state on the box (or `$HERMES_HOME` if set), typically:
-
-| Path (under `~/.hermes`) | Role |
-|--------------------------|------|
+| Path | Role |
+|------|------|
 | `config.yaml` | Settings / tools policy |
-| `skills/` | Installed and agent-written skills |
-| `state.db` / sessions | Conversation store |
-| `SOUL.md`, `memories/MEMORY.md`, `memories/USER.md` | Identity + curated memory (see [../hermes/identity-and-memory.md](../hermes/identity-and-memory.md)) |
-| cron, plugins, etc. | Other Hermes runtime state |
+| `skills/` | Bundled + user/agent skills |
+| `state.db` / `sessions/` | Conversation store |
+| `SOUL.md`, `memories/MEMORY.md`, `memories/USER.md` | Identity + curated memory ([identity-and-memory.md](../hermes/identity-and-memory.md)) |
+| `plugins/`, cron, logs, … | Other Hermes runtime state |
 
-**Day to day:** this stays **on the sandbox** (pause/resume preserves it).
+**Day to day:** stays on the sandbox (pause preserves it).
 
-**Not** continuously mirrored to R2 unless you add a backup job.
+### Workspace
 
-### Outside both (never “only on the sandbox”)
+`/home/user/workspace` — agent working files (harness CWD for tools). Included in the runtime checkpoint.
 
-- Telegram/WhatsApp tokens  
-- Nango OAuth / API product keys  
-- Billing, identity, `user_id ↔ sandbox_id`  
+### R2 runtime checkpoint (implemented — Architecture B)
 
-These live on **Worker** (and Nango), not as the only copy inside E2B.
+**Bucket:** `fromdonna-user-state` (Worker binding `USER_STATE`).
 
-### Other paths on the sandbox
+**Layout:**
 
-If Hermes writes project files under e.g. `~/workspace` and you **don’t** send them through R2 tools, those are **only on that VM** until you back them up. Prefer R2 tools for anything product-durable.
-
-## Rebuild / template upgrade (move `~/.hermes` only when needed)
-
-If you **don’t** upgrade the template and never delete the sandbox:
-
-- User keeps the same box; **no** `~/.hermes` transfer required.
-
-When you **must** replace the computer (new template, forced delete, etc.):
-
-```
-1. Build new template (optional — new Hermes/base)
-2. Create new sandbox from template
-3. Restore ~/.hermes from old sandbox or from R2 backup
-4. Update user_id → new sandbox_id
-5. Delete old sandbox
+```text
+users/{userId}/checkpoint.tar.gz
+users/{userId}/manifests/latest.json
 ```
 
-Assuming product files already live on R2: **transferring `~/.hermes` is enough** for the agent brain.
+**Manifest fields:** `version`, `userId`, `savedAt`, `bytes`, `sha256`, `runtimeId`, `source`  
+(`source` examples: `envd-pull`, `gateway-session`, `harness-export`)
 
-### When `~/.hermes` touches R2
+#### What is packed
+
+Filtered **agent-home** + **workspace**:
+
+- Include: config, skills, memories, `state.db` (via SQLite backup API), sessions, SOUL, plugins, etc.
+- Exclude: `.env`, `auth.json`, caches, venvs, `node_modules`, PIDs, WAL/SHM, staged checkpoint files themselves, `/opt/fromdonna`
+
+#### How backup runs (not sandbox → Worker POST)
+
+Sandbox **outbound POST** to `*.workers.dev` is often blocked by Cloudflare **error 1010**. Live path:
+
+```text
+Agent session finishes
+  → harness stages tar on disk
+      ~/.hermes/fromdonna-checkpoint-latest.tar.gz
+      ~/.hermes/fromdonna-checkpoint-ready.json
+  → Worker harvests (async, separate waitUntil):
+      1) GET harness /internal/checkpoint/export
+      2) fallback: E2B envd GET /files (staged tar)
+  → R2 put + manifest
+```
+
+Also pulled:
+
+- At the **start of the next message** (safety net)
+- **Before replace/kill** when the old box is still reachable
+
+#### How restore runs
+
+On **provision** and **replaceRuntime**, after harness `/bootstrap`:
+
+```text
+Worker GET R2 checkpoint (if any)
+  → POST harness /internal/restore  (gzip body)
+  → extract into ~/.hermes + workspace
+  → mark D1 ready
+```
 
 | Situation | Action |
 |-----------|--------|
-| Normal use | **No** — brain stays on sandbox |
-| Backup (optional / scheduled) | Copy `~/.hermes` → R2 |
-| Rebuild / disaster restore | R2 (or live old box) → new sandbox `~/.hermes` |
+| Normal use / pause / unpause | **No R2 required** — disk stays |
+| After agent use | Stage → Worker **pull** → R2 (async; may land shortly after the reply) |
+| Create / replaceRuntime | Worker **restore** from R2 if present |
 
-So: **R2 is ongoing storage for user files.**  
-**`~/.hermes` is copied to/from R2 only for backup or transfer**, not as the live primary path every turn (unless you later build a full remote FS).
+### Product files (tools → R2)
 
-## Mental model (one page)
+Separate from the runtime checkpoint: durable docs/exports may later use agent tools → Worker → R2 (`r2://` descriptors already exist in harness). The agent must not hold long-lived R2 credentials.
+
+### Outside the sandbox (always)
+
+- Channel bot tokens  
+- Nango / OAuth product secrets  
+- Billing, identity, `user_id ↔ runtime_id`  
+
+## Mental model
 
 ```
-                    ┌─────────────────────────┐
-                    │  Worker / Nango / DB    │
-                    │  identity, secrets,     │
-                    │  user → sandbox_id      │
-                    └───────────┬─────────────┘
+                    ┌──────────────────────────────┐
+                    │  Worker / D1 / Nango         │
+                    │  identity, secrets, routing  │
+                    │  R2 checkpoint put + restore │
+                    └───────────┬──────────────────┘
                                 │
               ┌─────────────────┼─────────────────┐
               ▼                                   ▼
      ┌─────────────────┐                 ┌─────────────────┐
      │  E2B (this user)│                 │  R2 (this user) │
-     │  Hermes process │                 │  files/artifacts│
-     │  ~/.hermes live │                 │  via tools      │
-     │  pause = keep   │                 │  durable        │
+     │  Hermes live    │  stage + pull   │  checkpoint.tar │
+     │  ~/.hermes      │ ───────────────►│  + manifest     │
+     │  workspace      │                 │                 │
+     │  pause = keep   │ ◄── restore ─── │  on new runtime │
      └─────────────────┘                 └─────────────────┘
-              │
-              │ only on rebuild/backup
-              └──────────► optional ~/.hermes archive on R2
+```
+
+## Ops checks
+
+```bash
+# Manifest for a user (Worker secret)
+curl -sS -H "Authorization: Bearer $WORKER_TO_HARNESS_SECRET" \
+  "https://fromdonna-telegram-gateway.code-df4.workers.dev/internal/checkpoint/status?userId=telegram:<id>"
+
+# Or via wrangler
+npx wrangler r2 object get \
+  "fromdonna-user-state/users/telegram:<id>/manifests/latest.json" \
+  --file /tmp/man.json --remote
 ```
 
 ## One-line summary
 
-**R2 holds ongoing user files; the sandbox holds the live Hermes brain (`~/.hermes`); pause keeps that brain in place; you move or backup `~/.hermes` only when replacing or protecting the machine.**
+**Pause keeps the live brain on the box; Architecture B stages after agent use and the Worker pulls into R2 so a missing or replaced E2B can restore agent-home + workspace — channel-agnostic, no secrets in the archive.**

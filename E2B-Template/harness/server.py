@@ -29,7 +29,7 @@ from pathlib import Path
 from typing import Annotated, Iterator, Literal
 from urllib.parse import urlparse
 
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import FastAPI, Header, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field
 
 app = FastAPI()
@@ -693,6 +693,10 @@ class TelegramProxyBootstrap(BaseModel):
 
 class Bootstrap(BaseModel):
     secret: str = Field(min_length=16, max_length=256)
+    # Product user id (channel-agnostic), e.g. telegram:123 — for R2 checkpoints.
+    userId: str | None = Field(default=None, max_length=200)
+    # Worker public base URL (no trailing slash) for checkpoint uploads.
+    workerUrl: str | None = Field(default=None, max_length=512)
     telegramProxy: TelegramProxyBootstrap | None = None
 
 
@@ -702,9 +706,24 @@ class TelegramUpdateEnvelope(BaseModel):
     update: dict
 
 
+def _apply_identity_env(*, user_id: str | None, worker_url: str | None, secret: str) -> None:
+    """Export channel-agnostic identity for checkpoint pack/upload (and tools)."""
+    os.environ["WORKER_TO_HARNESS_SECRET"] = secret
+    os.environ["HERMES_HOME"] = str(HERMES_HOME)
+    if user_id:
+        os.environ["FROMDONNA_USER_ID"] = user_id
+    if worker_url:
+        os.environ["FROMDONNA_WORKER_URL"] = worker_url.rstrip("/")
+
+
 def _apply_telegram_proxy(proxy: TelegramProxyBootstrap, *, start: bool = False) -> None:
     """Configure official Hermes Telegram gateway against Worker proxy."""
     from gateway_runtime import TelegramProxyConfig, get_gateway_runtime
+
+    # Keep checkpoint upload able to derive Worker URL from the proxy base.
+    os.environ["FROMDONNA_TELEGRAM_BASE_URL"] = proxy.baseUrl
+    if proxy.userId:
+        os.environ["FROMDONNA_USER_ID"] = proxy.userId
 
     runtime = get_gateway_runtime(str(HERMES_HOME))
     runtime.configure_proxy(
@@ -743,6 +762,10 @@ def bootstrap(body: Bootstrap):
         if body.telegramProxy is not None:
             proxy_to_apply = body.telegramProxy
 
+    user_id = (body.userId or (proxy_to_apply.userId if proxy_to_apply else None) or "").strip() or None
+    worker_url = (body.workerUrl or "").strip() or None
+    _apply_identity_env(user_id=user_id, worker_url=worker_url, secret=secret)
+
     if proxy_to_apply is not None:
         try:
             # Start early so first user message does not pay cold connect cost,
@@ -768,6 +791,72 @@ def bootstrap(body: Bootstrap):
                 ) from retry_exc
 
     return {"ok": True, "already": already, "telegram_proxy": bool(_telegram_proxy)}
+
+
+@app.post("/internal/restore")
+async def internal_restore(
+    request: Request,
+    authorization: str | None = Header(default=None),
+):
+    """Worker pushes latest R2 checkpoint (gzip tar) into this runtime.
+
+    Channel-agnostic. Called after create/replace before the user is served.
+    """
+    if not _authorized(authorization):
+        raise HTTPException(status_code=401, detail="unauthorized")
+
+    body = await request.body()
+    if not body:
+        raise HTTPException(status_code=400, detail="empty_checkpoint")
+    if len(body) > 40 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="checkpoint_too_large")
+
+    try:
+        import checkpoint as ckpt
+
+        with tempfile.NamedTemporaryFile(prefix="restore-", suffix=".tar.gz", delete=False) as handle:
+            archive = Path(handle.name)
+            handle.write(body)
+        try:
+            ckpt.restore_checkpoint_archive(archive, hermes_home=HERMES_HOME)
+        finally:
+            archive.unlink(missing_ok=True)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"restore_failed: {exc}") from exc
+
+    return {"ok": True, "bytes": len(body)}
+
+
+@app.get("/internal/checkpoint/export")
+def internal_checkpoint_export(authorization: str | None = Header(default=None)):
+    """Worker pulls a staged checkpoint (avoids sandbox→Worker CF 1010 blocks).
+
+    Returns 204 when no ready checkpoint is staged yet.
+    """
+    if not _authorized(authorization):
+        raise HTTPException(status_code=401, detail="unauthorized")
+    try:
+        import checkpoint as ckpt
+        from fastapi.responses import Response
+
+        packed = ckpt.read_local_checkpoint(consume=True, hermes_home=HERMES_HOME)
+        if not packed:
+            return Response(status_code=204)
+        data, meta = packed
+        headers = {
+            "content-type": "application/gzip",
+            "x-fromdonna-checkpoint-source": str(meta.get("source") or "turn"),
+            "x-fromdonna-checkpoint-bytes": str(len(data)),
+        }
+        if meta.get("savedAt"):
+            headers["x-fromdonna-checkpoint-saved-at"] = str(meta["savedAt"])
+        return Response(content=data, media_type="application/gzip", headers=headers)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"export_failed: {exc}") from exc
 
 
 @app.post("/telegram/update")
@@ -821,4 +910,13 @@ def turn(
         chat_id=turn.gatewayChatId,
         message_id=turn.gatewayMessageId,
     )
+    # Legacy /turn path: agent work is fully done when we return — checkpoint now.
+    try:
+        import checkpoint as ckpt
+
+        if turn.userId:
+            os.environ.setdefault("FROMDONNA_USER_ID", turn.userId)
+        ckpt.schedule_checkpoint_upload(source="turn")
+    except Exception:
+        pass
     return _response(text, session_id, actions)

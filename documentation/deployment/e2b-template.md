@@ -2,7 +2,7 @@
 
 How to build the **shared sandbox image** FromDonna users boot from: Hermes (possibly customized), CLIs, optional MCPs, plugins, and extra product code.
 
-Related: [memorymanagement.md](./memorymanagement.md) (what lives on the box vs R2), [../tooling/general.md](../tooling/general.md) (secrets stay on Worker), [../gateway/telegram.md](../gateway/telegram.md) (Worker create + `/bootstrap` + `/turn`).
+Related: [memorymanagement.md](./memorymanagement.md) (pause vs R2 Architecture B), [../tooling/general.md](../tooling/general.md) (secrets stay on Worker), [../gateway/telegram.md](../gateway/telegram.md) (Worker create + inject + checkpoint harvest).
 
 Source tree: `E2B-Template/`
 
@@ -16,32 +16,35 @@ Source tree: `E2B-Template/`
 | Harness port | `8788` (uvicorn warm start) |
 | Hermes config | `config/hermes/config.yaml` → LLM proxy base URL + `grok-4.5` |
 | Hermes SOUL | `config/hermes/SOUL.md` → baked to `/home/user/.hermes/SOUL.md` (Donna persona) |
-| Harness code | `E2B-Template/harness/server.py` |
+| Harness code | `E2B-Template/harness/` (`server.py`, `gateway_runtime.py`, `checkpoint.py`) |
 
 ### What is baked today
 
 - Vendored Hermes under `E2B-Template/hermes/`
 - Agent-only Hermes config (no channel tokens)
 - Default Donna `SOUL.md` (`config/hermes/SOUL.md` → `~/.hermes/SOUL.md`)
-- FastAPI harness with `/health`, `/bootstrap`, `/turn`
+- Product plugins under `extensions/plugins` (e.g. `fromdonna_transport`)
+- FastAPI harness: `/health`, `/bootstrap`, `/telegram/update`, `/internal/checkpoint/export`, `/internal/restore`, legacy `/turn`
+- Checkpoint pack/stage helpers (`checkpoint.py`)
 - `setStartCmd` starts uvicorn and waits for port 8788
 
 ### What is *not* baked
 
 - Telegram bot token, E2B API key, Codex/OAuth, relay secret
 - Per-user `WORKER_TO_HARNESS_SECRET` (injected post-create via `/bootstrap`)
-- Per-user capability tokens (injected per `/turn` as `OPENAI_API_KEY` for the Hermes child only)
+- Per-user capability tokens (injected per inject as short-lived capability)
+- Per-user R2 data (restored after create if a checkpoint exists)
 
-### Warm start + `/bootstrap`
+### Warm start + `/bootstrap` + restore
 
 Build snapshots uvicorn already listening. Create-time `envVars` do **not** reach that process. After `Sandbox.create`, the gateway:
 
 1. Waits for `GET /health`
-2. `POST /bootstrap` with `{ "secret": "<WORKER_TO_HARNESS_SECRET>" }`
-3. Stores sandbox id in D1 as `ready`
+2. `POST /bootstrap` with secret + telegramProxy + `userId` / `workerUrl`
+3. **`POST /internal/restore`** with R2 checkpoint body if one exists for `userId`
+4. Stores sandbox id in D1 as `ready`
 
-See [telegram.md](../gateway/telegram.md) for the full Worker lifecycle.
-
+See [telegram.md](../gateway/telegram.md) and [memorymanagement.md](./memorymanagement.md).
 ## Goal
 
 One reusable template (e.g. `fromdonna-hermes`) so every user sandbox starts with:
@@ -156,14 +159,17 @@ If default config lists an MCP server, ensure either:
 Typical extras in the image:
 
 - **HTTP harness** (implemented):  
-  - `POST /bootstrap` — one-time Worker secret into process memory  
-  - `POST /turn` — Worker-forwarded message → Hermes `--oneshot` → `{ text }`  
-  - `GET /health` — liveness + `auth_ready`  
+  - `GET /health` — liveness + gateway/proxy readiness  
+  - `POST /bootstrap` — Worker secret + Telegram proxy + identity  
+  - `POST /telegram/update` — inject Update into official Hermes Telegram gateway  
+  - `GET /internal/checkpoint/export` — Worker pull of staged runtime checkpoint  
+  - `POST /internal/restore` — apply R2 checkpoint after create/replace  
+  - `POST /turn` — legacy path  
+- **Checkpoint packer** (`checkpoint.py`) — filtered agent-home + workspace tar  
 - **Thin tools** / wrappers that call Worker for Nango / API / MCP  
 - CLI shims that rewrite upstream base URLs to Worker  
 
-This code is **yours**, versioned in FromDonna, **copied in at template build** (`template.ts` copies `harness/` + `hermes/` + default config).
-
+This code is **yours**, versioned in FromDonna, **copied in at template build** (`template.ts` copies `harness/` + `hermes/` + default config + plugins).
 ### 8. Warm start (recommended)
 
 ```text
@@ -192,13 +198,14 @@ POST api.e2b.app/sandboxes
   autoPause + autoResume
   metadata.fromdonna_user_id
 → wait GET https://8788-{id}.e2b.dev/health
-→ POST /bootstrap { secret }
+→ POST /bootstrap { secret, userId, workerUrl, telegramProxy }
+→ POST /internal/restore  (R2 blob if any)
 → D1 status=ready
 ```
 
-Before later turns: `POST .../sandboxes/{id}/connect` then `POST /turn`.  
+Before later messages: `POST .../sandboxes/{id}/connect` then `POST /telegram/update`.  
+After agent sessions: sandbox stages checkpoint; Worker harvests to R2 (Architecture B).  
 Don’t rebuild the template per message.
-
 ### Build commands
 
 ```bash
@@ -234,21 +241,23 @@ User **R2 files** do not need moving (already durable).
 | Concern | Where it lives |
 |---------|----------------|
 | Hermes binary, CLIs, stock plugins, harness | **Template** |
-| User skills/memory/config drift | **Live sandbox `~/.hermes`** |
-| Docs/images/exports | **R2** |
+| User skills/memory/config/sessions drift | **Live sandbox `~/.hermes` + workspace** |
+| Runtime checkpoint for replace/missing box | **R2** (Worker pull after use) |
+| Product docs/images/exports (tools) | **R2** (later / separate path) |
 | Secrets / OAuth | **Worker / Nango** |
 
 ## Ops checklist
 
 1. Pin Hermes (commit/version) + CLI versions  
 2. Apply your Hermes mods/plugins/bundled skills in the recipe  
-3. Copy harness + Worker client code  
+3. Copy harness (`checkpoint.py`, gateway runtime) + default config  
 4. Default config: agent-only, no channel tokens  
 5. MCP: only secret-free local in-image; privileged MCP via Worker  
-6. Optional warm `setStartCmd` + port wait  
-7. Build → set Worker `TEMPLATE_ID`  
-8. Smoke test: create sandbox → `which hermes` → CLIs on PATH → one harness turn → no product secrets in env dump  
+6. Warm `setStartCmd` + port wait  
+7. Build → Worker `E2B_TEMPLATE=fromdonna-hermes` + R2 `USER_STATE` bound  
+8. Smoke: create sandbox → `/health` → `/bootstrap` → inject path → no product secrets in env dump  
+9. After a real turn: confirm R2 `users/{userId}/manifests/latest.json` updates  
 
 ## One-line summary
 
-**Template build = pin and install Hermes (yours), CLIs, plugins, optional local MCP, and product harness once; users get create/resume from that image; secrets and per-user brain stay off the shared image except via live sandbox + R2 rules.**
+**Template build = pin Hermes, plugins, and harness (including checkpoint stage/export/restore) once; users get create/resume from that image; secrets stay off the image; per-user brain is live on the sandbox and durably checkpointed to R2 via Worker pull.**

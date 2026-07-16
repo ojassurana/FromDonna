@@ -2,7 +2,7 @@
 
 Operational reference for the live Telegram → D1 → E2B Hermes → LLM proxy path.
 
-See also: [telegram.md](./telegram.md), [gateway.md](./gateway.md), [llm-proxy-worker.md](./llm-proxy-worker.md), [../deployment/e2b-template.md](../deployment/e2b-template.md).
+See also: [telegram.md](./telegram.md), [gateway.md](./gateway.md), [llm-proxy-worker.md](./llm-proxy-worker.md), [../deployment/e2b-template.md](../deployment/e2b-template.md), [../deployment/memorymanagement.md](../deployment/memorymanagement.md).
 
 ---
 
@@ -13,26 +13,26 @@ See also: [telegram.md](./telegram.md), [gateway.md](./gateway.md), [llm-proxy-w
     │
     ▼
 fromdonna-telegram-gateway  (Cloudflare Worker)
-    │  secrets: TELEGRAM_*, E2B_API_KEY, WORKER_TO_HARNESS_SECRET
-    │  D1: fromdonna-routing.user_agents (gateway-neutral)
+    │  secrets: TELEGRAM_*, E2B_API_KEY, WORKER_TO_HARNESS_SECRET, LLM_CAPABILITY_SECRET
+    │  D1: fromdonna-routing.user_agents
+    │  R2: USER_STATE → fromdonna-user-state (runtime checkpoints)
     │
     ├─ provision ──► E2B Sandbox.create(fromdonna-hermes)
     │                   │
     │                   ├─ GET  /health
-    │                   └─ POST /bootstrap  (harness auth)
+    │                   ├─ POST /bootstrap  (secret + telegramProxy + userId)
+    │                   └─ POST /internal/restore  (R2 checkpoint if any)
     │
-    └─ turn ────────► POST https://8788-{sandboxId}.e2b.dev/turn
+    └─ inject ──────► POST https://8788-{sandboxId}.e2b.dev/telegram/update
                          Authorization: Bearer <harness secret>
-                         x-llm-capability: <nonce>
+                         x-llm-capability: <HMAC capability>
                               │
                               ▼
-                         Hermes oneshot (OPENAI_API_KEY=capability)
+                         Official Hermes Telegram gateway in sandbox
                               │
-                              ▼
-                         fromdonna-llm-proxy
-                              │
-                              ▼
-                         Codex relay (host + ngrok) → model
+                              ├─ outbound Bot API via Worker /telegram-bot-api/*
+                              ├─ LLM via fromdonna-llm-proxy (capability only)
+                              └─ after session: stage checkpoint → Worker pull → R2
 ```
 
 ---
@@ -45,9 +45,9 @@ fromdonna-telegram-gateway  (Cloudflare Worker)
 | LLM proxy | `https://fromdonna-llm-proxy.code-df4.workers.dev` | `GET /health` + chat completion |
 | Telegram webhook | Bot API `getWebhookInfo` | URL matches gateway; `last_error` null |
 | D1 | `fromdonna-routing` | `SELECT … FROM user_agents` |
-| E2B template | alias `fromdonna-hermes` | `npm run smoke` in `E2B-Template` |
-| Per-user harness | `https://8788-{id}.e2b.dev/health` | `auth_ready: true` after bootstrap |
-| Codex relay | `CODEX_RELAY_URL` in llm-proxy `wrangler.toml` | process up; proxy completion works |
+| R2 checkpoints | `fromdonna-user-state` | manifest `users/{userId}/manifests/latest.json` |
+| E2B template | alias `fromdonna-hermes` | `npm run build:prod` / smoke |
+| Per-user harness | `https://8788-{id}.e2b.dev/health` | `auth_ready` + `telegram_proxy_ready` after bootstrap |
 
 ---
 
@@ -153,12 +153,30 @@ New users get the new image immediately. Existing sandboxes keep the old filesys
 
 ---
 
+## Checkpoint ops (Architecture B)
+
+After agent use, the sandbox **stages** a filtered tar; the Worker **pulls** to R2 (not sandbox→Worker POST — CF 1010). On create/replace, Worker **restores**.
+
+```bash
+# Status (needs WORKER_TO_HARNESS_SECRET)
+curl -sS -H "Authorization: Bearer $WORKER_TO_HARNESS_SECRET" \
+  "https://fromdonna-telegram-gateway.code-df4.workers.dev/internal/checkpoint/status?userId=telegram:<id>"
+
+# Or wrangler
+npx wrangler r2 object get \
+  "fromdonna-user-state/users/telegram:<id>/manifests/latest.json" \
+  --file /tmp/man.json --remote && cat /tmp/man.json
+```
+
+Details: [../deployment/memorymanagement.md](../deployment/memorymanagement.md).
+
+---
+
 ## Change log (implementation snapshot)
 
-Documented as of the FromDonna Telegram routing ship:
-
-1. **Gateway Worker** — D1 routing, atomic provision claim, failed recovery, E2B create/connect, harness bootstrap, capability header, Telegram webhook with `waitUntil`
-2. **Harness** — `/health`, `/bootstrap`, `/turn`; Hermes oneshot via LLM proxy only
-3. **E2B template** — `fromdonna-hermes` warm harness on 8788; agent-only config pointing at llm-proxy
-4. **LLM proxy** — accepts Hermes `stream:true` via aggregated OpenAI SSE response; credentials stay on relay path
-5. **Secrets model** — no Telegram/Codex secrets in sandboxes; capability + harness secret only
+1. **Gateway Worker** — D1 routing, provision/replaceRuntime, E2B create/connect, bootstrap, inject `/telegram/update`, Bot API proxy, R2 checkpoint harvest/restore
+2. **Harness** — official Hermes Telegram gateway; `/health`, `/bootstrap`, `/telegram/update`, `/internal/checkpoint/export`, `/internal/restore`
+3. **E2B template** — `fromdonna-hermes` warm harness on 8788; checkpoint packer; agent-only config → llm-proxy
+4. **LLM proxy** — capability tokens; credentials stay off sandbox
+5. **Secrets model** — no Telegram/Codex/R2 long-lived keys in sandboxes
+6. **Runtime persistence** — Architecture B stage + Worker pull to R2; verified on live traffic

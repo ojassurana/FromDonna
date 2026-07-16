@@ -90,10 +90,10 @@ Session start
 
 ## FromDonna product notes
 
-- Live brain for each Telegram user is **that sandbox’s** `~/.hermes` (see [../deployment/memorymanagement.md](../deployment/memorymanagement.md)).
+- Live brain for each user is **that sandbox’s** `~/.hermes` (see [../deployment/memorymanagement.md](../deployment/memorymanagement.md)).
 - Template seeds **Donna** identity via `E2B-Template/config/hermes/SOUL.md` → image `/home/user/.hermes/SOUL.md` (see [../deployment/e2b-template.md](../deployment/e2b-template.md)). Hermes does not overwrite an existing SOUL after first use.
 - Per-user memories (`MEMORY.md` / `USER.md`) grow after first use.
-- Template upgrade / sandbox kill requires restore of `~/.hermes` if you want the same identity and memory.
+- Template upgrade / sandbox kill / `replaceRuntime`: Worker restores the R2 **runtime checkpoint** (filtered agent-home + workspace) when one exists — Architecture B stage + Worker pull (not needed for ordinary pause/unpause).
 
 ---
 

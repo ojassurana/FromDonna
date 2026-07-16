@@ -18,8 +18,9 @@ Architecture and ops notes for the multi-user Hermes product: one Telegram bot, 
 
 | Doc | Contents |
 |-----|----------|
-| [deployment/e2b-template.md](./deployment/e2b-template.md) | Template recipe, warm start, `/bootstrap` caveat, build commands |
-| [deployment/memorymanagement.md](./deployment/memorymanagement.md) | Sandbox vs `~/.hermes` vs R2 |
+| [deployment/e2b-template.md](./deployment/e2b-template.md) | Template recipe, warm start, `/bootstrap`, harness checkpoint endpoints |
+| [deployment/memorymanagement.md](./deployment/memorymanagement.md) | **Arch B:** pause vs R2 checkpoint (stage → Worker pull → restore) |
+| [deployment/fromdonna-persistence-technical-report.pdf](./deployment/fromdonna-persistence-technical-report.pdf) | Full technical report (implementation + live verification) |
 
 ### Hermes (in-sandbox agent)
 
@@ -36,12 +37,12 @@ Architecture and ops notes for the multi-user Hermes product: one Telegram bot, 
 
 ## Live path (one sentence)
 
-**User DMs `@fromdonna_bot` → gateway Worker + D1 → dedicated E2B Hermes → LLM proxy (capability only) → reply via Telegram.**
+**User DMs `@fromdonna_bot` → gateway Worker + D1 → dedicated E2B Hermes (official Telegram gateway) → LLM proxy (capability only) → reply via Bot API proxy; after use, Worker pulls a runtime checkpoint to R2 for restore if the box is replaced.**
 
 ## Repo map
 
 ```text
-cloudflare/gateway/     Telegram Worker + D1 migrations
+cloudflare/gateway/     Telegram Worker + D1 + R2 USER_STATE checkpoints
 cloudflare/llm-proxy/   OpenAI-compatible inference Worker + host relay
 E2B-Template/           Sandbox image (Hermes, harness, config)
 documentation/          This tree

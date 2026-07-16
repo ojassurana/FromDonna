@@ -29,6 +29,7 @@ User (any app)
 - **Many users, one bot/number per channel** is fine — identity is `platform user/chat id`, not “who holds the token.”
 - **One user → one sandbox → one Hermes process** (create/resume on demand; pause when idle via E2B autoPause + autoResume).
 - **Durable routing state lives outside the sandbox** (Worker + D1). Sandbox = compute for that user.
+- **Runtime checkpoint** (agent-home + workspace) lives in **R2**; Worker pulls after agent use and restores on create/replace. See [../deployment/memorymanagement.md](../deployment/memorymanagement.md).
 
 ## Layers
 
@@ -36,11 +37,12 @@ User (any app)
 | --- | --- | --- |
 | Channel adapter | Worker routes per platform | Verify webhook, parse native update, send native replies |
 | Normalize | Worker | Map any channel → one internal message shape |
-| Identity & routing | Worker + D1 | Map channel identity → `userId` → `sandboxId` / status |
-| Provision | Worker + E2B API | Create sandbox, wait for harness, bootstrap auth |
+| Identity & routing | Worker + D1 | Map channel identity → `userId` → `runtime_id` / status |
+| Provision | Worker + E2B API | Create sandbox, wait for harness, bootstrap auth, **R2 restore** |
 | Agent runtime | E2B (per user) | Harness + Hermes loop + tools; no channel secrets |
+| Checkpoint | Worker + R2 | Harvest staged tar after use; restore when runtime is replaced |
 | Inference | LLM proxy Worker | OpenAI-compatible edge; real credentials stay off sandbox |
-| Outbound | Worker | Agent reply → correct channel API |
+| Outbound | Worker / Bot API proxy | Agent replies via channel (Telegram: proxy) |
 
 ## Internal message shape (channel-agnostic)
 
@@ -77,11 +79,12 @@ Treat every sandbox as hostile: model + shell can read env and files.
 ```
 ┌──────────────┐     channel secrets      ┌────────────────────┐
 │  Telegram /  │◄────────────────────────►│  Gateway Worker    │
-│  WhatsApp    │                          │  + D1 routing      │
+│  WhatsApp    │                          │  + D1 + R2         │
 └──────────────┘                          └─────────┬──────────┘
                                                     │ create / connect
-                                                    │ POST /bootstrap
-                                                    │ POST /turn + capability
+                                                    │ POST /bootstrap (+ restore)
+                                                    │ inject update + capability
+                                                    │ harvest checkpoint → R2
                                           ┌─────────▼──────────┐
                                           │  Per-user E2B      │
                                           │  harness + Hermes  │
@@ -89,7 +92,6 @@ Treat every sandbox as hostile: model + shell can read env and files.
                                                     │ Bearer capability only
                                           ┌─────────▼──────────┐
                                           │  LLM proxy Worker  │
-                                          │  → Codex relay     │
                                           └────────────────────┘
 ```
 
@@ -117,13 +119,13 @@ Atomic first-message claim prevents double-create. Failed rows re-provision on t
 ## Non-goals for this Worker
 
 - Running Hermes itself
-- Holding long-lived per-user agent process state (that’s E2B + durable stores)
-- Putting channel tokens into sandboxes so Hermes “native gateway” can bind them
+- Holding the only copy of long-lived agent brain on the Worker (live brain is E2B; durable copy is R2)
+- Putting channel tokens into sandboxes so Hermes binds the real bot token
 - Owning Codex OAuth (that’s LLM proxy + relay)
 
 ## Summary
 
-**Worker = all gateway I/O + routing + sandbox lifecycle.**  
-**Sandbox = per-user Hermes brain + HTTP harness.**  
+**Worker = all gateway I/O + routing + sandbox lifecycle + R2 checkpoint harvest/restore.**  
+**Sandbox = per-user Hermes brain + HTTP harness (stages checkpoints; never holds long-lived R2 keys).**  
 **LLM proxy = inference door; credentials never in E2B.**  
 **Architecture is gateway-agnostic at the agent boundary;** only adapters are channel-specific.

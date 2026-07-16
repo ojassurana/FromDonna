@@ -7,10 +7,18 @@
  */
 
 import { handleBotApiProxy, mintBotProxyToken } from "./bot_api_proxy";
+import {
+  getCheckpointBytes,
+  handleCheckpointStatus,
+  handleCheckpointUpload,
+  putCheckpoint,
+} from "./checkpoint";
 import { normalizeTelegramUpdate, type TelegramUpdate } from "./telegram";
 
 export interface Env {
   FROMDONNA_ROUTING: D1Database;
+  /** Optional until R2 bucket is provisioned; checkpoint endpoints return 503 without it. */
+  USER_STATE?: R2Bucket;
   TELEGRAM_BOT_TOKEN: string;
   TELEGRAM_WEBHOOK_SECRET: string;
   E2B_API_KEY: string;
@@ -175,6 +183,210 @@ async function waitForHarness(env: Env, sandboxId: string, domain: string | null
   throw new Error(`Sandbox harness health check failed: ${lastError}`);
 }
 
+const CHECKPOINT_TAR_PATH = "/home/user/.hermes/fromdonna-checkpoint-latest.tar.gz";
+const CHECKPOINT_READY_PATH = "/home/user/.hermes/fromdonna-checkpoint-ready.json";
+/** envd default port for filesystem API */
+const ENVD_PORT = "49983";
+
+async function storeCheckpointBytes(
+  env: Env,
+  row: Pick<UserAgentRow, "user_id" | "runtime_id">,
+  bytes: ArrayBuffer,
+  source: string,
+): Promise<boolean> {
+  if (!bytes.byteLength) return false;
+  const manifest = await putCheckpoint(env, row.user_id, bytes, {
+    runtimeId: row.runtime_id,
+    source,
+  });
+  console.log(
+    `checkpoint stored for ${row.user_id} (${manifest.bytes} bytes, source=${manifest.source})`,
+  );
+  return true;
+}
+
+/** Harness GET /internal/checkpoint/export (preferred when auth_ready). */
+async function pullCheckpointViaHarness(
+  env: Env,
+  row: Pick<UserAgentRow, "user_id" | "runtime_id" | "runtime_domain">,
+): Promise<boolean> {
+  const url = `${harnessBaseUrl(env, row.runtime_id, row.runtime_domain)}/internal/checkpoint/export`;
+  const response = await fetch(url, {
+    method: "GET",
+    headers: { authorization: `Bearer ${required(env, "WORKER_TO_HARNESS_SECRET")}` },
+  });
+  if (response.status === 204 || response.status === 404) return false;
+  if (!response.ok) {
+    console.error(`checkpoint export failed for ${row.user_id}: HTTP ${response.status}`);
+    return false;
+  }
+  const bytes = await response.arrayBuffer();
+  const source = response.headers.get("x-fromdonna-checkpoint-source") || "harness-export";
+  return storeCheckpointBytes(env, row, bytes, source);
+}
+
+/**
+ * Fallback: read staged tar via E2B envd filesystem API.
+ * Works even if harness export is down; uses connect token.
+ */
+async function pullCheckpointViaEnvd(
+  env: Env,
+  row: Pick<UserAgentRow, "user_id" | "runtime_id" | "runtime_domain">,
+): Promise<boolean> {
+  // Ensure sandbox is up and get envd access token
+  const connectRes = await fetch(`https://api.e2b.app/sandboxes/${row.runtime_id}/connect`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "X-API-KEY": required(env, "E2B_API_KEY"),
+    },
+    body: JSON.stringify({ timeout: SANDBOX_TTL_SECONDS }),
+  });
+  if (connectRes.status === 404) return false;
+  if (!connectRes.ok) {
+    console.error(`envd connect for checkpoint failed: HTTP ${connectRes.status}`);
+    return false;
+  }
+  const connected = await connectRes.json<{ envdAccessToken?: string; domain?: string | null }>();
+  const token = connected.envdAccessToken;
+  if (!token) {
+    console.error("envd connect returned no access token");
+    return false;
+  }
+  const domain = sandboxDomain(env, connected.domain || row.runtime_domain);
+  // Probe ready marker (optional — if missing, still try tar)
+  const readyUrl = new URL(`https://${ENVD_PORT}-${row.runtime_id}.${domain}/files`);
+  readyUrl.searchParams.set("path", CHECKPOINT_READY_PATH);
+  readyUrl.searchParams.set("username", "user");
+  const readyRes = await fetch(readyUrl.toString(), {
+    headers: { "X-Access-Token": token },
+  });
+  if (!readyRes.ok && readyRes.status !== 404) {
+    // continue; tar may still exist
+  }
+
+  const tarUrl = new URL(`https://${ENVD_PORT}-${row.runtime_id}.${domain}/files`);
+  tarUrl.searchParams.set("path", CHECKPOINT_TAR_PATH);
+  tarUrl.searchParams.set("username", "user");
+  const tarRes = await fetch(tarUrl.toString(), {
+    headers: { "X-Access-Token": token },
+  });
+  if (tarRes.status === 404) return false;
+  if (!tarRes.ok) {
+    console.error(`envd tar read failed for ${row.user_id}: HTTP ${tarRes.status}`);
+    return false;
+  }
+  const bytes = await tarRes.arrayBuffer();
+  if (!bytes.byteLength) return false;
+
+  // Best-effort clear ready marker so we don't re-upload forever
+  try {
+    const delReady = new URL(`https://${ENVD_PORT}-${row.runtime_id}.${domain}/files`);
+    delReady.searchParams.set("path", CHECKPOINT_READY_PATH);
+    delReady.searchParams.set("username", "user");
+    await fetch(delReady.toString(), {
+      method: "DELETE",
+      headers: { "X-Access-Token": token },
+    });
+  } catch {
+    // ignore
+  }
+
+  return storeCheckpointBytes(env, row, bytes, "envd-pull");
+}
+
+/**
+ * Pull a staged checkpoint from the runtime and store it in R2.
+ * Tries harness export first, then E2B envd file read.
+ * Prefer this over sandbox→Worker upload (often blocked by Cloudflare 1010).
+ */
+async function pullCheckpointOnce(
+  env: Env,
+  row: Pick<UserAgentRow, "user_id" | "runtime_id" | "runtime_domain">,
+): Promise<boolean> {
+  if (!env.USER_STATE) return false;
+  if (!row.runtime_id || row.runtime_id.startsWith("provisioning:")) return false;
+  try {
+    if (await pullCheckpointViaHarness(env, row)) return true;
+  } catch (error) {
+    console.error(
+      `harness checkpoint pull error for ${row.user_id}:`,
+      error instanceof Error ? error.message : error,
+    );
+  }
+  try {
+    if (await pullCheckpointViaEnvd(env, row)) return true;
+  } catch (error) {
+    console.error(
+      `envd checkpoint pull error for ${row.user_id}:`,
+      error instanceof Error ? error.message : error,
+    );
+  }
+  return false;
+}
+
+/**
+ * After a turn is scheduled, harvest a staged checkpoint when ready.
+ * Long-running; must be scheduled via its own ctx.waitUntil so create/inject
+ * does not consume the whole background budget before pack finishes.
+ */
+async function harvestCheckpointAfterTurn(
+  env: Env,
+  row: Pick<UserAgentRow, "user_id" | "runtime_id" | "runtime_domain">,
+  attempts = 60,
+  delayMs = 10_000,
+): Promise<void> {
+  // Initial delay: agent turn rarely finishes in the first few seconds.
+  await new Promise((r) => setTimeout(r, 15_000));
+  for (let i = 0; i < attempts; i++) {
+    const ok = await pullCheckpointOnce(env, row);
+    if (ok) return;
+    await new Promise((r) => setTimeout(r, delayMs));
+  }
+  console.log(`checkpoint harvest timed out for ${row.user_id} after ${attempts} attempts`);
+}
+
+/**
+ * Push latest R2 checkpoint into a sandbox (agent-home + workspace).
+ * No-op when R2 is unbound or the user has never been checkpointed.
+ * Soft-fails: must not block a working empty runtime.
+ */
+async function restoreCheckpointToRuntime(
+  env: Env,
+  row: Pick<UserAgentRow, "user_id" | "runtime_id" | "runtime_domain">,
+): Promise<void> {
+  if (!env.USER_STATE) return;
+  try {
+    const checkpoint = await getCheckpointBytes(env, row.user_id);
+    if (!checkpoint || checkpoint.bytes.byteLength === 0) return;
+
+    const url = `${harnessBaseUrl(env, row.runtime_id, row.runtime_domain)}/internal/restore`;
+    const response = await fetch(url, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${required(env, "WORKER_TO_HARNESS_SECRET")}`,
+        "content-type": "application/gzip",
+      },
+      body: checkpoint.bytes,
+    });
+    if (!response.ok) {
+      const detail = await response.text().catch(() => "");
+      console.error(
+        `checkpoint restore failed for ${row.user_id}: HTTP ${response.status}${detail ? ` ${detail.slice(0, 200)}` : ""}`,
+      );
+      return;
+    }
+    console.log(
+      `checkpoint restored for ${row.user_id} (${checkpoint.bytes.byteLength} bytes, savedAt=${checkpoint.manifest?.savedAt ?? "unknown"})`,
+    );
+  } catch (error) {
+    console.error(
+      `checkpoint restore error for ${row.user_id}:`,
+      error instanceof Error ? error.message : error,
+    );
+  }
+}
+
 async function bootstrapHarness(
   env: Env,
   row: Pick<UserAgentRow, "user_id" | "gateway_user_id" | "gateway_conversation_id" | "runtime_id" | "runtime_domain">,
@@ -191,6 +403,8 @@ async function bootstrapHarness(
     headers: { "content-type": "application/json" },
     body: JSON.stringify({
       secret: required(env, "WORKER_TO_HARNESS_SECRET"),
+      workerUrl: base,
+      userId: row.user_id,
       telegramProxy: {
         token: proxyToken,
         baseUrl: `${base}/telegram-bot-api/bot`,
@@ -325,6 +539,9 @@ async function provision(env: Env, gateway: string, gatewayUserId: string): Prom
       throw new Error("Runtime was created but the user-agent row was not in provisioning state.");
     }
     await bootstrapHarness(env, pending);
+    // Hydrate agent-home + workspace from R2 when this user has a prior checkpoint
+    // (create after loss/rebuild). No-op for first-time users.
+    await restoreCheckpointToRuntime(env, pending);
 
     await env.FROMDONNA_ROUTING.prepare(
       `UPDATE user_agents
@@ -370,7 +587,14 @@ async function replaceRuntime(env: Env, row: UserAgentRow): Promise<UserAgentRow
       runtime_domain: domain,
       status: "provisioning",
     };
+    // Best-effort: pull any staged checkpoint from the old live box before kill.
+    if (oldId && !oldId.startsWith("provisioning:")) {
+      await pullCheckpointOnce(env, { ...row, runtime_id: oldId }).catch(() => {});
+    }
+
     await bootstrapHarness(env, pending);
+    // Critical: replaceRuntime kills the old box — restore before marking ready.
+    await restoreCheckpointToRuntime(env, pending);
 
     await env.FROMDONNA_ROUTING.prepare(
       `UPDATE user_agents
@@ -409,8 +633,11 @@ async function postTelegramUpdate(env: Env, row: UserAgentRow, update: TelegramU
   });
 }
 
-/** Push a raw Telegram update into the sandbox official Hermes Telegram gateway. */
-async function injectTelegramUpdate(env: Env, row: UserAgentRow, update: TelegramUpdate): Promise<void> {
+/**
+ * Push a raw Telegram update into the sandbox official Hermes Telegram gateway.
+ * Returns the live runtime row after a successful inject (for checkpoint pull).
+ */
+async function injectTelegramUpdate(env: Env, row: UserAgentRow, update: TelegramUpdate): Promise<UserAgentRow> {
   if (row.runtime_provider !== "e2b") throw new Error(`Unsupported runtime provider: ${row.runtime_provider}`);
 
   let current = row;
@@ -428,6 +655,8 @@ async function injectTelegramUpdate(env: Env, row: UserAgentRow, update: Telegra
         // Pause→resume: wait for harness, then re-bootstrap proxy + start gateway.
         await waitForHarness(env, current.runtime_id, current.runtime_domain, 90);
         await bootstrapHarness(env, current);
+        // Capture prior turn's staged checkpoint before this turn overwrites state.
+        await pullCheckpointOnce(env, current);
       }
 
       let response = await postTelegramUpdate(env, current, update);
@@ -447,7 +676,7 @@ async function injectTelegramUpdate(env: Env, row: UserAgentRow, update: Telegra
           throw new Error(lastError);
         }
       }
-      return;
+      return current;
     } catch (error) {
       lastError = error instanceof Error ? error.message : String(error);
       if (
@@ -534,7 +763,11 @@ async function resolveReadyRow(
   return row;
 }
 
-async function processTelegramUpdate(env: Env, update: TelegramUpdate): Promise<void> {
+async function processTelegramUpdate(
+  env: Env,
+  update: TelegramUpdate,
+  ctx: ExecutionContext,
+): Promise<void> {
   const event = normalizeTelegramUpdate(update);
   if (!event) return;
 
@@ -554,7 +787,11 @@ async function processTelegramUpdate(env: Env, update: TelegramUpdate): Promise<
 
     // Official path: sandbox Hermes Telegram gateway sends via Bot API proxy.
     // Worker does not render agent text itself.
-    await injectTelegramUpdate(env, resolved, update);
+    const live = await injectTelegramUpdate(env, resolved, update);
+    // Separate waitUntil so create/inject time does not starve checkpoint harvest.
+    // Goal: proactive R2 backup after agent use (best-effort after this turn;
+    // also pulled at the start of the next message / before replace).
+    ctx.waitUntil(harvestCheckpointAfterTurn(env, live));
   } catch (error) {
     console.error(error instanceof Error ? error.message : "processTelegramUpdate failed");
     try {
@@ -601,7 +838,7 @@ async function handleTelegram(request: Request, env: Env, ctx: ExecutionContext)
   }
 
   const update = await request.json<TelegramUpdate>();
-  ctx.waitUntil(processTelegramUpdate(env, update));
+  ctx.waitUntil(processTelegramUpdate(env, update, ctx));
   return json({ ok: true });
 }
 
@@ -619,6 +856,14 @@ export default {
         const expected = `Bearer ${required(env, "WORKER_TO_HARNESS_SECRET")}`;
         if (auth !== expected) return new Response("Unauthorized", { status: 401 });
         return await rebindTelegramWebhook(env);
+      }
+
+      // Runtime checkpoint (channel-agnostic): harness uploads after agent turn completes.
+      if (request.method === "POST" && url.pathname === "/internal/checkpoint") {
+        return await handleCheckpointUpload(request, env);
+      }
+      if (request.method === "GET" && url.pathname === "/internal/checkpoint/status") {
+        return await handleCheckpointStatus(request, env);
       }
 
       // Official Hermes TelegramAdapter Bot API reverse proxy (token never leaves Worker).

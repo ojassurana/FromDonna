@@ -43,6 +43,15 @@ Source: `cloudflare/gateway/`
 | `HARNESS_PORT` | `8788` |
 | `E2B_SANDBOX_DOMAIN` | `e2b.dev` |
 
+### Worker bindings
+
+| Binding | Resource |
+|---------|----------|
+| `FROMDONNA_ROUTING` | D1 `fromdonna-routing` |
+| `USER_STATE` | R2 `fromdonna-user-state` (runtime checkpoints) |
+
+Also: `LLM_CAPABILITY_SECRET` (HMAC for short-lived proxy tokens).
+
 ---
 
 ## User experience
@@ -51,11 +60,12 @@ From the user side: **DM the bot → get a private Hermes**. No setup, no “pic
 
 1. User texts `@fromdonna_bot`
 2. Worker looks up their `(gateway, gateway_user_id)` identity in D1
-3. **No row / failed** → create the user’s E2B runtime, health-check harness, `/bootstrap` auth, mark `ready`
-4. **Ready** → `POST /turn` on that user’s harness with capability header
-5. Hermes calls the LLM proxy; Worker sends the reply via Bot API
+3. **No row / failed** → create E2B runtime, `/health`, `/bootstrap`, **R2 restore if any**, mark `ready`
+4. **Ready** → connect/resume → inject update into **official Hermes Telegram gateway** in the sandbox
+5. Hermes replies via **Worker Bot API proxy** (sandbox never holds the real bot token)
+6. After the agent session finishes → sandbox **stages** a checkpoint; Worker **pulls** it to R2 (Architecture B)
 
-Concurrent first messages: only one request wins the D1 insert claim; others see `provisioning` and are asked to retry shortly. Failed provisions self-heal on the next message.
+Concurrent first messages: only one request wins the D1 insert claim; others see `provisioning` and are asked to retry shortly. Failed provisions self-heal on the next message. Dead/broken runtimes use `replaceRuntime` (new box + restore + kill old).
 
 ---
 
@@ -67,36 +77,35 @@ User DMs @fromdonna_bot
   → POST /telegram/webhook (secret header verified)
   → Worker ACKs Telegram immediately (ctx.waitUntil)
   → D1 lookup (gateway, gateway_user_id)
-       ├─ missing / failed → claim row → E2B create → wait /health → POST /bootstrap → status=ready
-       └─ ready           → E2B connect (resume + TTL) → POST /turn
-  → Harness runs Hermes oneshot (capability = OPENAI_API_KEY)
-  → Hermes → fromdonna-llm-proxy → Codex relay → model
-  → Worker sendMessage(reply) back to same chat_id
+       ├─ missing / failed → claim → E2B create → /health → /bootstrap
+       │                      → R2 restore (if any) → status=ready
+       └─ ready             → E2B connect (resume + TTL) → re-bootstrap if needed
+  → POST /telegram/update  (Bearer + x-llm-capability)
+  → Official Hermes TelegramAdapter.process_update
+  → Outbound Telegram via Worker /telegram-bot-api/* proxy
+  → (async) stage checkpoint → Worker harvest → R2
 ```
 
-### What the Worker sends to the sandbox
+### What the Worker injects
 
-```json
-{
-  "userId": "telegram:<telegram_user_id>",
-  "gateway": "telegram",
-  "gatewayChatId": "<chat.id>",
-  "gatewayMessageId": "<message_id>",
-  "text": "<user text>"
-}
-```
+Raw Telegram `Update` JSON to:
+
+`POST https://8788-{runtimeId}.{domain}/telegram/update`
 
 Headers:
 
 - `Authorization: Bearer <WORKER_TO_HARNESS_SECRET>`
-- `x-llm-capability: fd_cap_<userId>_<uuid>` — **not** a real provider key; LLM proxy currently accepts any non-empty Bearer (verification planned)
+- `x-llm-capability: <HMAC capability>` — short-lived; not a real provider key
+
+Bootstrap also sends `userId`, `workerUrl`, and `telegramProxy` (proxy token + Bot API base URLs). See [telegram-auth.md](./telegram-auth.md).
 
 ### What never enters the sandbox
 
-- Telegram bot token
+- Real Telegram bot token
 - Codex / OAuth tokens
 - Relay shared secret
 - E2B API key
+- Long-lived R2 credentials
 
 ---
 
@@ -134,9 +143,12 @@ Warm-started on port **8788** in the template.
 
 | Method | Path | Auth | Purpose |
 |--------|------|------|---------|
-| `GET` | `/health` | none | Liveness; `auth_ready` when secret is set |
-| `POST` | `/bootstrap` | none (once) | Inject `WORKER_TO_HARNESS_SECRET` into process memory |
-| `POST` | `/turn` | Bearer secret + `x-llm-capability` | Run one Hermes oneshot; return `{ "text": "..." }` |
+| `GET` | `/health` | none | Liveness; `auth_ready`, `telegram_proxy_ready`, `gateway_running` |
+| `POST` | `/bootstrap` | body secret | Inject harness secret + Telegram proxy config + identity |
+| `POST` | `/telegram/update` | Bearer + `x-llm-capability` | Inject raw Telegram Update into official Hermes gateway |
+| `GET` | `/internal/checkpoint/export` | Bearer | Worker pulls staged runtime checkpoint |
+| `POST` | `/internal/restore` | Bearer | Worker pushes R2 checkpoint after create/replace |
+| `POST` | `/turn` | Bearer + capability | Legacy path (not the primary Telegram flow) |
 
 ### Why `/bootstrap` exists
 
@@ -144,10 +156,32 @@ Template warm-start freezes the uvicorn process env at **image build** time. Cre
 
 1. Creates the sandbox (may still pass `envVars` for future processes)
 2. Waits for `/health`
-3. `POST /bootstrap` with the shared Worker secret
-4. Marks the D1 row `ready`
+3. `POST /bootstrap` with secret + telegramProxy + userId/workerUrl
+4. **Restores R2 checkpoint** if present (`POST /internal/restore`)
+5. Marks the D1 row `ready`
 
 Best-effort re-bootstrap runs before later turns (idempotent if the same secret).
+
+### Runtime checkpoint (Architecture B)
+
+See [../deployment/memorymanagement.md](../deployment/memorymanagement.md).
+
+```text
+After Hermes session finishes → stage tar on sandbox disk
+Worker harvest (separate waitUntil):
+  → GET /internal/checkpoint/export  and/or  E2B envd file read
+  → R2 users/{userId}/checkpoint.tar.gz + manifests/latest.json
+Also: pull at start of next message; pull before replace/kill when possible
+```
+
+Sandbox → Worker **POST** of the tar is **not** the live path (Cloudflare **1010** from E2B to `workers.dev`).
+
+Worker endpoints:
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| `POST` | `/internal/checkpoint` | Optional push (ops/tests; not relied on from E2B) |
+| `GET` | `/internal/checkpoint/status?userId=` | Ops: exists / size / manifest |
 
 ---
 
@@ -157,16 +191,18 @@ On create:
 
 - `autoPause: true`
 - `autoResume: { enabled: true }`
-- `timeout: 3600` (seconds)
+- `timeout: 3600` (seconds) — E2B max continuous TTL; each connect extends
 - `secure: true`
 - `allow_internet_access: true`
 - metadata: `fromdonna_user_id`
 
-Before each turn:
+Before each inject:
 
 - `POST /sandboxes/{id}/connect` with `{ timeout: 3600 }` to resume if paused and extend TTL
 - Host URL shape: `https://{HARNESS_PORT}-{sandboxId}.{domain}/…`  
   (E2B may omit `domain` in create response; Worker defaults to `e2b.dev`)
+
+If connect is **404** or inject/bootstrap stays broken → **`replaceRuntime`**: new sandbox from template, restore R2, kill old id.
 
 ---
 
@@ -174,9 +210,9 @@ Before each turn:
 
 | Topic | Behavior |
 |-------|----------|
-| Webhook ACK | Telegram is ACKed with `{ ok: true }` immediately; provision + Hermes run in `waitUntil` |
-| Message types (v1) | Text only; non-text updates ignored |
-| Reply length | Split at ~4000 chars for Telegram limits |
+| Webhook ACK | Telegram is ACKed with `{ ok: true }` immediately; provision + inject + harvest in `waitUntil` |
+| Message types | Text, callbacks, media updates allowed (webhook `allowed_updates`); official Hermes handles UX |
+| Outbound | Sandbox Hermes via Bot API proxy — Worker does not re-render agent text on the happy path |
 | Errors | User gets a short “try again” message; details go to Worker logs only |
 | Free Workers plan | No custom `cpu_ms`; long turns depend on network wait + platform limits |
 

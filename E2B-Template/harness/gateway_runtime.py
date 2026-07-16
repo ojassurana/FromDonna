@@ -379,6 +379,41 @@ class GatewayRuntime:
             # Wait briefly so handlers can schedule a session task, then return.
             await self._wait_for_session_schedule(before, max_wait_s=2.0)
 
+            # After the HTTP response returns, wait for the real agent session to
+            # finish, then upload a channel-agnostic R2 checkpoint (agent-home +
+            # workspace). Pause/resume does not need this; replaceRuntime does.
+            before_for_ckpt = set(before)
+            try:
+                loop = self._loop
+                if loop is not None:
+                    def _checkpoint_when_idle() -> None:
+                        try:
+                            assert loop is not None
+                            fut = asyncio.run_coroutine_threadsafe(
+                                self._wait_for_new_or_active_sessions(before_for_ckpt),
+                                loop,
+                            )
+                            fut.result(timeout=900)
+                        except Exception:
+                            logger.exception("wait for session before checkpoint failed")
+                        try:
+                            import checkpoint as ckpt
+
+                            # Stage locally; Worker pulls via GET /internal/checkpoint/export
+                            # (sandbox→workers.dev POST is often blocked with CF error 1010).
+                            result = ckpt.prepare_local_checkpoint(source="gateway-session")
+                            logger.info("checkpoint staged after session: %s", result)
+                        except Exception:
+                            logger.exception("checkpoint stage failed")
+
+                    threading.Thread(
+                        target=_checkpoint_when_idle,
+                        name="fromdonna-ckpt-after-turn",
+                        daemon=True,
+                    ).start()
+            except Exception:
+                logger.exception("failed to schedule post-turn checkpoint")
+
             if cq is not None:
                 # Ensure callback spinner is cleared even if a Hermes handler forgot answer().
                 try:
