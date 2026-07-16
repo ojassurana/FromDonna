@@ -910,7 +910,11 @@ export default {
     const url = new URL(request.url);
     try {
       if (request.method === "GET" && url.pathname === "/health") {
-        return json({ ok: true, service: "fromdonna-gateway", mode: "channel-agnostic" });
+        return json({
+          ok: true,
+          service: "fromdonna-telegram-gateway",
+          mode: "official-telegram-proxy",
+        });
       }
 
       // Ops: rebind Telegram webhook with full allowed_updates (auth via harness secret).

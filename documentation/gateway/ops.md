@@ -43,7 +43,7 @@ fromdonna-gateway  (Cloudflare Worker)
 
 | Service | URL / location | Quick check |
 |---------|----------------|-------------|
-| Gateway Worker | `https://fromdonna-gateway.code-df4.workers.dev` | `GET /health` |
+| Gateway Worker (live Telegram) | `https://fromdonna-telegram-gateway.code-df4.workers.dev` | `GET /health` |
 | LLM proxy | `https://fromdonna-llm-proxy.code-df4.workers.dev` | `GET /health` + chat completion |
 | API proxy | `https://fromdonna-api-proxy.code-df4.workers.dev` | `GET /health` + Exa search (stub) |
 | Telegram webhook | Bot API `getWebhookInfo` | URL matches gateway; `last_error` null |
