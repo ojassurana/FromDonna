@@ -30,11 +30,13 @@ display:
   interim_assistant_messages: false
   # No "still working / heartbeat" status bubbles on long turns.
   long_running_notifications: false
-  # Telegram DMs: keep platform default streaming on once master switch is on.
   # Explicitly re-assert quiet tool/skill progress + no reasoning on messaging.
+  # streaming:false — multi-step tool turns (Gmail via Composio) stream a short
+  # mid-turn line ("Checking…") then Hermes marks content_delivered and SUPPRESSES
+  # the real final answer. Prefer a single final send over draft previews.
   platforms:
     telegram:
-      streaming: true
+      streaming: false
       tool_progress: false
       show_reasoning: false
       interim_assistant_messages: false
@@ -44,12 +46,11 @@ display:
 onboarding:
   profile_build: off
 
-# Real-time replies on messaging platforms.
-# transport: auto → Telegram DMs use official Bot API sendMessageDraft
-# (animated in-place preview); groups fall back to editMessageText.
+# Master streaming switch. Keep off for Telegram reliability (see platforms above).
+# transport: auto → Telegram DMs use official Bot API sendMessageDraft when on.
 # Docs: hermes user-guide/messaging/telegram.md (streaming)
 streaming:
-  enabled: true
+  enabled: false
   transport: auto
   edit_interval: 0.8
   buffer_threshold: 24
