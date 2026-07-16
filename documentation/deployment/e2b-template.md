@@ -15,12 +15,14 @@ Source tree: `E2B-Template/`
 | Gateway var | `E2B_TEMPLATE=fromdonna-hermes` |
 | Harness port | `8788` (uvicorn warm start) |
 | Hermes config | `config/hermes/config.yaml` → LLM proxy base URL + `grok-4.5` |
+| Hermes SOUL | `config/hermes/SOUL.md` → baked to `/home/user/.hermes/SOUL.md` (Donna persona) |
 | Harness code | `E2B-Template/harness/server.py` |
 
 ### What is baked today
 
 - Vendored Hermes under `E2B-Template/hermes/`
 - Agent-only Hermes config (no channel tokens)
+- Default Donna `SOUL.md` (`config/hermes/SOUL.md` → `~/.hermes/SOUL.md`)
 - FastAPI harness with `/health`, `/bootstrap`, `/turn`
 - `setStartCmd` starts uvicorn and waits for port 8788
 

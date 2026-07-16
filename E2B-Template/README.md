@@ -20,7 +20,9 @@ E2B-Template/
 ├── build.prod.ts             ← publish template tag: fromdonna-hermes
 ├── config/
 │   └── hermes/               ← default agent-only Hermes config (no product secrets)
-│       └── config.yaml.example
+│       ├── config.yaml
+│       ├── config.yaml.example
+│       └── SOUL.md           ← Donna persona seeded to ~/.hermes/SOUL.md
 ├── hermes/                   ← vendored Hermes fork (agent source pin)
 ├── extensions/               ← product plugins, bundled skills, agent tools
 │   ├── plugins/.gitkeep

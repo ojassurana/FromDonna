@@ -22,6 +22,7 @@ export const template = Template()
   .copy("harness", "/opt/fromdonna/harness")
   .copy("extensions/plugins", "/home/user/.hermes/plugins")
   .copy("config/hermes/config.yaml", "/home/user/.hermes/config.yaml")
+  .copy("config/hermes/SOUL.md", "/home/user/.hermes/SOUL.md")
   // messaging extra pulls python-telegram-bot — required for official TelegramAdapter
   // inside the sandbox (without it connect() returns False immediately).
   .runCmd(
