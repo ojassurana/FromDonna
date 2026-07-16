@@ -76,8 +76,8 @@ One reusable template (e.g. `fromdonna-hermes`) so every user sandbox starts wit
 ## What stays out (always)
 
 - Channel bot tokens  
-- `NANGO_*` / Composio project secrets  
-- Long-lived user OAuth  
+- `COMPOSIO_API_KEY` / Composio project secrets (live only on **composio-proxy** — see [../tooling/composio.md](../tooling/composio.md))  
+- Long-lived user OAuth (vaulted in Composio, not the image)  
 - Per-user memory/skills history (that accumulates **after** create in their sandbox)  
 - User artifacts (those go to **R2** via tools)
 
@@ -162,13 +162,14 @@ Typical extras in the image:
 
 - **HTTP harness** (implemented):  
   - `GET /health` — liveness + gateway/proxy readiness  
-  - `POST /bootstrap` — Worker secret + Telegram proxy + identity  
+  - `POST /bootstrap` — Worker secret + Telegram proxy + identity + optional **`composioMcp`** (writes Hermes `mcp_servers.composio`; no product API key)  
   - `POST /telegram/update` — inject Update into official Hermes Telegram gateway  
   - `GET /internal/checkpoint/export` — Worker pull of staged runtime checkpoint  
   - `POST /internal/restore` — apply R2 checkpoint after create/replace  
   - `POST /turn` — legacy path  
 - **Checkpoint packer** (`checkpoint.py`) — filtered agent-home + workspace tar  
-- **Thin tools** / wrappers that call Worker for OAuth / API / MCP  
+- **Composio** — capability Bearer only at bootstrap; OAuth vault stays on composio-proxy ([../tooling/composio.md](../tooling/composio.md))  
+- **Thin tools** / wrappers that call Workers for API / MCP  
 
 - CLI shims that rewrite upstream base URLs to Worker  
 
@@ -201,10 +202,12 @@ POST api.e2b.app/sandboxes
   autoPause + autoResume
   metadata.fromdonna_user_id
 → wait GET https://8788-{id}.e2b.dev/health
-→ POST /bootstrap { secret, userId, workerUrl, telegramProxy }
+→ POST /bootstrap { secret, userId, workerUrl, telegramProxy, composioMcp? }
 → POST /internal/restore  (R2 blob if any)
 → D1 status=ready
 ```
+
+`composioMcp` is minted by the gateway from composio-proxy (shared MCP URL + per-user Bearer). See [../tooling/composio.md](../tooling/composio.md).
 
 Before later messages: `POST .../sandboxes/{id}/connect` then `POST /telegram/update`.  
 After agent sessions: sandbox stages checkpoint; Worker harvests to R2 (Architecture B).  

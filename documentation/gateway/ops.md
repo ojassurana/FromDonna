@@ -2,7 +2,7 @@
 
 Operational reference for the live Telegram → D1 → E2B Hermes → LLM proxy path.
 
-See also: [telegram.md](./telegram.md), [gateway.md](./gateway.md), [llm-proxy-worker.md](./llm-proxy-worker.md), [../deployment/e2b-template.md](../deployment/e2b-template.md), [../deployment/memorymanagement.md](../deployment/memorymanagement.md).
+See also: [telegram.md](./telegram.md), [gateway.md](./gateway.md), [llm-proxy-worker.md](./llm-proxy-worker.md), [../deployment/e2b-template.md](../deployment/e2b-template.md), [../deployment/memorymanagement.md](../deployment/memorymanagement.md), [../tooling/composio.md](../tooling/composio.md), [../tooling/general.md](../tooling/general.md).
 
 ---
 
@@ -133,6 +133,11 @@ printf '%s' 'NEW_WEBHOOK_SECRET' | npx wrangler secret put TELEGRAM_WEBHOOK_SECR
 # Harness shared secret (existing sandboxes need re-bootstrap on next turn or re-provision).
 # Leak of this secret = treat Telegram bridge as compromised until rotated + sandboxes recreated.
 printf '%s' 'NEW_HARNESS_SECRET' | npx wrangler secret put WORKER_TO_HARNESS_SECRET
+
+# Composio session HMAC — must match on gateway AND composio-proxy.
+# Rotating invalidates all Hermes MCP capability Bearers (users re-mint on next bootstrap).
+printf '%s' 'NEW_COMPOSIO_SESSION_SECRET' | npx wrangler secret put COMPOSIO_SESSION_SECRET
+# then: cd ../composio-proxy && same secret put COMPOSIO_SESSION_SECRET && npx wrangler deploy
 ```
 
 Never commit secrets. Prefer `wrangler secret put` / env injection; do not paste into docs or git.
@@ -141,13 +146,15 @@ Never commit secrets. Prefer `wrangler secret put` / env injection; do not paste
 
 ## Rebuild template after harness/config changes
 
+Required after harness changes that affect sandbox behavior (Telegram proxy, **Composio MCP apply**, Exa env, SOUL, etc.).
+
 ```bash
 cd ~/FromDonna/E2B-Template
 # E2B_API_KEY in .env
-npm run build:prod
+npm run build:prod   # alias fromdonna-hermes
 ```
 
-New users get the new image immediately. Existing sandboxes keep the old filesystem/process until recreated (see [e2b-template.md](../deployment/e2b-template.md) upgrade workflow).
+New users get the new image immediately. Existing sandboxes keep the old filesystem/process until recreated (see [e2b-template.md](../deployment/e2b-template.md) upgrade workflow). Composio OAuth connections in Composio’s vault are unchanged by a template rebuild.
 
 ---
 
@@ -159,10 +166,12 @@ New users get the new image immediately. Existing sandboxes keep the old filesys
 | D1 migrations | `npx wrangler d1 migrations apply fromdonna-routing --remote` |
 | LLM proxy | `cd cloudflare/llm-proxy && npx wrangler deploy` |
 | API proxy | `cd cloudflare/api-proxy && npx wrangler secret put <VENDOR>_API_KEY && npx wrangler deploy` |
+| Composio proxy | `cd cloudflare/composio-proxy && npx wrangler secret put COMPOSIO_API_KEY && npx wrangler secret put COMPOSIO_SESSION_SECRET && npx wrangler deploy` |
 | E2B template | `cd E2B-Template && npm run build:prod` |
 | Telegram webhook | Bot API `setWebhook` (see [telegram.md](./telegram.md)) |
 
-Adding a new product HTTP API: follow **Protocol: adding another API connector** in [../tooling/api-proxy-worker.md](../tooling/api-proxy-worker.md) (not gateway secrets).
+- Adding a new product **HTTP API**: [../tooling/api-proxy-worker.md](../tooling/api-proxy-worker.md) (not gateway secrets).  
+- **OAuth apps (Gmail etc.)**: [../tooling/composio.md](../tooling/composio.md) — key only on composio-proxy; rebuild template after harness changes.
 
 ---
 
@@ -187,10 +196,11 @@ Details: [../deployment/memorymanagement.md](../deployment/memorymanagement.md).
 
 ## Change log (implementation snapshot)
 
-1. **Gateway Worker** — D1 routing, provision/replaceRuntime, E2B create/connect, bootstrap, inject `/telegram/update`, Bot API proxy, R2 checkpoint harvest/restore
-2. **Harness** — official Hermes Telegram runtime; `/health`, `/bootstrap`, `/telegram/update`, `/internal/checkpoint/export`, `/internal/restore`
-3. **E2B template** — `fromdonna-hermes` warm harness on 8788; checkpoint packer; agent-only config → llm-proxy; **web.backend: exa** via api-proxy
+1. **Gateway Worker** — D1 routing, provision/replaceRuntime, E2B create/connect, bootstrap (incl. Composio mint), inject `/telegram/update`, Bot API proxy, R2 checkpoint harvest/restore
+2. **Harness** — official Hermes Telegram runtime; `/health`, `/bootstrap` (+ `composioMcp`), `/telegram/update`, checkpoint export/restore
+3. **E2B template** — `fromdonna-hermes` warm harness on 8788; checkpoint packer; agent-only config → llm-proxy; **web.backend: exa** via api-proxy; Composio MCP via composio-proxy
 4. **API proxy** — `fromdonna-api-proxy`; Exa reverse proxy; real `EXA_API_KEY` only here; sandbox uses STUB + `EXA_BASE_URL`
-4. **LLM proxy** — capability tokens; credentials stay off sandbox
-5. **Secrets model** — no Telegram/Codex/R2 long-lived keys in sandboxes
-6. **Runtime persistence** — Architecture B stage + Worker pull to R2; verified on live traffic
+5. **Composio proxy** — `fromdonna-composio-proxy`; `COMPOSIO_API_KEY` + session HMAC; Hermes MCP capability Bearer; sticky sessions in D1
+6. **LLM proxy** — capability tokens; credentials stay off sandbox
+7. **Secrets model** — no Telegram/Codex/Composio product key / user OAuth in sandboxes
+8. **Runtime persistence** — Architecture B stage + Worker pull to R2; verified on live traffic
