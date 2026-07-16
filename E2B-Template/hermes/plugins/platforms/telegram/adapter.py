@@ -664,6 +664,9 @@ class TelegramAdapter(BasePlatformAdapter):
         # Tracks status bubbles owned by this adapter so subsequent calls with the
         # same key edit the same message instead of appending new ones (#30045).
         self._status_message_ids: Dict[tuple, str] = {}
+        # FromDonna Telegram UX: per-chat thinking-dots bubble state.
+        # chat_id -> {message_id, stop_event, task, frame_index}
+        self._fromdonna_thinking: Dict[str, Dict[str, Any]] = {}
         # Last truncated mid-stream preview delivered per (chat_id, message_id).
         # Once an oversized streaming edit saturates at the 4096 preview cap,
         # every subsequent progressive edit truncates to the SAME text; sending
@@ -3604,6 +3607,9 @@ class TelegramAdapter(BasePlatformAdapter):
                                 await self.send_typing(chat_id, metadata=metadata)
                             except Exception:
                                 pass  # Typing failures are non-fatal
+                        await self._fromdonna_maybe_clear_thinking_dots(
+                            chat_id, metadata=metadata, success=True,
+                        )
                     return rich_result
 
             # Format and split message if needed
@@ -3851,6 +3857,10 @@ class TelegramAdapter(BasePlatformAdapter):
                     await self.send_typing(chat_id, metadata=metadata)
                 except Exception:
                     pass  # Typing failures are non-fatal
+
+            await self._fromdonna_maybe_clear_thinking_dots(
+                chat_id, metadata=metadata, success=True,
+            )
 
             return SendResult(
                 success=True,
@@ -8490,11 +8500,43 @@ class TelegramAdapter(BasePlatformAdapter):
             timestamp=message.date,
         )
 
-    # ── Message reactions (processing lifecycle) ──────────────────────────
+    # ── Message reactions + FromDonna thinking-dots UX ────────────────────
+    #
+    # FromDonna supersedes Hermès' TELEGRAM_REACTIONS lifecycle (👀 then
+    # 👍/👎). Instead:
+    #   1. Parallel low-context classifier picks one of ❤️🔥👍😭 on inbound.
+    #   2. A temporary "." → ".." → "..." bubble is posted while the turn runs
+    #      and deleted on the first real outbound assistant message (or on
+    #      processing complete as a safety net).
+    # Native sendChatAction typing is unchanged.
 
     def _reactions_enabled(self) -> bool:
-        """Check if message reactions are enabled via config/env."""
-        return os.getenv("TELEGRAM_REACTIONS", "false").lower() not in {"false", "0", "no"}
+        """Legacy Hermès lifecycle reactions (👀/👍/👎).
+
+        FromDonna UX is always on for this template and owns reactions, so the
+        old lifecycle scheme is never active here (kept for API compatibility).
+        """
+        return False
+
+    def _fromdonna_ux_enabled(self) -> bool:
+        """FromDonna Telegram thinking-dots + context reactions (default on)."""
+        raw = os.getenv("FROMDONNA_TELEGRAM_UX", "true").lower()
+        if raw in {"false", "0", "no", "off"}:
+            return False
+        # Optional explicit disable via platforms.telegram.extra
+        config = getattr(self, "config", None)
+        extra = getattr(config, "extra", None) or {}
+        if isinstance(extra, dict) and extra.get("fromdonna_ux") is False:
+            return False
+        return True
+
+    def _fromdonna_thinking_map(self) -> Dict[str, Dict[str, Any]]:
+        """Per-chat thinking-dots state; safe for partial adapters (``__new__``)."""
+        store = getattr(self, "_fromdonna_thinking", None)
+        if not isinstance(store, dict):
+            store = {}
+            self._fromdonna_thinking = store
+        return store
 
     async def _set_reaction(self, chat_id: str, message_id: str, emoji: str) -> bool:
         """Set a single emoji reaction on a Telegram message."""
@@ -8532,42 +8574,199 @@ class TelegramAdapter(BasePlatformAdapter):
             logger.debug("[%s] clear reactions failed: %s", self.name, e)
             return False
 
-    async def on_processing_start(self, event: MessageEvent) -> None:
-        """Add an in-progress reaction when message processing begins."""
-        if not self._reactions_enabled():
+    async def _fromdonna_start_thinking_dots(
+        self,
+        event: MessageEvent,
+        *,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Post a temporary ``.`` bubble and animate ``.`` → ``..`` → ``...``."""
+        from plugins.platforms.telegram.fromdonna_ux import (
+            DOTS_INTERVAL_SECONDS,
+            THINKING_DOTS_METADATA_KEY,
+            next_dots_frame,
+        )
+
+        chat_id = getattr(getattr(event, "source", None), "chat_id", None)
+        if not chat_id or not self._bot:
             return
-        chat_id = getattr(event.source, "chat_id", None)
-        message_id = getattr(event, "message_id", None)
-        if chat_id and message_id:
-            await self._set_reaction(chat_id, message_id, "\U0001f440")
+        chat_key = str(chat_id)
 
-    async def on_processing_complete(self, event: MessageEvent, outcome: ProcessingOutcome) -> None:
-        """Swap the in-progress reaction for a final success/failure reaction.
+        # Replace any leftover bubble from a previous turn in this chat.
+        await self._fromdonna_clear_thinking_dots(chat_key)
 
-        Unlike Discord (additive reactions), Telegram's set_message_reaction
-        replaces all existing reactions in one call — no remove step needed.
+        dots_meta: Dict[str, Any] = {THINKING_DOTS_METADATA_KEY: True}
+        if metadata:
+            dots_meta.update(metadata)
+        # Prefer thread / reply context from the inbound event when present.
+        src = getattr(event, "source", None)
+        if src is not None:
+            thread_id = getattr(src, "thread_id", None)
+            if thread_id is not None and "thread_id" not in dots_meta:
+                dots_meta["thread_id"] = str(thread_id)
 
-        On CANCELLED outcomes (e.g. the user runs ``/stop``, or a session is
-        interrupted mid-flight), we explicitly clear the 👀 in-progress
-        reaction so it doesn't linger on the user's message indefinitely.
-        Without this clear, the only way to remove the 👀 was to wait for
-        another agent run to swap it to 👍/👎 — which never happens if the
-        cancellation was the last activity in the chat.
-        """
-        if not self._reactions_enabled():
+        first_frame, next_idx = next_dots_frame(0)
+        try:
+            result = await self.send(chat_key, first_frame, metadata=dots_meta)
+        except Exception as e:
+            logger.debug("[%s] thinking-dots send failed: %s", self.name, e)
             return
-        chat_id = getattr(event.source, "chat_id", None)
+        if not result or not result.success or not result.message_id:
+            return
+
+        stop_event = asyncio.Event()
+        state: Dict[str, Any] = {
+            "message_id": str(result.message_id),
+            "stop_event": stop_event,
+            "frame_index": next_idx,
+            "task": None,
+        }
+        self._fromdonna_thinking_map()[chat_key] = state
+
+        async def _animate() -> None:
+            idx = next_idx
+            while not stop_event.is_set():
+                try:
+                    await asyncio.wait_for(stop_event.wait(), timeout=DOTS_INTERVAL_SECONDS)
+                    break
+                except asyncio.TimeoutError:
+                    pass
+                if stop_event.is_set():
+                    break
+                frame, idx = next_dots_frame(idx)
+                state["frame_index"] = idx
+                try:
+                    if not self._bot:
+                        break
+                    await self._bot.edit_message_text(
+                        chat_id=normalize_telegram_chat_id(chat_key),
+                        message_id=int(state["message_id"]),
+                        text=frame,
+                    )
+                except Exception as e:
+                    logger.debug(
+                        "[%s] thinking-dots edit failed (stopping): %s",
+                        self.name,
+                        e,
+                    )
+                    break
+
+        state["task"] = asyncio.create_task(_animate())
+
+    async def _fromdonna_clear_thinking_dots(self, chat_id: str) -> None:
+        """Stop the dots animation and delete the temporary status message."""
+        chat_key = str(chat_id)
+        state = self._fromdonna_thinking_map().pop(chat_key, None)
+        if not state:
+            return
+        stop_event = state.get("stop_event")
+        if stop_event is not None:
+            stop_event.set()
+        task = state.get("task")
+        if task is not None and not task.done():
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
+        message_id = state.get("message_id")
+        bot = getattr(self, "_bot", None)
+        if message_id and bot:
+            try:
+                delete_fn = getattr(self, "delete_message", None)
+                if callable(delete_fn):
+                    await delete_fn(chat_key, str(message_id))
+            except Exception as e:
+                logger.debug(
+                    "[%s] thinking-dots delete failed: %s",
+                    getattr(self, "name", "telegram"),
+                    e,
+                )
+
+    async def _fromdonna_maybe_clear_thinking_dots(
+        self,
+        chat_id: str,
+        *,
+        metadata: Optional[Dict[str, Any]] = None,
+        success: bool = True,
+    ) -> None:
+        """Delete the thinking-dots bubble when a real assistant message lands."""
+        from plugins.platforms.telegram.fromdonna_ux import (
+            should_clear_thinking_dots_on_outbound,
+        )
+
+        if not should_clear_thinking_dots_on_outbound(
+            success=success, metadata=metadata,
+        ):
+            return
+        await self._fromdonna_clear_thinking_dots(chat_id)
+
+    async def _fromdonna_context_react(self, event: MessageEvent) -> None:
+        """Classify context (low-context, parallel) and set one reaction emoji."""
+        from plugins.platforms.telegram.fromdonna_ux import (
+            REACTION_EMOJIS,
+            classify_reaction_emoji,
+        )
+
+        chat_id = getattr(getattr(event, "source", None), "chat_id", None)
         message_id = getattr(event, "message_id", None)
         if not (chat_id and message_id):
             return
-        if outcome == ProcessingOutcome.CANCELLED:
-            await self._clear_reactions(chat_id, message_id)
-        else:
-            await self._set_reaction(
-                chat_id,
-                message_id,
-                "\U0001f44d" if outcome == ProcessingOutcome.SUCCESS else "\U0001f44e",
-            )
+        text = getattr(event, "text", None) or ""
+
+        def _pick() -> str:
+            return classify_reaction_emoji(text)
+
+        try:
+            emoji = await asyncio.to_thread(_pick)
+        except Exception:
+            from plugins.platforms.telegram.fromdonna_ux import heuristic_reaction_emoji
+
+            emoji = heuristic_reaction_emoji(text)
+        if emoji not in REACTION_EMOJIS:
+            from plugins.platforms.telegram.fromdonna_ux import DEFAULT_REACTION_EMOJI
+
+            emoji = DEFAULT_REACTION_EMOJI
+        await self._set_reaction(str(chat_id), str(message_id), emoji)
+
+    async def on_processing_start(self, event: MessageEvent) -> None:
+        """FromDonna: start thinking-dots bubble + parallel context reaction.
+
+        Does **not** apply Hermès lifecycle 👀 reactions (superseded).
+        """
+        if not self._fromdonna_ux_enabled():
+            return
+        # Fire reaction classifier in parallel — must not block the main turn.
+        try:
+            task = asyncio.create_task(self._fromdonna_context_react(event))
+
+            def _consume_react_task(t: asyncio.Task) -> None:
+                try:
+                    t.exception()
+                except (asyncio.CancelledError, Exception):
+                    pass
+
+            task.add_done_callback(_consume_react_task)
+        except Exception as e:
+            logger.debug("[%s] context-react schedule failed: %s", self.name, e)
+        try:
+            await self._fromdonna_start_thinking_dots(event)
+        except Exception as e:
+            logger.debug("[%s] thinking-dots start failed: %s", self.name, e)
+
+    async def on_processing_complete(self, event: MessageEvent, outcome: ProcessingOutcome) -> None:
+        """FromDonna: ensure thinking-dots bubble is gone when the turn ends.
+
+        Context reaction (❤️🔥👍😭) is left as set at start — we do **not**
+        overwrite with Hermès lifecycle 👍/👎.
+        """
+        if not self._fromdonna_ux_enabled():
+            return
+        chat_id = getattr(getattr(event, "source", None), "chat_id", None)
+        if chat_id:
+            await self._fromdonna_clear_thinking_dots(str(chat_id))
+        # outcome intentionally unused for reactions (context emoji stays).
+        _ = outcome
 
 
 # ──────────────────────────────────────────────────────────────────────────
