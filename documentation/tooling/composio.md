@@ -27,9 +27,16 @@ composio-proxy Worker
 | Donna `user_id` | D1 `user_agents` / bootstrap | forever (= Composio user) |
 | Toolkit allowlist | D1 `user_composio.toolkits_json` | forever (policy) |
 | OAuth connections | Composio under `user_id` | until disconnect |
-| MCP Bearer for Hermes | Injected at bootstrap | per sandbox / TTL (~1h) |
+| MCP Bearer for Hermes | Injected at bootstrap (and re-minted on every inject) | **30 days** default (`SESSION_TTL_SECONDS=2592000`); sticky Composio session id in D1 |
 
 **Not** a different public MCP URL per person. Identity is in the Bearer token.
+
+### Production lifetime
+
+- **OAuth connections** under Donna `user_id` persist in Composio (connect once).
+- **Composio tool-router session** (`trs_…`) is stored in D1 and **reused** across sandboxes (not recreated every message).
+- **Hermes Bearer** defaults to **30 days** and is **re-minted on every gateway bootstrap/inject** so long-running Donna boxes stay valid.
+- `POST /internal/session/refresh` re-issues Bearer from a prior token (up to 7d past expiry) without a new Composio user.
 
 ## Default toolkit allowlist (new users)
 

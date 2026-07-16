@@ -18,7 +18,13 @@ import {
   proxyToComposioMcp,
 } from "./composio_api";
 import { defaultToolkits, resolveToolkits } from "./toolkits";
-import { bearerToken, mintSessionToken, verifySessionToken } from "./session_token";
+import {
+  bearerToken,
+  mintSessionToken,
+  refreshSessionToken,
+  verifySessionToken,
+  type SessionClaims,
+} from "./session_token";
 
 function json(body: unknown, status = 200): Response {
   return Response.json(body, { status });
@@ -63,6 +69,10 @@ async function handleInternalSession(request: Request, env: Env): Promise<Respon
     toolkits?: string[];
     runtime_id?: string;
     ttl_seconds?: number;
+    /** If set, re-mint our Bearer without creating a new Composio session */
+    composio_session_id?: string;
+    composio_mcp_url?: string;
+    force_new_composio_session?: boolean;
   };
   try {
     body = (await request.json()) as typeof body;
@@ -77,15 +87,27 @@ async function handleInternalSession(request: Request, env: Env): Promise<Respon
 
   const toolkits = resolveToolkits(body.toolkits);
   const ttl = body.ttl_seconds ?? sessionTtlSeconds(env);
+  const secret = sessionSecret(env);
 
   try {
-    const session = await createToolRouterSession(env.COMPOSIO_API_KEY, userId, toolkits);
-    const token = await mintSessionToken(sessionSecret(env), {
+    let sessionId = (body.composio_session_id || "").trim();
+    let mcpUrl = (body.composio_mcp_url || "").trim();
+    let reused = false;
+
+    if (!body.force_new_composio_session && sessionId && mcpUrl) {
+      reused = true;
+    } else {
+      const session = await createToolRouterSession(env.COMPOSIO_API_KEY, userId, toolkits);
+      sessionId = session.session_id;
+      mcpUrl = session.mcp.url;
+    }
+
+    const token = await mintSessionToken(secret, {
       user_id: userId,
       toolkits,
       runtime_id: body.runtime_id,
-      composio_session_id: session.session_id,
-      composio_mcp_url: session.mcp.url,
+      composio_session_id: sessionId,
+      composio_mcp_url: mcpUrl,
       ttlSeconds: ttl,
     });
 
@@ -94,14 +116,16 @@ async function handleInternalSession(request: Request, env: Env): Promise<Respon
       ok: true,
       user_id: userId,
       toolkits,
-      composio_session_id: session.session_id,
+      composio_session_id: sessionId,
       /** Shared product MCP URL (all sandboxes) */
       mcp_url: `${base}/mcp`,
-      /** Per-user/sandbox Bearer for Hermes */
+      /** Per-user Bearer for Hermes — production TTL default 30d */
       mcp_token: token,
       exp: Math.floor(Date.now() / 1000) + ttl,
-      /** For ops/debug only — not for E2B long-term storage of product key */
-      composio_mcp_url: session.mcp.url,
+      ttl_seconds: ttl,
+      reused_composio_session: reused,
+      /** Server-side Composio MCP target (not the product key) */
+      composio_mcp_url: mcpUrl,
     });
   } catch (error) {
     console.error("internal/session error:", error instanceof Error ? error.message : error);
@@ -115,6 +139,45 @@ async function handleInternalSession(request: Request, env: Env): Promise<Respon
       502,
     );
   }
+}
+
+/** Refresh Bearer from a still-valid (or recently valid) token without new Composio user. */
+async function handleInternalRefresh(request: Request, env: Env): Promise<Response> {
+  if (!requireInternalAuth(request, env)) {
+    return json({ error: { message: "Unauthorized.", code: "unauthorized" } }, 401);
+  }
+  let body: { mcp_token?: string; ttl_seconds?: number };
+  try {
+    body = (await request.json()) as typeof body;
+  } catch {
+    return json({ error: { message: "Invalid JSON.", code: "invalid_json" } }, 400);
+  }
+  const priorToken = (body.mcp_token || "").trim();
+  if (!priorToken) {
+    return json({ error: { message: "mcp_token required.", code: "invalid_body" } }, 400);
+  }
+  const secret = sessionSecret(env);
+  const now = Math.floor(Date.now() / 1000);
+  // Accept tokens expired up to 7 days (long E2B idle) for re-mint only
+  const claims = await verifySessionToken(secret, priorToken, now, 7 * 24 * 3600);
+  if (!claims) {
+    return json({ error: { message: "Invalid token; cannot refresh.", code: "unauthorized" } }, 401);
+  }
+  const ttl = body.ttl_seconds ?? sessionTtlSeconds(env);
+  const token = await refreshSessionToken(secret, claims, ttl, now);
+  const base = publicBase(request, env);
+  return json({
+    ok: true,
+    user_id: claims.user_id,
+    toolkits: claims.toolkits,
+    composio_session_id: claims.composio_session_id,
+    mcp_url: `${base}/mcp`,
+    mcp_token: token,
+    exp: now + ttl,
+    ttl_seconds: ttl,
+    refreshed: true,
+    composio_mcp_url: claims.composio_mcp_url,
+  });
 }
 
 async function handleInternalConnect(request: Request, env: Env): Promise<Response> {
@@ -255,6 +318,10 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
     return handleInternalSession(request, env);
   }
 
+  if (request.method === "POST" && path === "/internal/session/refresh") {
+    return handleInternalRefresh(request, env);
+  }
+
   if (request.method === "POST" && path === "/internal/connect") {
     return handleInternalConnect(request, env);
   }
@@ -280,4 +347,11 @@ export default {
 
 // Re-exports for tests
 export { defaultToolkits, resolveToolkits } from "./toolkits";
-export { mintSessionToken, verifySessionToken, bearerToken } from "./session_token";
+export {
+  mintSessionToken,
+  verifySessionToken,
+  refreshSessionToken,
+  needsRefresh,
+  bearerToken,
+} from "./session_token";
+export { DEFAULT_SESSION_TTL_SECONDS, sessionTtlSeconds } from "./env";

@@ -41,6 +41,8 @@ export async function createToolRouterSession(
       toolkits: { enable: toolkits },
       // Prefer not to give sandboxes a remote bash by default
       sandbox: { enable: false },
+      // Keep manage-connections so Hermes can surface OAuth login URLs
+      manage_connections: { enable: true },
     }),
   });
   const text = await res.text();

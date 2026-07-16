@@ -5,7 +5,8 @@ compatibility_date = "2026-07-13"
 # Public vars only. Secrets are never committed.
 [vars]
 PUBLIC_BASE_URL = "https://fromdonna-composio-proxy.code-df4.workers.dev"
-# SESSION_TTL_SECONDS = "3600"
+# Production: 30 days — sandbox pause/resume must not kill MCP after 1h
+SESSION_TTL_SECONDS = "2592000"
 
 # Secrets (wrangler secret put — never commit):
 # COMPOSIO_API_KEY           Real Composio project key

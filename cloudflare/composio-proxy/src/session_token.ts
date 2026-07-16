@@ -66,6 +66,8 @@ export async function verifySessionToken(
   secret: string,
   token: string,
   nowSeconds = Math.floor(Date.now() / 1000),
+  /** Accept tokens expired by up to this many seconds (for refresh). */
+  allowExpiredSeconds = 0,
 ): Promise<SessionClaims | null> {
   const parts = token.split(".");
   if (parts.length !== 2) return null;
@@ -84,7 +86,8 @@ export async function verifySessionToken(
     const json = atob(body.replace(/-/g, "+").replace(/_/g, "/") + pad2);
     const claims = JSON.parse(json) as SessionClaims;
     if (!claims.user_id || !Array.isArray(claims.toolkits)) return null;
-    if (typeof claims.exp !== "number" || claims.exp < nowSeconds) return null;
+    if (typeof claims.exp !== "number") return null;
+    if (claims.exp + allowExpiredSeconds < nowSeconds) return null;
     return claims;
   } catch {
     return null;
@@ -96,4 +99,33 @@ export function bearerToken(request: Request): string | null {
   if (!h) return null;
   const m = /^Bearer\s+(.+)$/i.exec(h.trim());
   return m?.[1]?.trim() || null;
+}
+
+/**
+ * Re-mint a token from prior claims (same user/toolkits/composio urls), new exp.
+ * Used for production refresh without recreating Composio identity.
+ */
+export async function refreshSessionToken(
+  secret: string,
+  prior: SessionClaims,
+  ttlSeconds = 30 * 24 * 3600,
+  nowSeconds = Math.floor(Date.now() / 1000),
+): Promise<string> {
+  return mintSessionToken(secret, {
+    user_id: prior.user_id,
+    toolkits: prior.toolkits,
+    runtime_id: prior.runtime_id,
+    composio_session_id: prior.composio_session_id,
+    composio_mcp_url: prior.composio_mcp_url,
+    exp: nowSeconds + ttlSeconds,
+  });
+}
+
+/** True if token expires within `withinSeconds` (default 24h). */
+export function needsRefresh(
+  claims: SessionClaims,
+  withinSeconds = 24 * 3600,
+  nowSeconds = Math.floor(Date.now() / 1000),
+): boolean {
+  return claims.exp - nowSeconds < withinSeconds;
 }

@@ -40,7 +40,12 @@ export function internalSecret(env: Env): string {
   return s;
 }
 
+/** Production default: 30 days — covers long-lived E2B pause/resume without hourly death. */
+export const DEFAULT_SESSION_TTL_SECONDS = 30 * 24 * 3600;
+
 export function sessionTtlSeconds(env: Env): number {
-  const n = Number(env.SESSION_TTL_SECONDS || "3600");
-  return Number.isFinite(n) && n >= 60 ? Math.floor(n) : 3600;
+  const n = Number(env.SESSION_TTL_SECONDS || String(DEFAULT_SESSION_TTL_SECONDS));
+  // Floor 1h so misconfig never goes sub-hour; ceiling 90d
+  if (!Number.isFinite(n)) return DEFAULT_SESSION_TTL_SECONDS;
+  return Math.min(90 * 24 * 3600, Math.max(3600, Math.floor(n)));
 }
