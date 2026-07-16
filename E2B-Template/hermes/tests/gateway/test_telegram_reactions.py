@@ -1,16 +1,7 @@
-"""Telegram reactions: FromDonna supersedes Hermès lifecycle 👀/👍/👎.
+"""Tests for Telegram message reactions tied to processing lifecycle hooks."""
 
-FromDonna owns inbound reactions (❤️🔥👍😭 via a parallel classifier) and a
-thinking-dots bubble. The old TELEGRAM_REACTIONS lifecycle is disabled so one
-inbound message never gets two competing reaction schemes.
-
-``_set_reaction`` / ``_clear_reactions`` remain as Bot API helpers for the
-context-reaction path.
-"""
-
-import asyncio
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -19,7 +10,7 @@ from gateway.platforms.base import MessageEvent, MessageType, ProcessingOutcome
 from gateway.session import SessionSource
 
 
-def _make_adapter(**_extra):
+def _make_adapter(**extra_env):
     from plugins.platforms.telegram.adapter import TelegramAdapter
 
     adapter = object.__new__(TelegramAdapter)
@@ -27,18 +18,12 @@ def _make_adapter(**_extra):
     adapter.config = PlatformConfig(enabled=True, token="fake-token")
     adapter._bot = AsyncMock()
     adapter._bot.set_message_reaction = AsyncMock()
-    adapter._bot.edit_message_text = AsyncMock()
-    adapter._fromdonna_thinking = {}
     return adapter
 
 
-def _make_event(
-    chat_id: str = "123",
-    message_id: str = "456",
-    text: str = "hello",
-) -> MessageEvent:
+def _make_event(chat_id: str = "123", message_id: str = "456") -> MessageEvent:
     return MessageEvent(
-        text=text,
+        text="hello",
         message_type=MessageType.TEXT,
         source=SessionSource(
             platform=Platform.TELEGRAM,
@@ -51,46 +36,46 @@ def _make_event(
     )
 
 
-# ── _reactions_enabled (legacy lifecycle — always off for FromDonna) ─
+# ── _reactions_enabled ───────────────────────────────────────────────
 
 
 def test_reactions_disabled_by_default(monkeypatch):
-    """Legacy Hermès lifecycle reactions stay off even without env."""
+    """Telegram reactions should be disabled by default."""
     monkeypatch.delenv("TELEGRAM_REACTIONS", raising=False)
     adapter = _make_adapter()
     assert adapter._reactions_enabled() is False
 
 
 def test_reactions_enabled_when_set_true(monkeypatch):
-    """TELEGRAM_REACTIONS=true no longer enables 👀/👍/👎 lifecycle."""
+    """Setting TELEGRAM_REACTIONS=true enables reactions."""
     monkeypatch.setenv("TELEGRAM_REACTIONS", "true")
     adapter = _make_adapter()
-    assert adapter._reactions_enabled() is False
+    assert adapter._reactions_enabled() is True
 
 
 def test_reactions_enabled_with_1(monkeypatch):
-    """TELEGRAM_REACTIONS=1 is superseded by FromDonna UX."""
+    """TELEGRAM_REACTIONS=1 enables reactions."""
     monkeypatch.setenv("TELEGRAM_REACTIONS", "1")
     adapter = _make_adapter()
-    assert adapter._reactions_enabled() is False
+    assert adapter._reactions_enabled() is True
 
 
 def test_reactions_disabled_with_false(monkeypatch):
-    """TELEGRAM_REACTIONS=false remains disabled (lifecycle never on)."""
+    """TELEGRAM_REACTIONS=false disables reactions."""
     monkeypatch.setenv("TELEGRAM_REACTIONS", "false")
     adapter = _make_adapter()
     assert adapter._reactions_enabled() is False
 
 
 def test_reactions_disabled_with_0(monkeypatch):
-    """TELEGRAM_REACTIONS=0 remains disabled (lifecycle never on)."""
+    """TELEGRAM_REACTIONS=0 disables reactions."""
     monkeypatch.setenv("TELEGRAM_REACTIONS", "0")
     adapter = _make_adapter()
     assert adapter._reactions_enabled() is False
 
 
 def test_reactions_disabled_with_no(monkeypatch):
-    """TELEGRAM_REACTIONS=no remains disabled (lifecycle never on)."""
+    """TELEGRAM_REACTIONS=no disables reactions."""
     monkeypatch.setenv("TELEGRAM_REACTIONS", "no")
     adapter = _make_adapter()
     assert adapter._reactions_enabled() is False
@@ -102,6 +87,7 @@ def test_reactions_disabled_with_no(monkeypatch):
 @pytest.mark.asyncio
 async def test_set_reaction_calls_bot_api(monkeypatch):
     """_set_reaction should call bot.set_message_reaction with correct args."""
+    monkeypatch.setenv("TELEGRAM_REACTIONS", "true")
     adapter = _make_adapter()
 
     result = await adapter._set_reaction("123", "456", "\U0001f440")
@@ -117,6 +103,7 @@ async def test_set_reaction_calls_bot_api(monkeypatch):
 @pytest.mark.asyncio
 async def test_set_reaction_returns_false_without_bot(monkeypatch):
     """_set_reaction should return False when bot is not available."""
+    monkeypatch.setenv("TELEGRAM_REACTIONS", "true")
     adapter = _make_adapter()
     adapter._bot = None
 
@@ -127,6 +114,7 @@ async def test_set_reaction_returns_false_without_bot(monkeypatch):
 @pytest.mark.asyncio
 async def test_set_reaction_handles_api_error_gracefully(monkeypatch):
     """API errors during reaction should not propagate."""
+    monkeypatch.setenv("TELEGRAM_REACTIONS", "true")
     adapter = _make_adapter()
     adapter._bot.set_message_reaction = AsyncMock(side_effect=RuntimeError("no perms"))
 
@@ -134,83 +122,42 @@ async def test_set_reaction_handles_api_error_gracefully(monkeypatch):
     assert result is False
 
 
-# ── on_processing_start (FromDonna: context react + dots, not 👀) ────
+# ── on_processing_start ──────────────────────────────────────────────
 
 
 @pytest.mark.asyncio
-async def test_on_processing_start_does_not_set_eyes_lifecycle(monkeypatch):
-    """FromDonna must not apply Hermès 👀 lifecycle reaction."""
-    monkeypatch.setenv("TELEGRAM_REACTIONS", "true")
-    monkeypatch.setenv("FROMDONNA_TELEGRAM_UX", "true")
-    adapter = _make_adapter()
-    adapter._bot.send_message = AsyncMock(
-        return_value=SimpleNamespace(message_id=900)
-    )
-    adapter._disable_link_previews = False
-    event = _make_event(text="this is amazing")
-
-    with patch(
-        "plugins.platforms.telegram.fromdonna_ux.classify_reaction_emoji",
-        return_value="🔥",
-    ):
-        await adapter.on_processing_start(event)
-        await asyncio.sleep(0.05)
-
-    # No 👀 lifecycle reaction.
-    for call in adapter._bot.set_message_reaction.await_args_list:
-        assert call.kwargs.get("reaction") != "\U0001f440"
-        assert call.kwargs.get("reaction") != "👀"
-    await adapter._fromdonna_clear_thinking_dots("123")
-
-
-@pytest.mark.asyncio
-async def test_on_processing_start_applies_context_emoji(monkeypatch):
-    """Processing start fires parallel context reaction from the four-emoji set."""
-    from plugins.platforms.telegram.fromdonna_ux import REACTION_EMOJIS
-
-    monkeypatch.setenv("FROMDONNA_TELEGRAM_UX", "true")
-    adapter = _make_adapter()
-    adapter._bot.send_message = AsyncMock(
-        return_value=SimpleNamespace(message_id=900)
-    )
-    adapter._disable_link_previews = False
-    event = _make_event(text="thank you so much")
-
-    with patch(
-        "plugins.platforms.telegram.fromdonna_ux.classify_reaction_emoji",
-        return_value="❤️",
-    ):
-        await adapter.on_processing_start(event)
-        await asyncio.sleep(0.05)
-
-    assert adapter._bot.set_message_reaction.await_count >= 1
-    reaction = adapter._bot.set_message_reaction.await_args.kwargs.get("reaction")
-    assert reaction in REACTION_EMOJIS
-    assert reaction == "❤️"
-    await adapter._fromdonna_clear_thinking_dots("123")
-
-
-@pytest.mark.asyncio
-async def test_on_processing_start_skipped_when_fromdonna_ux_disabled(monkeypatch):
-    """When FromDonna UX is off, start is a no-op (no lifecycle either)."""
-    monkeypatch.setenv("FROMDONNA_TELEGRAM_UX", "false")
+async def test_on_processing_start_adds_eyes_reaction(monkeypatch):
+    """Processing start should add eyes reaction when enabled."""
     monkeypatch.setenv("TELEGRAM_REACTIONS", "true")
     adapter = _make_adapter()
-    adapter._bot.send_message = AsyncMock()
     event = _make_event()
 
     await adapter.on_processing_start(event)
 
-    adapter._bot.send_message.assert_not_awaited()
+    adapter._bot.set_message_reaction.assert_awaited_once_with(
+        chat_id=123,
+        message_id=456,
+        reaction="\U0001f440",
+    )
+
+
+@pytest.mark.asyncio
+async def test_on_processing_start_skipped_when_disabled(monkeypatch):
+    """Processing start should not react when reactions are disabled."""
+    monkeypatch.delenv("TELEGRAM_REACTIONS", raising=False)
+    adapter = _make_adapter()
+    event = _make_event()
+
+    await adapter.on_processing_start(event)
+
     adapter._bot.set_message_reaction.assert_not_awaited()
 
 
 @pytest.mark.asyncio
 async def test_on_processing_start_handles_missing_ids(monkeypatch):
     """Should handle events without chat_id or message_id gracefully."""
-    monkeypatch.setenv("FROMDONNA_TELEGRAM_UX", "true")
+    monkeypatch.setenv("TELEGRAM_REACTIONS", "true")
     adapter = _make_adapter()
-    adapter._bot.send_message = AsyncMock()
     event = MessageEvent(
         text="hello",
         message_type=MessageType.TEXT,
@@ -219,114 +166,85 @@ async def test_on_processing_start_handles_missing_ids(monkeypatch):
     )
 
     await adapter.on_processing_start(event)
-    await asyncio.sleep(0.02)
 
-    adapter._bot.send_message.assert_not_awaited()
     adapter._bot.set_message_reaction.assert_not_awaited()
 
 
-@pytest.mark.asyncio
-async def test_on_processing_complete_safe_without_thinking_state(monkeypatch):
-    """Partial adapters missing _fromdonna_thinking must not AttributeError."""
-    monkeypatch.setenv("FROMDONNA_TELEGRAM_UX", "true")
-    adapter = _make_adapter()
-    del adapter._fromdonna_thinking
-    event = _make_event()
-
-    await adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
-    # No lifecycle 👍 either.
-    adapter._bot.set_message_reaction.assert_not_awaited()
-
-
-# ── on_processing_complete (clears dots; no 👍/👎) ───────────────────
+# ── on_processing_complete ───────────────────────────────────────────
 
 
 @pytest.mark.asyncio
 async def test_on_processing_complete_success(monkeypatch):
-    """Successful processing must not set thumbs-up; only clear thinking-dots."""
+    """Successful processing should set thumbs-up reaction."""
     monkeypatch.setenv("TELEGRAM_REACTIONS", "true")
-    monkeypatch.setenv("FROMDONNA_TELEGRAM_UX", "true")
     adapter = _make_adapter()
-    adapter.delete_message = AsyncMock(return_value=True)
-    stop = asyncio.Event()
-    adapter._fromdonna_thinking["123"] = {
-        "message_id": "900",
-        "stop_event": stop,
-        "frame_index": 1,
-        "task": None,
-    }
     event = _make_event()
 
     await adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
 
-    assert "123" not in adapter._fromdonna_thinking
-    assert stop.is_set()
-    adapter.delete_message.assert_awaited_once_with("123", "900")
-    adapter._bot.set_message_reaction.assert_not_awaited()
+    adapter._bot.set_message_reaction.assert_awaited_once_with(
+        chat_id=123,
+        message_id=456,
+        reaction="\U0001f44d",
+    )
 
 
 @pytest.mark.asyncio
 async def test_on_processing_complete_failure(monkeypatch):
-    """Failed processing must not set thumbs-down lifecycle reaction."""
+    """Failed processing should set thumbs-down reaction."""
     monkeypatch.setenv("TELEGRAM_REACTIONS", "true")
-    monkeypatch.setenv("FROMDONNA_TELEGRAM_UX", "true")
     adapter = _make_adapter()
     event = _make_event()
 
     await adapter.on_processing_complete(event, ProcessingOutcome.FAILURE)
 
-    adapter._bot.set_message_reaction.assert_not_awaited()
+    adapter._bot.set_message_reaction.assert_awaited_once_with(
+        chat_id=123,
+        message_id=456,
+        reaction="\U0001f44e",
+    )
 
 
 @pytest.mark.asyncio
 async def test_on_processing_complete_skipped_when_disabled(monkeypatch):
-    """Processing complete is a no-op when FromDonna UX is off."""
-    monkeypatch.setenv("FROMDONNA_TELEGRAM_UX", "false")
+    """Processing complete should not react when reactions are disabled."""
+    monkeypatch.delenv("TELEGRAM_REACTIONS", raising=False)
     adapter = _make_adapter()
-    adapter.delete_message = AsyncMock()
-    adapter._fromdonna_thinking["123"] = {
-        "message_id": "900",
-        "stop_event": asyncio.Event(),
-        "frame_index": 0,
-        "task": None,
-    }
     event = _make_event()
 
     await adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
 
-    adapter.delete_message.assert_not_awaited()
-    assert "123" in adapter._fromdonna_thinking
     adapter._bot.set_message_reaction.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_on_processing_complete_cancelled_clears_thinking_dots(monkeypatch):
-    """Cancelled turn clears thinking-dots bubble; no reaction clear API."""
-    monkeypatch.setenv("FROMDONNA_TELEGRAM_UX", "true")
+async def test_on_processing_complete_cancelled_clears_reaction(monkeypatch):
+    """Cancelled processing should clear the in-progress reaction.
+
+    Without this clear, the 👀 reaction lingers on the user's message
+    indefinitely (until another agent run swaps it for 👍/👎). On a
+    ``/stop`` that ends a session, that reaction never gets cleaned up.
+    """
+    monkeypatch.setenv("TELEGRAM_REACTIONS", "true")
     adapter = _make_adapter()
-    adapter.delete_message = AsyncMock(return_value=True)
-    stop = asyncio.Event()
-    adapter._fromdonna_thinking["123"] = {
-        "message_id": "900",
-        "stop_event": stop,
-        "frame_index": 0,
-        "task": None,
-    }
     event = _make_event()
 
     await adapter.on_processing_complete(event, ProcessingOutcome.CANCELLED)
 
-    assert "123" not in adapter._fromdonna_thinking
-    assert stop.is_set()
-    # Must NOT call set_message_reaction(reaction=None) lifecycle clear.
-    adapter._bot.set_message_reaction.assert_not_awaited()
-    adapter.delete_message.assert_awaited_once_with("123", "900")
+    # set_message_reaction with reaction=None clears all reactions on the
+    # message (Bot API documented semantics; equivalent to Bot API 10.0's
+    # deleteMessageReaction but works on PTB 22.6 already).
+    adapter._bot.set_message_reaction.assert_awaited_once_with(
+        chat_id=123,
+        message_id=456,
+        reaction=None,
+    )
 
 
 @pytest.mark.asyncio
 async def test_on_processing_complete_cancelled_skipped_when_disabled(monkeypatch):
-    """Cancelled processing should not call the API when FromDonna UX is off."""
-    monkeypatch.setenv("FROMDONNA_TELEGRAM_UX", "false")
+    """Cancelled processing should not call the API when reactions are off."""
+    monkeypatch.delenv("TELEGRAM_REACTIONS", raising=False)
     adapter = _make_adapter()
     event = _make_event()
 
@@ -338,6 +256,7 @@ async def test_on_processing_complete_cancelled_skipped_when_disabled(monkeypatc
 @pytest.mark.asyncio
 async def test_clear_reactions_handles_api_error_gracefully(monkeypatch):
     """API errors during clear should not propagate."""
+    monkeypatch.setenv("TELEGRAM_REACTIONS", "true")
     adapter = _make_adapter()
     adapter._bot.set_message_reaction = AsyncMock(side_effect=RuntimeError("no perms"))
 
