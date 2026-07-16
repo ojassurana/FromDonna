@@ -19,7 +19,7 @@ Architecture and ops notes for the multi-user Hermes product: one Telegram bot, 
 | Doc | Contents |
 |-----|----------|
 | [deployment/e2b-template.md](./deployment/e2b-template.md) | Template recipe, warm start, `/bootstrap`, harness checkpoint endpoints |
-| [deployment/memorymanagement.md](./deployment/memorymanagement.md) | **Arch B:** pause vs R2 checkpoint (stage → Worker pull → restore) |
+| [deployment/memorymanagement.md](./deployment/memorymanagement.md) | **Three per-user resources** (D1 + E2B + R2); Arch B pause vs R2 checkpoint |
 | [deployment/fromdonna-persistence-technical-report.pdf](./deployment/fromdonna-persistence-technical-report.pdf) | Full technical report (implementation + live verification) |
 
 ### Hermes (in-sandbox agent)
@@ -33,7 +33,7 @@ Architecture and ops notes for the multi-user Hermes product: one Telegram bot, 
 
 | Doc | Contents |
 |-----|----------|
-| [tooling/general.md](./tooling/general.md) | Connectors (Nango / CLI / MCP / API); three Worker doors |
+| [tooling/general.md](./tooling/general.md) | Connectors (OAuth apps / CLI / MCP / API); three Worker doors |
 | [tooling/api-proxy-worker.md](./tooling/api-proxy-worker.md) | **API proxy Worker** — Exa + **how to add more API connectors**; keys never in E2B |
 
 ## Live path (one sentence)

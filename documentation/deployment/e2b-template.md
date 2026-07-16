@@ -57,7 +57,7 @@ One reusable template (e.g. `fromdonna-hermes`) so every user sandbox starts wit
 - Extra **product code** (HTTP harness, thin tool wrappers that call Worker)
 - Optional **warm start** (process already listening for Worker)
 
-**Not** in the template: Telegram/WhatsApp tokens, Nango secrets, real OAuth tokens, per-user `~/.hermes` brain, R2 user files.
+**Not** in the template: Telegram/WhatsApp tokens, real OAuth tokens, per-user `~/.hermes` brain, R2 user files.
 
 ## What you can bake in
 
@@ -168,7 +168,8 @@ Typical extras in the image:
   - `POST /internal/restore` — apply R2 checkpoint after create/replace  
   - `POST /turn` — legacy path  
 - **Checkpoint packer** (`checkpoint.py`) — filtered agent-home + workspace tar  
-- **Thin tools** / wrappers that call Worker for Nango / API / MCP  
+- **Thin tools** / wrappers that call Worker for OAuth / API / MCP  
+
 - CLI shims that rewrite upstream base URLs to Worker  
 
 This code is **yours**, versioned in FromDonna, **copied in at template build** (`template.ts` copies `harness/` + `hermes/` + default config + plugins).
@@ -246,7 +247,7 @@ User **R2 files** do not need moving (already durable).
 | User skills/memory/config/sessions drift | **Live sandbox `~/.hermes` + workspace** |
 | Runtime checkpoint for replace/missing box | **R2** (Worker pull after use) |
 | Product docs/images/exports (tools) | **R2** (later / separate path) |
-| Secrets / OAuth | **Worker / Nango** |
+| Secrets / OAuth | **Worker / product vault** |
 
 ## Ops checklist
 

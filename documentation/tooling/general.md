@@ -18,28 +18,27 @@ Any external action → E2B → dedicated Worker door → backend
 
 - **E2B** = untrusted computer per user (code, shell, local files).
 - **API keys for product connectors** = **api-proxy only**, never gateway, never sandbox.
-- Sandbox never gets long-lived provider secrets (Gmail, Zepto, Exa, Nango keys, etc.).
+- Sandbox never gets long-lived provider secrets (Gmail, Zepto, Exa, OAuth tokens, etc.).
 
 See [api-proxy-worker.md](./api-proxy-worker.md) for the API door and the **protocol for adding more API connectors**.
 
-## Four connector buckets
+## Connector buckets
 
 | Bucket | What it is | Where it runs | Auth | What the agent sees |
 |--------|------------|---------------|------|---------------------|
-| **Nango** | OAuth apps; you own/customize the tool layer | Nango Cloud (or one self-host) — **not** per E2B | User connects via Nango Connect; tokens in Nango under your `user_id` | Tools → **api-proxy or gateway tool path** → Nango → provider |
+| **OAuth apps** | User-connected third-party accounts (Gmail, GitHub, …) | Shared vault outside E2B (product Worker path) — **not** per sandbox | User connects once; tokens vaulted under product `user_id` | Tools → **gateway or api-proxy tool path** → vaulted credentials → provider |
 | **CLI** | Shell binaries / local programs | **Inside that user’s E2B** | No key: local only. Needs key: **fake token + Worker URL**; real key on **api-proxy** (or CLI-specific door) | Agent runs CLI in sandbox; secret path is Worker-backed |
 | **MCP** | Vendor/custom MCP (e.g. Zepto MCP) | Shared MCP process/URL — **not** one MCP install per E2B by default | Per-user session/token vaulted outside E2B | Tools → Worker is MCP client → real MCP |
 | **API** | Plain HTTP APIs (e.g. **Exa**) | Upstream API | Product key on **`fromdonna-api-proxy` only** | Hermes tools (`web_search` / `web_extract` via Exa) → api-proxy → Exa |
 
 ## How each is managed
 
-### 1. Nango
+### 1. OAuth apps
 
-- Shared integration hub for multi-user OAuth (Gmail, GitHub, …).
-- You can use catalog connectors **and** implement custom tools (TypeScript actions) so you own the tool layer.
-- Agent does not talk to Nango with a project secret in E2B.
-- Flow: E2B tool → Worker → Nango (connection for `user_id`) → provider.
-- Free self-host is mainly auth + proxy; full functions/MCP on Nango self-host often needs Cloud/Enterprise.
+- Multi-user OAuth (Gmail, GitHub, …) lives **outside** E2B under a product-owned vault keyed by `user_id`.
+- Agent does not hold the vault secret or long-lived provider tokens in the sandbox.
+- Flow: E2B tool → Worker → vaulted connection for `user_id` → provider.
+- Concrete vault implementation (self-host / vendor SaaS) is an ops choice; the architecture only requires credentials off-sandbox and a Worker door.
 
 ### 2. CLI
 
@@ -56,7 +55,7 @@ See [api-proxy-worker.md](./api-proxy-worker.md) for the API door and the **prot
 - Agent does **not** speak MCP JSON-RPC; it only gets **toolified** entry points.
 - Registry: `server id → URL, auth type, which users`.
 - One protocol for all MCPs, e.g. `POST /internal/mcp/call` with capability + `server` + `tool` + `args`.
-- **Do not** wrap arbitrary vendor MCP “inside Nango” unless you reimplement that integration as Nango actions. Zepto’s own MCP → Worker talks to Zepto MCP directly.
+- **Do not** reimplement vendor MCP “inside” an OAuth vault unless you own that integration layer. Zepto’s own MCP → Worker talks to Zepto MCP directly.
 - Local stdio MCP with **no secrets** may run in that user’s E2B; anything with auth stays outside.
 
 ### 4. API (Exa live)
@@ -72,7 +71,7 @@ See [api-proxy-worker.md](./api-proxy-worker.md) for the API door and the **prot
 
 | Kind | Toolified for the agent? | Worker involved? |
 |------|--------------------------|------------------|
-| Nango | Yes | Always |
+| OAuth apps | Yes | Always |
 | API | Yes | Always (**api-proxy**) |
 | MCP | Yes (Worker is MCP client) | Always |
 | CLI | No (raw shell in E2B) | Only when a key/proxy is required |
@@ -80,10 +79,10 @@ See [api-proxy-worker.md](./api-proxy-worker.md) for the API door and the **prot
 
 ## Per-user state (outside E2B)
 
-Store on gateway D1/R2 and/or Nango (not in the agent box long-term):
+Store on gateway D1/R2 and/or a product OAuth vault (not in the agent box long-term):
 
 - stable `user_id`
-- Nango connection ids / connected accounts
+- OAuth connection ids / connected accounts
 - MCP sessions if multi-user
 - optional personal API keys (vaulted)
 - capability signing secrets (gateway + llm-proxy; api-proxy later)
@@ -93,11 +92,11 @@ Store on gateway D1/R2 and/or Nango (not in the agent box long-term):
 - Code, shell, secret-free CLIs
 - Thin tools that only call **your Workers**
 - Short-lived **LLM** capability; **API stub** until capability ships for api-proxy
-- **Not** long-lived Gmail/GitHub/Zepto/Exa/Nango secrets
+- **Not** long-lived Gmail/GitHub/Zepto/Exa/OAuth secrets
 
 ## Explicit non-goals
 
-- Nango (or full OAuth store) installed in every E2B
+- Full OAuth store installed in every E2B
 - Real OAuth/API tokens living in the agent sandbox
 - Product API keys on the **gateway** Worker (channels only)
 - Different one-off auth path per connector without a shared Worker door
@@ -105,4 +104,4 @@ Store on gateway D1/R2 and/or Nango (not in the agent box long-term):
 
 ## One-line summary
 
-**Four backends (Nango, CLI, MCP, API), three Worker doors (gateway / llm-proxy / api-proxy), credentials outside E2B; the agent sees tools plus local CLI.**
+**Four backends (OAuth apps, CLI, MCP, API), three Worker doors (gateway / llm-proxy / api-proxy), credentials outside E2B; the agent sees tools plus local CLI.**

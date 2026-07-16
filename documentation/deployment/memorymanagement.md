@@ -12,7 +12,7 @@ Related: [e2b-template.md](./e2b-template.md), [../gateway/telegram.md](../gatew
 ```
 User (years)
   ├── Account / routing          → Worker D1 (user_id → runtime_id)
-  ├── Secrets / OAuth            → Worker + Nango (never long-lived in E2B)
+  ├── Secrets / OAuth            → Worker / product vault (never long-lived in E2B)
   ├── Runtime checkpoint         → R2  users/{userId}/checkpoint.tar.gz
   ├── Product files & artifacts  → R2  (tools path later; optional)
   └── Live agent brain           → that user’s E2B: ~/.hermes + ~/workspace
@@ -23,6 +23,70 @@ User (years)
 | Day-to-day continuity | **E2B pause/resume** (same disk; memory/workspace **not** cleared on unpause) |
 | Survive missing / replaced sandbox | **R2 checkpoint** (agent-home + workspace) |
 | Channel tokens / E2B API key | **Worker only** |
+
+## Three per-user resources
+
+Every Donna user is allocated **exactly three dedicated usages** outside the shared product edge (gateway, LLM proxy, API proxy, bot token, E2B *template*). Everything else is shared infrastructure.
+
+| # | Resource | Binding / name | Per-user unit | Usage |
+|---|----------|----------------|---------------|--------|
+| **1** | **D1** (routing) | Worker `FROMDONNA_ROUTING` → DB `fromdonna-routing` | One row in `user_agents` | **Identity & routing only:** channel identity → product `user_id` → live `runtime_id` / `status` / provider. Does **not** store agent memory, skills, or chat history. |
+| **2** | **E2B** (live runtime) | Template alias `fromdonna-hermes` (shared image); **one sandbox id per user** | One VM / `runtime_id` (e.g. harness `https://8788-{id}.e2b.dev`) | **Live agent brain:** Hermes + harness, `~/.hermes`, workspace. Day-to-day continuity via pause/resume (same disk). Provisioned/resumed by the gateway with `E2B_API_KEY` (key stays on Worker). |
+| **3** | **R2** (durable checkpoint) | Worker `USER_STATE` → bucket `fromdonna-user-state` | Object prefix `users/{userId}/` | **Survive sandbox loss/replace:** filtered agent-home + workspace archive + manifest. Written by Worker **pull** after agent use; **restored** on create/replace. Keys: `checkpoint.tar.gz`, `manifests/latest.json`. |
+
+```text
+                    ┌─ 1. D1 ──────────────────────────────────────┐
+                    │  user_agents: who is this user, which runtime? │
+                    └──────────────────────┬───────────────────────┘
+                                           │ runtime_id
+              ┌────────────────────────────┼────────────────────────────┐
+              ▼                                                         ▼
+   ┌─ 2. E2B (this user) ─┐                          ┌─ 3. R2 (this user) ─┐
+   │  live Hermes          │   stage → Worker pull    │  users/{userId}/      │
+   │  ~/.hermes + workspace │ ───────────────────────► │  checkpoint + manifest│
+   │  pause = keep disk    │ ◄── restore on replace ─ │  no channel secrets   │
+   └───────────────────────┘                          └──────────────────────┘
+```
+
+### What each is *not*
+
+| Resource | Not used for |
+|----------|----------------|
+| **D1** | Conversation history, SOUL/MEMORY files, workspace files, secrets |
+| **E2B** | Long-lived product API keys, bot tokens, R2 credentials, global routing |
+| **R2** | Live inference, channel I/O, or as the day-to-day “open the box” path (that’s E2B pause/resume) |
+
+### Shared (not per-user)
+
+Gateway Worker, LLM proxy, API proxy, Telegram bot token / webhook secrets, E2B **template** image — one product-wide copy; sandboxes never hold those long-lived secrets.
+
+### How they stay in sync
+
+| Event | D1 | E2B | R2 |
+|-------|----|-----|-----|
+| First message / provision | Insert/update row → `ready` + `runtime_id` | Create from template, bootstrap, optional restore | Read checkpoint if present |
+| Idle → next message | Lookup `runtime_id` | Resume / connect same sandbox | Unchanged (no restore) |
+| After agent session | Unchanged (or status touch) | Stage tar on disk | Worker harvest → put objects |
+| replaceRuntime / dead box | New `runtime_id` | New VM; kill old | Restore into new VM if objects exist |
+
+### Ops: inspect one user’s three usages
+
+```bash
+# 1) D1 routing row
+npx wrangler d1 execute fromdonna-routing --remote --command \
+  "SELECT gateway, gateway_user_id, user_id, status, runtime_provider, runtime_id, updated_at
+   FROM user_agents WHERE user_id = 'telegram:<id>';"
+
+# 2) E2B live harness (runtime_id from D1)
+curl -sS "https://8788-<runtime_id>.e2b.dev/health"
+
+# 3) R2 checkpoint manifest
+npx wrangler r2 object get \
+  "fromdonna-user-state/users/telegram:<id>/manifests/latest.json" \
+  --file /tmp/man.json --remote
+```
+
+Details of pack/exclude/harvest and pause vs restore are in the sections below.
 
 ## Sandbox lifecycle
 
@@ -128,14 +192,15 @@ Separate from the runtime checkpoint: durable docs/exports may later use agent t
 ### Outside the sandbox (always)
 
 - Channel bot tokens  
-- Nango / OAuth product secrets  
+- OAuth / product secrets  
+
 - Billing, identity, `user_id ↔ runtime_id`  
 
 ## Mental model
 
 ```
                     ┌──────────────────────────────┐
-                    │  Worker / D1 / Nango         │
+                    │  Worker / D1                 │
                     │  identity, secrets, routing  │
                     │  R2 checkpoint put + restore │
                     └───────────┬──────────────────┘

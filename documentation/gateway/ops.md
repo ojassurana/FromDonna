@@ -52,6 +52,8 @@ fromdonna-gateway  (Cloudflare Worker)
 | E2B template | alias `fromdonna-hermes` | `npm run build:prod` / smoke |
 | Per-user harness | `https://8788-{id}.e2b.dev/health` | `auth_ready` + `telegram_proxy_ready` after bootstrap |
 
+**Per-user resource model (D1 routing + E2B live runtime + R2 checkpoint):** see [../deployment/memorymanagement.md](../deployment/memorymanagement.md#three-per-user-resources).
+
 ---
 
 ## Status script (copy/paste)

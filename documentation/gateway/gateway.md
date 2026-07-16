@@ -32,7 +32,8 @@ User (any app)
 - **Many users, one bot/number per channel** is fine — identity is `platform user/chat id`, not “who holds the token.”
 - **One user → one sandbox → one Hermes process** (create/resume on demand; pause when idle via E2B autoPause + autoResume).
 - **Durable routing state lives outside the sandbox** (Worker + D1). Sandbox = compute for that user.
-- **Runtime checkpoint** (agent-home + workspace) lives in **R2**; Worker pulls after agent use and restores on create/replace. See [../deployment/memorymanagement.md](../deployment/memorymanagement.md).
+- **Runtime checkpoint** (agent-home + workspace) lives in **R2**; Worker pulls after agent use and restores on create/replace.
+- **Three per-user resources** (D1 row + E2B sandbox + R2 prefix): [../deployment/memorymanagement.md#three-per-user-resources](../deployment/memorymanagement.md#three-per-user-resources).
 
 ## Layers
 
