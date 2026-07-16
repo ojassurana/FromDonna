@@ -12,8 +12,17 @@
 # Disable gateway platforms inside the sandbox — Worker owns channel delivery.
 # platforms: {}
 
-# Prefer product tools that call Worker over in-box secrets.
-# mcp_servers: {}   # only secret-free local MCP if any
+# Composio — official Hermes MCP shape (composio.dev/hermes).
+# Multi-user: proxy URL + Bearer ${FROMDONNA_COMPOSIO_MCP_TOKEN} from bootstrap
+# (never COMPOSIO_API_KEY in the sandbox). Live block is in config.yaml.
+# mcp_servers:
+#   composio:
+#     url: "https://fromdonna-composio-proxy…/mcp"
+#     headers:
+#       Authorization: "Bearer ${FROMDONNA_COMPOSIO_MCP_TOKEN}"
+#     connect_timeout: 60
+#     timeout: 180
+#     skip_preflight: true
 
 agent:
   # max_turns: 90

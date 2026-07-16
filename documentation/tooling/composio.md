@@ -136,7 +136,7 @@ Donna SOUL includes a short **CONNECTED APPS** rule (template `config/hermes/SOU
 ## 6. Lifecycle (code path)
 
 1. **First user / first E2B** — `ensureUserComposio` + `mintComposioMcpAccess` in `bootstrapHarness`.
-2. **Harness** — `_apply_composio_mcp` writes `mcp_servers.composio` (url, Bearer, `timeout: 180`, `skip_preflight: true`) **before** Telegram gateway start when possible.
+2. **Harness** — template bakes the **official Hermes Composio MCP block** (`mcp_servers.composio` with `url` / `headers` / `connect_timeout: 60` / `timeout: 180` / `skip_preflight: true`, same shape as [composio.dev/hermes](https://composio.dev/hermes)). Bootstrap sets `FROMDONNA_COMPOSIO_MCP_TOKEN` (and URL); Hermes expands `Bearer ${FROMDONNA_COMPOSIO_MCP_TOKEN}` like any other `${ENV}` MCP secret. Hermes auto-includes `composio` into platform toolsets (`include_default_mcp_servers`). Applied **before** Telegram gateway start so stock `discover_mcp_tools` loads it.
 3. **Later E2B** — same `user_id`; re-mint Bearer; reuse sticky `trs_` from D1 when possible.
 4. **Connect** — manage-connections tool or `POST /internal/connect`.
 5. **Template change** — rebuild `fromdonna-hermes` (`npm run build:prod`); old sandboxes keep old image until reclaimed/recreated.

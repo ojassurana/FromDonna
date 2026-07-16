@@ -657,6 +657,26 @@ def _response(
     return TurnResponse(actions=actions, text=text, sessionId=session_id)
 
 
+def _composio_mcp_ready() -> bool:
+    """True when official Hermes ``mcp_servers.composio`` is live (token + url)."""
+    token = (os.environ.get("FROMDONNA_COMPOSIO_MCP_TOKEN") or "").strip()
+    url = (os.environ.get("FROMDONNA_COMPOSIO_MCP_URL") or "").strip()
+    if not token or not url:
+        return False
+    config_path = HERMES_HOME / "config.yaml"
+    if not config_path.is_file():
+        return False
+    try:
+        import yaml  # type: ignore
+
+        loaded = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+        servers = loaded.get("mcp_servers") if isinstance(loaded, dict) else None
+        entry = servers.get("composio") if isinstance(servers, dict) else None
+        return isinstance(entry, dict) and bool(entry.get("url"))
+    except Exception:
+        return False
+
+
 @app.get("/health")
 def health():
     with _state_lock:
@@ -676,6 +696,8 @@ def health():
         # Only true when proxy is configured AND Hermes TG gateway thread is up.
         "telegram_proxy_ready": proxy_configured and gateway_running,
         "gateway_running": gateway_running,
+        # Official Hermes mcp_servers.composio wired (env Bearer + config block).
+        "composio_mcp_ready": _composio_mcp_ready(),
         "mode": "official-telegram-gateway",
     }
 
@@ -748,34 +770,36 @@ def _apply_identity_env(
     _apply_exa_proxy_env(api_proxy_url=api_proxy_url)
 
 
-def _apply_composio_mcp(mcp: ComposioMcpBootstrap) -> None:
-    """Point Hermes MCP client at composio-proxy (Bearer session token only; product key stays on Worker).
+# Official Hermes Composio MCP block shape (composio.dev/hermes), multi-user:
+# proxy URL + per-user Bearer. Token lives in env; config uses ${…} like stock Hermes.
+_DEFAULT_COMPOSIO_MCP_URL = (
+    "https://fromdonna-composio-proxy.code-df4.workers.dev/mcp"
+)
 
-    Production: shared MCP URL for all users; identity is the per-user Bearer
-    (30d TTL, re-minted on every gateway bootstrap). Never stores COMPOSIO_API_KEY.
+
+def _composio_mcp_server_entry(*, url: str) -> dict:
+    """Return the official Hermes ``mcp_servers.composio`` mapping.
+
+    Mirrors the documented Hermes/Composio config (url + headers + timeouts),
+    with FromDonna multi-user auth: Bearer ${FROMDONNA_COMPOSIO_MCP_TOKEN}
+    instead of a product ``x-consumer-api-key`` in the image.
     """
-    url = (mcp.url or "").strip()
-    token = (mcp.token or "").strip()
-    if not url or not token:
-        return
-    os.environ["FROMDONNA_COMPOSIO_MCP_URL"] = url
-    # Production-duration session token; do not treat as a product secret for logging.
-    os.environ["FROMDONNA_COMPOSIO_MCP_TOKEN"] = token
-    if mcp.toolkits:
-        os.environ["FROMDONNA_COMPOSIO_TOOLKITS"] = ",".join(mcp.toolkits)
-
-    HERMES_HOME.mkdir(parents=True, exist_ok=True)
-    config_path = HERMES_HOME / "config.yaml"
-    # Match Hermes streamable-HTTP MCP shape (url + headers).
-    # Longer timeouts: Composio tool_router can be slow on first tools/list.
-    server_entry = {
+    return {
         "url": url,
-        "headers": {"Authorization": f"Bearer {token}"},
-        "timeout": 180,
+        "headers": {
+            "Authorization": "Bearer ${FROMDONNA_COMPOSIO_MCP_TOKEN}",
+        },
         "connect_timeout": 60,
-        # Composio MCP answers streamable HTTP over POST; HEAD/GET probes can mis-detect.
+        "timeout": 180,
         "skip_preflight": True,
     }
+
+
+def _ensure_composio_mcp_config(*, url: str) -> None:
+    """Idempotently write ``mcp_servers.composio`` in official Hermes shape."""
+    HERMES_HOME.mkdir(parents=True, exist_ok=True)
+    config_path = HERMES_HOME / "config.yaml"
+    entry = _composio_mcp_server_entry(url=url)
     try:
         import yaml  # type: ignore
 
@@ -787,32 +811,120 @@ def _apply_composio_mcp(mcp: ComposioMcpBootstrap) -> None:
         servers = config.get("mcp_servers")
         if not isinstance(servers, dict):
             servers = {}
-        servers["composio"] = server_entry
+        # Preserve any extra keys ops added; always enforce official required fields.
+        existing = servers.get("composio")
+        if isinstance(existing, dict):
+            merged = dict(existing)
+            merged.update(entry)
+            # headers: replace Authorization while keeping any extras
+            headers = dict(existing.get("headers") or {})
+            headers.update(entry["headers"])
+            merged["headers"] = headers
+            servers["composio"] = merged
+        else:
+            servers["composio"] = entry
         config["mcp_servers"] = servers
         config_path.write_text(
             yaml.safe_dump(config, default_flow_style=False, sort_keys=False),
             encoding="utf-8",
         )
-    except Exception:
-        # Fallback: minimal YAML without full merge
+    except Exception as exc:
+        # Fallback sidecar so ops can still see the intended block.
         import json as _json
 
         snippet = (
-            "# Auto-written by FromDonna harness bootstrap (Composio MCP)\n"
+            "# Auto-written by FromDonna harness (official Hermes Composio MCP shape)\n"
             "mcp_servers:\n"
             "  composio:\n"
             f"    url: {_json.dumps(url)}\n"
             "    headers:\n"
-            f"      Authorization: {_json.dumps('Bearer ' + token)}\n"
-            "    timeout: 180\n"
+            '      Authorization: "Bearer ${FROMDONNA_COMPOSIO_MCP_TOKEN}"\n'
             "    connect_timeout: 60\n"
+            "    timeout: 180\n"
             "    skip_preflight: true\n"
         )
-        # If a config already exists, append is wrong; write sidecar for ops
         sidecar = HERMES_HOME / "fromdonna-composio-mcp.yaml"
         sidecar.write_text(snippet, encoding="utf-8")
         if not config_path.is_file():
             config_path.write_text(snippet, encoding="utf-8")
+        print(f"composio mcp config merge failed (sidecar written): {exc}", flush=True)
+
+
+def _reload_mcp_if_gateway_running() -> None:
+    """If the official gateway already started, rediscover MCP (incl. composio).
+
+    Bootstrap order is composio-then-gateway, so first start picks up tools
+    via stock ``discover_mcp_tools``. Re-bootstrap with a new Bearer must
+    refresh the live MCP client the same way Hermes ``/reload-mcp`` does.
+    """
+    try:
+        from gateway_runtime import get_gateway_runtime
+
+        runtime = get_gateway_runtime(str(HERMES_HOME))
+        if not runtime.is_running():
+            return
+    except Exception:
+        return
+    try:
+        from tools.mcp_tool import (
+            discover_mcp_tools,
+            refresh_agent_mcp_tools,
+            shutdown_mcp_servers,
+        )
+
+        shutdown_mcp_servers()
+        discover_mcp_tools()
+        # Refresh any cached session agents so tools appear without /new.
+        try:
+            runner = getattr(runtime, "_runner", None)
+            cache = getattr(runner, "_agent_cache", None) if runner is not None else None
+            lock = getattr(runner, "_agent_cache_lock", None) if runner is not None else None
+            if cache and lock is not None:
+                with lock:
+                    for entry in list(cache.values()):
+                        try:
+                            agent = entry[0] if isinstance(entry, tuple) else entry
+                        except Exception:
+                            continue
+                        if agent is not None:
+                            refresh_agent_mcp_tools(agent, quiet_mode=True)
+        except Exception as exc:
+            print(f"composio mcp agent refresh skipped: {exc}", flush=True)
+        print("composio mcp rediscovered for running gateway", flush=True)
+    except Exception as exc:
+        print(f"composio mcp rediscover failed: {exc}", flush=True)
+
+
+def _apply_composio_mcp(mcp: ComposioMcpBootstrap) -> None:
+    """Wire Hermes Composio MCP exactly like stock Hermes, multi-user style.
+
+    Official Hermes::
+
+        mcp_servers:
+          composio:
+            url: "https://connect.composio.dev/mcp"
+            headers:
+              x-consumer-api-key: "YOUR_COMPOSIO_API_KEY"
+            connect_timeout: 60
+            timeout: 180
+
+    FromDonna: same ``mcp_servers.composio`` block + Hermes MCP discovery.
+    ``COMPOSIO_API_KEY`` stays on composio-proxy; sandbox only gets a
+    per-user Bearer in ``FROMDONNA_COMPOSIO_MCP_TOKEN`` (expanded via
+    Hermes ``${…}`` interpolation). Never stores the product API key.
+    """
+    url = (mcp.url or "").strip() or _DEFAULT_COMPOSIO_MCP_URL
+    token = (mcp.token or "").strip()
+    if not token:
+        return
+    # Env is the live credential surface Hermes interpolates at MCP connect.
+    os.environ["FROMDONNA_COMPOSIO_MCP_URL"] = url
+    os.environ["FROMDONNA_COMPOSIO_MCP_TOKEN"] = token
+    if mcp.toolkits:
+        os.environ["FROMDONNA_COMPOSIO_TOOLKITS"] = ",".join(mcp.toolkits)
+
+    _ensure_composio_mcp_config(url=url)
+    _reload_mcp_if_gateway_running()
 
 
 def _apply_telegram_proxy(proxy: TelegramProxyBootstrap, *, start: bool = False) -> None:

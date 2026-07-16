@@ -123,6 +123,34 @@ platforms:
 
 agent: {}
 
+# ── Composio MCP (official Hermes shape) ─────────────────────────────────
+# Same block Hermes documents for Composio (composio.dev/hermes):
+#
+#   mcp_servers:
+#     composio:
+#       url: "https://connect.composio.dev/mcp"
+#       headers:
+#         x-consumer-api-key: "YOUR_COMPOSIO_API_KEY"
+#       connect_timeout: 60
+#       timeout: 180
+#
+# Multi-user FromDonna adaptation (secrets never in the sandbox image):
+# - URL is the shared fromdonna-composio-proxy /mcp endpoint (not connect.composio.dev).
+# - Header is a per-user Bearer minted by the gateway at /bootstrap
+#   (FROMDONNA_COMPOSIO_MCP_TOKEN), not COMPOSIO_API_KEY.
+# - Hermes auto-includes every mcp_servers.* name into platform toolsets
+#   (include_default_mcp_servers=true) — same as a normal Hermes install.
+# Token is injected as env at bootstrap; ${…} is expanded by Hermes MCP loader.
+mcp_servers:
+  composio:
+    url: "https://fromdonna-composio-proxy.code-df4.workers.dev/mcp"
+    headers:
+      Authorization: "Bearer ${FROMDONNA_COMPOSIO_MCP_TOKEN}"
+    connect_timeout: 60
+    timeout: 180
+    # Composio/proxy answers streamable HTTP over POST; HEAD/GET preflight can mis-detect.
+    skip_preflight: true
+
 # Web research: Exa by default. Real EXA_API_KEY lives on fromdonna-api-proxy;
 # sandbox gets EXA_API_KEY=STUB + EXA_BASE_URL={api-proxy}/v1/exa (bootstrap/create).
 web:

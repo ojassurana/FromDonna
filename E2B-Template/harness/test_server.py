@@ -234,3 +234,52 @@ def test_success_without_a_created_session_is_not_silently_continued(monkeypatch
 
     assert exc.value.status_code == 502
     assert exc.value.detail == "agent_session_not_persisted"
+
+
+def test_apply_composio_mcp_writes_official_hermes_shape(monkeypatch, tmp_path):
+    """Composio is wired as stock Hermes mcp_servers.composio (env Bearer)."""
+    import os
+
+    hermes = tmp_path / ".hermes"
+    hermes.mkdir()
+    # Seed baked-style config like the E2B template.
+    (hermes / "config.yaml").write_text(
+        "model:\n  default: grok-4.5\nplatform_toolsets:\n  telegram:\n    - hermes-cli\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(server, "HERMES_HOME", hermes)
+    monkeypatch.delenv("FROMDONNA_COMPOSIO_MCP_TOKEN", raising=False)
+    monkeypatch.delenv("FROMDONNA_COMPOSIO_MCP_URL", raising=False)
+
+    mcp = server.ComposioMcpBootstrap(
+        url="https://fromdonna-composio-proxy.code-df4.workers.dev/mcp",
+        token="t" * 32,
+        toolkits=["gmail", "github"],
+    )
+    server._apply_composio_mcp(mcp)
+
+    assert os.environ["FROMDONNA_COMPOSIO_MCP_TOKEN"] == "t" * 32
+    assert os.environ["FROMDONNA_COMPOSIO_MCP_URL"].endswith("/mcp")
+    assert os.environ["FROMDONNA_COMPOSIO_TOOLKITS"] == "gmail,github"
+
+    import yaml
+
+    cfg = yaml.safe_load((hermes / "config.yaml").read_text(encoding="utf-8"))
+    entry = cfg["mcp_servers"]["composio"]
+    # Official Hermes fields
+    assert entry["url"].endswith("/mcp")
+    assert entry["connect_timeout"] == 60
+    assert entry["timeout"] == 180
+    assert entry["skip_preflight"] is True
+    # Token via ${…} interpolation (not baked into the yaml as a secret)
+    assert entry["headers"]["Authorization"] == "Bearer ${FROMDONNA_COMPOSIO_MCP_TOKEN}"
+    # Existing config preserved
+    assert cfg["model"]["default"] == "grok-4.5"
+    assert server._composio_mcp_ready() is True
+
+
+def test_composio_mcp_not_ready_without_token(monkeypatch, tmp_path):
+    monkeypatch.setattr(server, "HERMES_HOME", tmp_path / ".hermes")
+    monkeypatch.delenv("FROMDONNA_COMPOSIO_MCP_TOKEN", raising=False)
+    monkeypatch.delenv("FROMDONNA_COMPOSIO_MCP_URL", raising=False)
+    assert server._composio_mcp_ready() is False
