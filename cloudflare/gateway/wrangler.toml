@@ -1,6 +1,5 @@
-# Live Telegram webhook + sandboxes use this workers.dev name (not fromdonna-gateway).
-# Deploying as fromdonna-gateway leaves Composio mint on a worker Telegram never hits.
-name = "fromdonna-telegram-gateway"
+# Channel-agnostic edge Worker (Telegram first; other channels later).
+name = "fromdonna-gateway"
 main = "src/index.ts"
 compatibility_date = "2026-07-13"
 # Free plan: no custom cpu_ms. Hermes turns run via waitUntil after the channel is ACKed.

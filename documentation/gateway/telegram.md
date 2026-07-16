@@ -31,7 +31,7 @@ Source: `cloudflare/gateway/`
 
 | Piece | Value |
 |-------|--------|
-| Gateway Worker (live) | `https://fromdonna-telegram-gateway.code-df4.workers.dev` |
+| Gateway Worker | `https://fromdonna-gateway.code-df4.workers.dev` |
 | Webhook | `POST /telegram/webhook` |
 | Health | `GET /health` |
 | D1 database | `fromdonna-routing` (`FROMDONNA_ROUTING` binding) |

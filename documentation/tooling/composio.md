@@ -165,9 +165,8 @@ Internal auth secret: `COMPOSIO_SESSION_SECRET` (or fallbacks documented in `env
 | Secret | Worker |
 |--------|--------|
 | `COMPOSIO_API_KEY` | **composio-proxy only** |
-| `COMPOSIO_SESSION_SECRET` | composio-proxy **and** live Telegram gateway (shared HMAC) |
+| `COMPOSIO_SESSION_SECRET` | composio-proxy **and** `fromdonna-gateway` (shared HMAC) |
 
-Live Telegram Worker name: **`fromdonna-telegram-gateway`** (repo `wrangler.toml` must match).  
 Both Workers need the **same** `COMPOSIO_SESSION_SECRET` or mint returns 401 and sandboxes stay `composio_mcp_ready: false`.
 
 Never put either secret in E2B template, git, or llm/api-proxy.
@@ -181,9 +180,9 @@ npx wrangler secret put COMPOSIO_API_KEY
 npx wrangler secret put COMPOSIO_SESSION_SECRET   # same value as gateway
 npx wrangler deploy
 
-# 2) live Telegram gateway + D1
+# 2) channel-agnostic gateway + D1
 cd ../gateway
-# name = fromdonna-telegram-gateway
+# name = fromdonna-gateway
 npx wrangler secret put COMPOSIO_SESSION_SECRET   # same value as proxy
 npx wrangler d1 migrations apply fromdonna-routing --remote
 npx wrangler deploy
