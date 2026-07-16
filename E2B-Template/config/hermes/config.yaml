@@ -15,8 +15,22 @@ providers:
     api_mode: chat_completions
 
 display:
-  streaming: false
+  streaming: false   # CLI terminal only — does not control Telegram
   tool_progress: false
+  # Telegram DMs: keep platform default streaming on once master switch is on.
+  platforms:
+    telegram:
+      streaming: true
+
+# Real-time replies on messaging platforms.
+# transport: auto → Telegram DMs use official Bot API sendMessageDraft
+# (animated in-place preview); groups fall back to editMessageText.
+# Docs: hermes user-guide/messaging/telegram.md (streaming)
+streaming:
+  enabled: true
+  transport: auto
+  edit_interval: 0.8
+  buffer_threshold: 24
 
 # Dangerous-command approvals (official Hermes approvals block).
 # FromDonna sandboxes are single-user isolated VMs — auto-approve by default

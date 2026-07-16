@@ -91,6 +91,11 @@ const BLOCKED_METHODS = new Set([
 /** Methods that include a chat_id we force-bind to the routed user. */
 const CHAT_SCOPED_METHODS = new Set([
   "sendmessage",
+  // Bot API 9.5+ native animated draft streaming (Hermes transport: auto/draft)
+  "sendmessagedraft",
+  // Bot API 10.1 rich final / rich draft (used when rich path is active)
+  "sendrichmessage",
+  "sendrichmessagedraft",
   "sendphoto",
   "senddocument",
   "sendaudio",

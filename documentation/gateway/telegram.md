@@ -1,5 +1,20 @@
 # Telegram channel (gateway Worker)
 
+## Outbound delivery mode
+
+Sandbox Hermes uses **native Telegram draft streaming** for DMs:
+
+| Setting | Value |
+|---------|--------|
+| `streaming.enabled` | `true` (baked in template `config/hermes/config.yaml`) |
+| `streaming.transport` | `auto` → **`sendMessageDraft`** in private chats (official animated preview) |
+| Groups / topics | Fall back to edit-based progressive updates (Telegram does not support drafts there) |
+| Final message | Normal `sendMessage` (draft is ephemeral until finalized) |
+
+API surface: [Bot API `sendMessageDraft`](https://core.telegram.org/bots/api#sendmessagedraft) (Bot API 9.5+). Same non-zero `draft_id` updates animate in place on clients.
+
+Gateway Bot API proxy allowlists `sendMessageDraft` / rich draft methods under chat-scoped binding (`bot_api_proxy.ts`).
+
 ## Scope
 
 Telegram-specific adapter on the **shared Cloudflare Worker** (see [gateway.md](./gateway.md)).
