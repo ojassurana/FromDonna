@@ -444,11 +444,53 @@ async function bootstrapHarness(
     );
   }
 
-  const mintAttempts: Array<{ forceNewComposioSession?: boolean }> = [
-    {},
-    { forceNewComposioSession: true },
-    { forceNewComposioSession: true },
-  ];
+  // Fast path for per-message inject: already wired — still refresh telegram proxy,
+  // but skip expensive mint+require if Composio is already live.
+  if (!requireComposio) {
+    const prior = await fetchHarnessHealth(env, row.runtime_id, row.runtime_domain);
+    if (prior?.composio_mcp_ready === true && prior?.telegram_proxy_ready === true) {
+      // Still re-mint Composio when possible (token refresh) but never fail the turn.
+      const soft = await mintComposioMcpAccess(env, row.user_id, row.runtime_id);
+      const url = `${harnessBaseUrl(env, row.runtime_id, row.runtime_domain)}/bootstrap`;
+      const response = await fetch(url, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          secret: required(env, "WORKER_TO_HARNESS_SECRET"),
+          workerUrl: base,
+          userId: row.user_id,
+          telegramProxy: {
+            token: proxyToken,
+            baseUrl: `${base}/telegram-bot-api/bot`,
+            baseFileUrl: `${base}/telegram-bot-api/file/bot`,
+            userId: row.user_id,
+            chatId: row.gateway_conversation_id,
+            gatewayUserId: row.gateway_user_id,
+          },
+          ...(soft
+            ? {
+                composioMcp: {
+                  url: soft.mcp_url,
+                  token: soft.mcp_token,
+                  toolkits: soft.toolkits,
+                },
+              }
+            : {}),
+        }),
+      });
+      if (!response.ok) {
+        const detail = await response.text().catch(() => "");
+        throw new Error(
+          `Harness bootstrap failed with HTTP ${response.status}${detail ? `: ${detail.slice(0, 200)}` : ""}`,
+        );
+      }
+      return;
+    }
+  }
+
+  const mintAttempts: Array<{ forceNewComposioSession?: boolean }> = requireComposio
+    ? [{}, { forceNewComposioSession: true }, { forceNewComposioSession: true }]
+    : [{}, { forceNewComposioSession: true }];
 
   let lastError = "composio mint failed";
   for (let attempt = 0; attempt < mintAttempts.length; attempt++) {
@@ -464,6 +506,10 @@ async function bootstrapHarness(
         `composio mint returned null (attempt ${attempt + 1}/${mintAttempts.length}); ` +
         `check COMPOSIO_SESSION_SECRET match on gateway+composio-proxy and COMPOSIO_API_KEY on proxy`;
       console.error(lastError);
+      // Without Composio: still try telegram-only bootstrap when not required.
+      if (!requireComposio) {
+        break;
+      }
       continue;
     }
     console.log(
@@ -498,6 +544,10 @@ async function bootstrapHarness(
       const detail = await response.text().catch(() => "");
       lastError = `Harness bootstrap failed with HTTP ${response.status}${detail ? `: ${detail.slice(0, 200)}` : ""}`;
       console.error(lastError);
+      // Inject path: telegram-only retry if composio apply rejected.
+      if (!requireComposio && detail.includes("composio")) {
+        break;
+      }
       continue;
     }
 
@@ -526,13 +576,40 @@ async function bootstrapHarness(
     console.error(lastError);
   }
 
-  if (requireComposio) {
-    throw new Error(
-      `Composio MCP not ready for ${row.user_id} after retries: ${lastError}`,
+  // Telegram-only bootstrap (inject path when Composio is unavailable).
+  if (!requireComposio) {
+    const url = `${harnessBaseUrl(env, row.runtime_id, row.runtime_domain)}/bootstrap`;
+    const response = await fetch(url, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        secret: required(env, "WORKER_TO_HARNESS_SECRET"),
+        workerUrl: base,
+        userId: row.user_id,
+        telegramProxy: {
+          token: proxyToken,
+          baseUrl: `${base}/telegram-bot-api/bot`,
+          baseFileUrl: `${base}/telegram-bot-api/file/bot`,
+          userId: row.user_id,
+          chatId: row.gateway_conversation_id,
+          gatewayUserId: row.gateway_user_id,
+        },
+      }),
+    });
+    if (!response.ok) {
+      const detail = await response.text().catch(() => "");
+      throw new Error(
+        `Harness bootstrap failed with HTTP ${response.status}${detail ? `: ${detail.slice(0, 200)}` : ""}`,
+      );
+    }
+    console.error(
+      `composio MCP NOT injected for ${row.user_id} (requireComposio=false) — ${lastError}`,
     );
+    return;
   }
-  console.error(
-    `composio MCP NOT injected for ${row.user_id} (requireComposio=false) — ${lastError}`,
+
+  throw new Error(
+    `Composio MCP not ready for ${row.user_id} after retries: ${lastError}`,
   );
 }
 
@@ -776,8 +853,10 @@ async function injectTelegramUpdate(env: Env, row: UserAgentRow, update: Telegra
         // fall through to inject on the new box
       } else {
         // Pause→resume: wait for harness, then re-bootstrap proxy + start gateway.
+        // requireComposio:false — per-message path must not 500 the whole turn if
+        // Composio mint is slow/down; chat still works. Provision still hard-requires it.
         await waitForHarness(env, current.runtime_id, current.runtime_domain, 90);
-        await bootstrapHarness(env, current);
+        await bootstrapHarness(env, current, { requireComposio: false });
         // Capture prior turn's staged checkpoint before this turn overwrites state.
         await pullCheckpointOnce(env, current);
       }
@@ -787,7 +866,7 @@ async function injectTelegramUpdate(env: Env, row: UserAgentRow, update: Telegra
         const detail = await response.text().catch(() => "");
         lastError = `Sandbox telegram inject failed with HTTP ${response.status}${detail ? `: ${detail.slice(0, 300)}` : ""}`;
         // One soft retry on same box after re-bootstrap (stale gateway thread / lock).
-        await bootstrapHarness(env, current);
+        await bootstrapHarness(env, current, { requireComposio: false });
         response = await postTelegramUpdate(env, current, update);
         if (!response.ok) {
           const detail2 = await response.text().catch(() => "");

@@ -120,6 +120,15 @@ Note: the success path is quiet; `console.error` surfaces failures (harness HTTP
 
 Full Telegram Worker↔sandbox auth model: [telegram-auth.md](./telegram-auth.md).
 
+**Always put matching secrets on every Worker that verifies them** — partial rotate = 401 / “Something went wrong”.
+
+| Secret | Workers that must share the **same** value |
+|--------|-----------------------------------------------|
+| `LLM_CAPABILITY_SECRET` | `fromdonna-gateway` **and** `fromdonna-llm-proxy` |
+| `COMPOSIO_SESSION_SECRET` | `fromdonna-gateway` **and** `fromdonna-composio-proxy` |
+| `WORKER_TO_HARNESS_SECRET` | gateway only (existing sandboxes need re-bootstrap / recreate) |
+| `TELEGRAM_BOT_TOKEN` / `TELEGRAM_WEBHOOK_SECRET` | gateway; re-`setWebhook` after webhook secret change |
+
 ```bash
 cd ~/FromDonna/cloudflare/gateway
 
@@ -134,11 +143,27 @@ printf '%s' 'NEW_WEBHOOK_SECRET' | npx wrangler secret put TELEGRAM_WEBHOOK_SECR
 # Leak of this secret = treat Telegram bridge as compromised until rotated + sandboxes recreated.
 printf '%s' 'NEW_HARNESS_SECRET' | npx wrangler secret put WORKER_TO_HARNESS_SECRET
 
+# LLM capability HMAC — gateway mints, llm-proxy verifies. BOTH must match.
+printf '%s' 'NEW_LLM_CAPABILITY_SECRET' | npx wrangler secret put LLM_CAPABILITY_SECRET
+cd ../llm-proxy && printf '%s' 'NEW_LLM_CAPABILITY_SECRET' | npx wrangler secret put LLM_CAPABILITY_SECRET
+
 # Composio session HMAC — must match on gateway AND composio-proxy.
 # Rotating invalidates all Hermes MCP capability Bearers (users re-mint on next bootstrap).
+cd ../gateway
 printf '%s' 'NEW_COMPOSIO_SESSION_SECRET' | npx wrangler secret put COMPOSIO_SESSION_SECRET
-# then: cd ../composio-proxy && same secret put COMPOSIO_SESSION_SECRET && npx wrangler deploy
+cd ../composio-proxy && printf '%s' 'NEW_COMPOSIO_SESSION_SECRET' | npx wrangler secret put COMPOSIO_SESSION_SECRET
 ```
+
+### Symptom: “Something went wrong on my side…”
+
+Gateway catch-all when inject/bootstrap throws. Common causes:
+
+1. **`LLM_CAPABILITY_SECRET` mismatch** (gateway mint vs llm-proxy verify) → Hermes 401 on every turn  
+2. **Per-message bootstrap hard-failing Composio** (fixed: inject uses `requireComposio:false`; only provision hard-requires)  
+3. Dead sandbox + replaceRuntime failure  
+
+Check: `npx wrangler tail fromdonna-gateway` and sandbox `~/.hermes/logs/agent.log` for `invalid_capability_token` / `composio`.
+
 
 Never commit secrets. Prefer `wrangler secret put` / env injection; do not paste into docs or git.
 
