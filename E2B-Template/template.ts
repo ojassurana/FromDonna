@@ -28,10 +28,12 @@ export const template = Template()
   .copy("extensions/plugins", "/home/user/.hermes/plugins")
   .copy("config/hermes/config.yaml", "/home/user/.hermes/config.yaml")
   .copy("config/hermes/SOUL.md", "/home/user/.hermes/SOUL.md")
-  // messaging: TelegramAdapter; exa: official web_search/web_extract backend.
+  // messaging: TelegramAdapter; exa: web_search; mcp: Hermes MCP client
+  // (required for Composio mcp_servers.composio — without the `mcp` extra,
+  // discover_mcp_tools is a no-op and Gmail connect tools never appear).
   .runCmd(
     "uv venv /home/user/venv --python python3 && " +
-      "uv pip install --python /home/user/venv/bin/python '/opt/fromdonna/hermes[messaging,exa]' && " +
+      "uv pip install --python /home/user/venv/bin/python '/opt/fromdonna/hermes[messaging,exa,mcp]' && " +
       "mkdir -p /home/user/workspace",
   )
   .setStartCmd(
