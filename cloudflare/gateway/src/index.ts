@@ -15,7 +15,6 @@ import {
   putCheckpoint,
 } from "./checkpoint";
 import { ensureUserComposio, mintComposioMcpAccess } from "./composio";
-import { runFirstDmProvisionUx } from "./first_dm_ux";
 import { normalizeTelegramUpdate, type TelegramUpdate } from "./telegram";
 
 export interface Env {
@@ -102,40 +101,16 @@ async function mintLlmCapability(env: Env, userId: string): Promise<string> {
   return `${encodeBase64Url(payload)}.${encodeBase64Url(signature)}`;
 }
 
-/** Bot API call that returns parsed JSON (needed for message_id on sendMessage). */
-async function telegramCall(env: Env, method: string, body: Record<string, unknown>): Promise<unknown> {
+async function telegram(env: Env, method: string, body: Record<string, unknown>): Promise<void> {
   const response = await fetch(`https://api.telegram.org/bot${required(env, "TELEGRAM_BOT_TOKEN")}/${method}`, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify(body),
   });
-  const detail = await response.text().catch(() => "");
-  let payload: unknown = null;
-  if (detail) {
-    try {
-      payload = JSON.parse(detail) as unknown;
-    } catch {
-      payload = null;
-    }
+  if (!response.ok) {
+    const detail = await response.text().catch(() => "");
+    throw new Error(`Telegram ${method} failed with HTTP ${response.status}${detail ? `: ${detail.slice(0, 200)}` : ""}`);
   }
-  const apiOk =
-    payload &&
-    typeof payload === "object" &&
-    (payload as { ok?: unknown }).ok === true;
-  if (!response.ok || !apiOk) {
-    const desc =
-      payload && typeof payload === "object" && typeof (payload as { description?: unknown }).description === "string"
-        ? String((payload as { description: string }).description)
-        : detail.slice(0, 200);
-    throw new Error(
-      `Telegram ${method} failed with HTTP ${response.status}${desc ? `: ${desc}` : ""}`,
-    );
-  }
-  return payload;
-}
-
-async function telegram(env: Env, method: string, body: Record<string, unknown>): Promise<void> {
-  await telegramCall(env, method, body);
 }
 
 async function createSandbox(env: Env, userId: string): Promise<E2bSandbox> {
@@ -864,33 +839,6 @@ async function processTelegramUpdate(
   const gatewayConversationId = event.conversationId;
 
   try {
-    // First DM only: claim → interview animation in parallel with provision →
-    // Donna welcome. Do NOT inject the bootstrap-triggering update (next message
-    // is the first real agent turn). Re-provision paths keep resolveReadyRow.
-    const existing = await lookup(env, gateway, gatewayUserId);
-    if (!existing) {
-      const claimed = await claimProvisioning(env, gateway, gatewayUserId, gatewayConversationId);
-      if (claimed) {
-        try {
-          await runFirstDmProvisionUx({
-            chatId: gatewayConversationId,
-            telegramCall: (method, body) => telegramCall(env, method, body),
-            provision: () => provision(env, gateway, gatewayUserId),
-          });
-        } catch (error) {
-          await markFailed(env, gateway, gatewayUserId).catch(() => {});
-          throw error;
-        }
-        return;
-      }
-      // Concurrent first messages: another isolate owns provision.
-      await telegram(env, "sendMessage", {
-        chat_id: gatewayConversationId,
-        text: "Setting up your private assistant — one moment, then send that again.",
-      });
-      return;
-    }
-
     const resolved = await resolveReadyRow(env, gateway, gatewayUserId, gatewayConversationId);
     if (resolved === "provisioning") {
       await telegram(env, "sendMessage", {

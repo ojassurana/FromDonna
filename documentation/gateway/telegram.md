@@ -71,23 +71,16 @@ Also: `LLM_CAPABILITY_SECRET` (HMAC for short-lived proxy tokens).
 
 ## User experience
 
-From the user side: **DM the bot → get a private Hermes**. No setup wizard, no “pick a sandbox.”
+From the user side: **DM the bot → get a private Hermes**. No setup, no “pick a sandbox,” no extra friction.
 
 1. User texts `@fromdonna_bot`
 2. Worker looks up their `(gateway, gateway_user_id)` identity in D1
-3. **First DM (no row)** — claim wins:
-   - Immediately send *Interviewing your new assistant. She’s hiring herself...* (dots animate via `editMessageText` while provision runs in parallel)
-   - Create E2B runtime → `/health` → `/bootstrap` → R2 restore if any → `ready`
-   - Delete the interview message → send Donna’s welcome monologue
-   - **Do not inject** that first update into Hermes (next message is the first agent turn)
-4. **Failed / stuck re-provision** → recreate runtime (no interview monologue)
-5. **Ready** → connect/resume → inject update into **official Hermes Telegram gateway** in the sandbox
-6. Hermes replies via **Worker Bot API proxy** (sandbox never holds the real bot token)
-7. After the agent session finishes → sandbox **stages** a checkpoint; Worker **pulls** it to R2 (Architecture B)
+3. **No row / failed** → create E2B runtime, `/health`, `/bootstrap`, **R2 restore if any**, mark `ready`
+4. **Ready** → connect/resume → inject update into **official Hermes Telegram gateway** in the sandbox
+5. Hermes replies via **Worker Bot API proxy** (sandbox never holds the real bot token)
+6. After the agent session finishes → sandbox **stages** a checkpoint; Worker **pulls** it to R2 (Architecture B)
 
-Concurrent first messages: only one request wins the D1 insert claim and owns the interview animation; others see `provisioning` and are asked to retry shortly. Failed provisions self-heal on the next message. Dead/broken runtimes use `replaceRuntime` (new box + restore + kill old).
-
-Source: `cloudflare/gateway/src/first_dm_ux.ts` + first-claim branch in `processTelegramUpdate`.
+Concurrent first messages: only one request wins the D1 insert claim; others see `provisioning` and are asked to retry shortly. Failed provisions self-heal on the next message. Dead/broken runtimes use `replaceRuntime` (new box + restore + kill old).
 
 ---
 
@@ -99,15 +92,10 @@ User DMs @fromdonna_bot
   → POST /telegram/webhook (secret header verified)
   → Worker ACKs Telegram immediately (ctx.waitUntil)
   → D1 lookup (gateway, gateway_user_id)
-       ├─ missing + claim wins → send interview loader (animate dots)
-       │                      → E2B create → /health → /bootstrap
+       ├─ missing / failed → claim → E2B create → /health → /bootstrap
        │                      → R2 restore (if any) → status=ready
-       │                      → delete loader → Donna welcome
-       │                      → STOP (no inject of first update)
-       ├─ missing + claim loses / provisioning → “send again” static notice
-       ├─ failed / stuck → reclaim → provision (no monologue) → inject
-       └─ ready → E2B connect (resume + TTL) → re-bootstrap if needed
-                → POST /telegram/update  (Bearer + x-llm-capability)
+       └─ ready             → E2B connect (resume + TTL) → re-bootstrap if needed
+  → POST /telegram/update  (Bearer + x-llm-capability)
   → Official Hermes TelegramAdapter.process_update
   → Outbound Telegram via Worker /telegram-bot-api/* proxy
   → (async) stage checkpoint → Worker harvest → R2
