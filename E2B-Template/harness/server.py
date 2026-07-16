@@ -991,12 +991,23 @@ def bootstrap(body: Bootstrap):
         api_proxy_url=api_proxy_url,
     )
 
+    composio_applied = False
     if body.composioMcp is not None:
         try:
             _apply_composio_mcp(body.composioMcp)
+            composio_applied = _composio_mcp_ready()
         except Exception as exc:
-            # Soft-fail: sandbox still usable without Composio MCP
             print(f"composio mcp bootstrap failed: {exc}", flush=True)
+            raise HTTPException(
+                status_code=502,
+                detail=f"composio_mcp_apply_failed: {exc}",
+            ) from exc
+        if not composio_applied:
+            # Do not lie to the gateway — body had token but env/config not live.
+            raise HTTPException(
+                status_code=502,
+                detail="composio_mcp_not_ready_after_apply",
+            )
 
     # System MEMORY pointer: connect-apps skill (idempotent; survives wipe).
     try:
@@ -1034,7 +1045,8 @@ def bootstrap(body: Bootstrap):
         "ok": True,
         "already": already,
         "telegram_proxy": bool(_telegram_proxy),
-        "composio_mcp": bool(body.composioMcp is not None),
+        # True only when token is live in env + config (not merely present in body).
+        "composio_mcp": composio_applied,
     }
 
 

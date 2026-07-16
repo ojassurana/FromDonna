@@ -169,6 +169,10 @@ Internal auth secret: `COMPOSIO_SESSION_SECRET` (or fallbacks documented in `env
 
 Both Workers need the **same** `COMPOSIO_SESSION_SECRET` or mint returns 401 and sandboxes stay `composio_mcp_ready: false`.
 
+### New-user guarantee (do not regress)
+
+Gateway `bootstrapHarness` **requires** harness `/health` → `composio_mcp_ready: true` before provision finishes (mint → inject → health check, with force-new retries). Harness `/bootstrap` returns `composio_mcp: true` only when the token is live in env + config — not merely present in the request body. If mint/inject fails, provisioning fails instead of marking the user ready without Gmail tools.
+
 Never put either secret in E2B template, git, or llm/api-proxy.
 
 ### Deploy order

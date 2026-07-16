@@ -173,6 +173,30 @@ async function killSandboxBestEffort(env: Env, sandboxId: string): Promise<void>
   }
 }
 
+type HarnessHealth = {
+  ok?: boolean;
+  auth_ready?: boolean;
+  telegram_proxy_ready?: boolean;
+  gateway_running?: boolean;
+  composio_mcp_ready?: boolean;
+};
+
+async function fetchHarnessHealth(
+  env: Env,
+  sandboxId: string,
+  domain: string | null | undefined,
+): Promise<HarnessHealth | null> {
+  try {
+    const response = await fetch(`${harnessBaseUrl(env, sandboxId, domain)}/health`, {
+      method: "GET",
+    });
+    if (!response.ok) return null;
+    return (await response.json()) as HarnessHealth;
+  } catch {
+    return null;
+  }
+}
+
 async function waitForHarness(env: Env, sandboxId: string, domain: string | null | undefined, attempts = 90): Promise<void> {
   const url = `${harnessBaseUrl(env, sandboxId, domain)}/health`;
   let lastError = "harness not ready";
@@ -393,10 +417,17 @@ async function restoreCheckpointToRuntime(
   }
 }
 
+/**
+ * Mint Composio MCP access and bootstrap the harness.
+ * Product policy: do not mark a runtime "done" without composio_mcp_ready —
+ * otherwise "connect Gmail" has no tools and no login link.
+ */
 async function bootstrapHarness(
   env: Env,
   row: Pick<UserAgentRow, "user_id" | "gateway_user_id" | "gateway_conversation_id" | "runtime_id" | "runtime_domain">,
+  opts?: { requireComposio?: boolean },
 ): Promise<void> {
+  const requireComposio = opts?.requireComposio !== false;
   const proxyToken = await mintBotProxyToken(
     required(env, "WORKER_TO_HARNESS_SECRET"),
     row.user_id,
@@ -404,9 +435,6 @@ async function bootstrapHarness(
   );
   const base = workerPublicUrl(env);
 
-  // Composio: ensure forever user rules once; mint MCP access for this sandbox.
-  // Soft-fail: bootstrap still succeeds if composio-proxy is down — but we log hard
-  // so "tools aren't in my toolset" is diagnosable from wrangler tail.
   try {
     await ensureUserComposio(env, row.user_id);
   } catch (error) {
@@ -415,65 +443,97 @@ async function bootstrapHarness(
       error instanceof Error ? error.message : error,
     );
   }
-  let composioMcp = await mintComposioMcpAccess(env, row.user_id, row.runtime_id);
-  if (!composioMcp) {
-    // One force-new retry (stale sticky session / transient Composio API).
-    console.error(`composio mint returned null for ${row.user_id}; retrying force-new`);
-    composioMcp = await mintComposioMcpAccess(env, row.user_id, row.runtime_id, {
-      forceNewComposioSession: true,
-    });
-  }
-  if (!composioMcp) {
-    console.error(
-      `composio MCP NOT injected for ${row.user_id} — Hermes will have no Gmail/Drive tools. ` +
-        `Check COMPOSIO_SESSION_SECRET match on gateway+composio-proxy and COMPOSIO_API_KEY on proxy.`,
+
+  const mintAttempts: Array<{ forceNewComposioSession?: boolean }> = [
+    {},
+    { forceNewComposioSession: true },
+    { forceNewComposioSession: true },
+  ];
+
+  let lastError = "composio mint failed";
+  for (let attempt = 0; attempt < mintAttempts.length; attempt++) {
+    const mintOpts = mintAttempts[attempt];
+    let composioMcp = await mintComposioMcpAccess(
+      env,
+      row.user_id,
+      row.runtime_id,
+      mintOpts,
     );
-  } else {
+    if (!composioMcp) {
+      lastError =
+        `composio mint returned null (attempt ${attempt + 1}/${mintAttempts.length}); ` +
+        `check COMPOSIO_SESSION_SECRET match on gateway+composio-proxy and COMPOSIO_API_KEY on proxy`;
+      console.error(lastError);
+      continue;
+    }
     console.log(
       `composio MCP minted for ${row.user_id} toolkits=${(composioMcp.toolkits || []).join(",")} ` +
-        `reused=${!!composioMcp.reused_composio_session}`,
+        `reused=${!!composioMcp.reused_composio_session} attempt=${attempt + 1}`,
     );
+
+    const url = `${harnessBaseUrl(env, row.runtime_id, row.runtime_domain)}/bootstrap`;
+    const response = await fetch(url, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        secret: required(env, "WORKER_TO_HARNESS_SECRET"),
+        workerUrl: base,
+        userId: row.user_id,
+        telegramProxy: {
+          token: proxyToken,
+          baseUrl: `${base}/telegram-bot-api/bot`,
+          baseFileUrl: `${base}/telegram-bot-api/file/bot`,
+          userId: row.user_id,
+          chatId: row.gateway_conversation_id,
+          gatewayUserId: row.gateway_user_id,
+        },
+        composioMcp: {
+          url: composioMcp.mcp_url,
+          token: composioMcp.mcp_token,
+          toolkits: composioMcp.toolkits,
+        },
+      }),
+    });
+    if (!response.ok) {
+      const detail = await response.text().catch(() => "");
+      lastError = `Harness bootstrap failed with HTTP ${response.status}${detail ? `: ${detail.slice(0, 200)}` : ""}`;
+      console.error(lastError);
+      continue;
+    }
+
+    let bodyComposio = false;
+    try {
+      const body = (await response.json()) as { composio_mcp?: boolean };
+      bodyComposio = body?.composio_mcp === true;
+    } catch {
+      // non-JSON — fall through to health check
+    }
+
+    // Source of truth: harness health (env token + config block live).
+    const health = await fetchHarnessHealth(env, row.runtime_id, row.runtime_domain);
+    if (health?.composio_mcp_ready === true) {
+      if (!bodyComposio) {
+        console.log(
+          `composio: health ready for ${row.user_id} (bootstrap body omitted composio_mcp flag)`,
+        );
+      }
+      return;
+    }
+
+    lastError =
+      `composio_mcp_ready still false after bootstrap attempt ${attempt + 1} ` +
+      `for ${row.user_id} (body_composio=${bodyComposio}, health=${JSON.stringify(health)})`;
+    console.error(lastError);
   }
 
-  const url = `${harnessBaseUrl(env, row.runtime_id, row.runtime_domain)}/bootstrap`;
-  const response = await fetch(url, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({
-      secret: required(env, "WORKER_TO_HARNESS_SECRET"),
-      workerUrl: base,
-      userId: row.user_id,
-      telegramProxy: {
-        token: proxyToken,
-        baseUrl: `${base}/telegram-bot-api/bot`,
-        baseFileUrl: `${base}/telegram-bot-api/file/bot`,
-        userId: row.user_id,
-        chatId: row.gateway_conversation_id,
-        gatewayUserId: row.gateway_user_id,
-      },
-      ...(composioMcp
-        ? {
-            composioMcp: {
-              url: composioMcp.mcp_url,
-              token: composioMcp.mcp_token,
-              toolkits: composioMcp.toolkits,
-            },
-          }
-        : {}),
-    }),
-  });
-  if (!response.ok) {
-    const detail = await response.text().catch(() => "");
-    throw new Error(`Harness bootstrap failed with HTTP ${response.status}${detail ? `: ${detail.slice(0, 200)}` : ""}`);
+  if (requireComposio) {
+    throw new Error(
+      `Composio MCP not ready for ${row.user_id} after retries: ${lastError}`,
+    );
   }
-  try {
-    const body = (await response.json()) as { composio_mcp?: boolean };
-    if (composioMcp && body?.composio_mcp === false) {
-      console.error(`composio: harness accepted bootstrap but composio_mcp=false for ${row.user_id}`);
-    }
-  } catch {
-    // non-JSON ok
-  }
+  console.error(
+    `composio MCP NOT injected for ${row.user_id} (requireComposio=false) — ${lastError}`,
+  );
 }
 
 async function lookup(env: Env, gateway: string, gatewayUserId: string): Promise<UserAgentRow | null> {
