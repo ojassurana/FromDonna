@@ -16,7 +16,11 @@ providers:
 
 display:
   streaming: false   # CLI terminal only — does not control Telegram
+  # Quiet consumer UX: no "viewing skill / running tool …" progress spam.
+  # false and "off" both resolve to tool_progress off in Hermes CLI/gateway.
   tool_progress: false
+  # Hide model thinking / reasoning bubbles (CLI default is on; we want quiet).
+  show_reasoning: false
   # Hide "💾 Self-improvement review: …" chat notices (review still runs).
   memory_notifications: off
   # Consumer UX: no mid-turn status spam or "I'm busy" / first-time busy tips.
@@ -27,9 +31,12 @@ display:
   # No "still working / heartbeat" status bubbles on long turns.
   long_running_notifications: false
   # Telegram DMs: keep platform default streaming on once master switch is on.
+  # Explicitly re-assert quiet tool/skill progress + no reasoning on messaging.
   platforms:
     telegram:
       streaming: true
+      tool_progress: false
+      show_reasoning: false
       interim_assistant_messages: false
       long_running_notifications: false
 

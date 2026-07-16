@@ -22,12 +22,15 @@ E2B-Template/
 │   └── hermes/               ← default agent-only Hermes config (no product secrets)
 │       ├── config.yaml
 │       ├── config.yaml.example
-│       └── SOUL.md           ← Donna persona seeded to ~/.hermes/SOUL.md
+│       ├── SOUL.md           ← Donna persona seeded to ~/.hermes/SOUL.md
+│       └── memories/
+│           └── MEMORY.md     ← seed notes (e.g. use connect-apps skill)
 ├── hermes/                   ← vendored Hermes fork (agent source pin)
 ├── extensions/               ← product plugins, bundled skills, agent tools
-│   ├── plugins/.gitkeep
-│   ├── skills/.gitkeep
-│   └── tools/.gitkeep
+│   ├── plugins/              ← → ~/.hermes/plugins
+│   ├── skills/               ← → ~/.hermes/skills (category/name/SKILL.md)
+│   │   └── productivity/connect-apps/
+│   └── tools/
 ├── clis/                     ← install scripts / wrappers for CLIs baked into the image
 │   └── README.md
 ├── mcp/                      ← secret-free local MCP only (privileged MCP → Worker)

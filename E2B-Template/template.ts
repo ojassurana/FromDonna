@@ -26,8 +26,16 @@ export const template = Template()
   .copy("hermes", "/opt/fromdonna/hermes")
   .copy("harness", "/opt/fromdonna/harness")
   .copy("extensions/plugins", "/home/user/.hermes/plugins")
+  // Product skills → Hermes primary skills tree (scanned as ~/.hermes/skills/).
+  // Layout: <category>/<skill-name>/SKILL.md (Hermes progressive skill_view load).
+  .copy("extensions/skills", "/home/user/.hermes/skills")
   .copy("config/hermes/config.yaml", "/home/user/.hermes/config.yaml")
   .copy("config/hermes/SOUL.md", "/home/user/.hermes/SOUL.md")
+  // Seed agent notes (not persona). Points at connect-apps skill for OAuth.
+  .copy(
+    "config/hermes/memories/MEMORY.md",
+    "/home/user/.hermes/memories/MEMORY.md",
+  )
   // messaging: TelegramAdapter; exa: web_search; mcp: Hermes MCP client
   // (required for Composio mcp_servers.composio — without the `mcp` extra,
   // discover_mcp_tools is a no-op and Gmail connect tools never appear).

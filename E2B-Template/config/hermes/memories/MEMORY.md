@@ -1,0 +1,1 @@
+App connect (Gmail, Drive, Calendar, Sheets, Docs, GitHub, Notion, LinkedIn, Dropbox, Splitwise, Outlook, Dropbox Sign): always load skill `connect-apps` with skill_view and follow it. Composio MCP allowlist only — no other OAuth connectors for this Hermes.
