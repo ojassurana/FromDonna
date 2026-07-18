@@ -88,7 +88,7 @@ There is a **gateway ops UI** that records each inbound Telegram turn and its st
 
 | | |
 |--|--|
-| **UI** | `https://fromdonna-gateway.code-df4.workers.dev/admin/turns` |
+| **UI** | `https://dashboard.fromdonna.com/admin/turns` (also `https://fromdonna-gateway.code-df4.workers.dev/admin/turns`) |
 | **Auth** | `WORKER_TO_HARNESS_SECRET` as Bearer, or `?token=` once (sessionStorage) |
 | **Storage** | D1 tables `message_turns` + `message_turn_events` (7-day retention) |
 | **Migration** | `cloudflare/gateway/migrations/0006_message_turns.sql` |

@@ -1185,6 +1185,15 @@ export default {
         return json({ ok: true, service: "fromdonna-gateway", mode: "channel-agnostic" });
       }
 
+      // Ops host convenience: dashboard.fromdonna.com/ → /admin/turns
+      if (
+        request.method === "GET" &&
+        (url.pathname === "/" || url.pathname === "") &&
+        url.hostname === "dashboard.fromdonna.com"
+      ) {
+        return Response.redirect(`${url.origin}/admin/turns`, 302);
+      }
+
       // Ops: message-flow dashboard + JSON API (auth via harness secret / ?token=).
       const adminTurns = await handleAdminTurns(request, env, url);
       if (adminTurns) return adminTurns;
