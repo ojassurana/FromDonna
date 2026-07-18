@@ -63,7 +63,9 @@ composio-proxy Worker
 | Toolkit allowlist | D1 `user_composio.toolkits_json` | Forever (product policy) |
 | Sticky tool-router session id (`trs_…`) | D1 `user_composio.composio_session_id` | Until force-new / recreate |
 | Sticky Composio MCP URL | D1 `user_composio.composio_mcp_url` | Same as session |
-| MCP **capability Bearer** | Hermes `~/.hermes/config.yaml` on the sandbox (not D1) | **30 days** default; re-minted on gateway **bootstrap** |
+| MCP **capability Bearer** | Harness **process env** `FROMDONNA_COMPOSIO_MCP_TOKEN` (not D1; **not** a literal secret in yaml) | **30 days** default claim TTL; re-minted on gateway **bootstrap** |
+
+**Bearer placement (do not misread the yaml):** Hermes `~/.hermes/config.yaml` stores only a placeholder — `Authorization: "Bearer ${FROMDONNA_COMPOSIO_MCP_TOKEN}"`. The real token is set in the **harness process environment** on `/bootstrap` (`FROMDONNA_COMPOSIO_MCP_TOKEN` + `FROMDONNA_COMPOSIO_MCP_URL`). It is **process-env only** (not written to `.env` or disk); a harness restart drops it until the next gateway bootstrap re-mints and re-injects.
 
 Migrations: `cloudflare/gateway/migrations/0004_user_composio.sql`, `0005_user_composio_session_sticky.sql`.
 
@@ -165,15 +167,31 @@ Internal auth secret: `COMPOSIO_SESSION_SECRET` (or fallbacks documented in `env
 | Secret | Worker |
 |--------|--------|
 | `COMPOSIO_API_KEY` | **composio-proxy only** |
-| `COMPOSIO_SESSION_SECRET` | composio-proxy **and** `fromdonna-gateway` (shared HMAC) |
+| `COMPOSIO_SESSION_SECRET` | composio-proxy **and** `fromdonna-gateway` (shared HMAC + internal auth) |
 
-Both Workers need the **same** `COMPOSIO_SESSION_SECRET` or mint returns 401 and sandboxes stay `composio_mcp_ready: false`.
+Both Workers need the **same** `COMPOSIO_SESSION_SECRET` or mint returns **401** and sandboxes stay `composio_mcp_ready: false`. A mint **401 is almost always a secret mismatch** (gateway vs proxy), **not** a “stale Composio session” — sticky `trs_` reuse is a separate path; do not force-new / wipe sessions as the first fix for 401.
+
+> **Warning — `INTERNAL_AUTH_SECRET` footgun**
+>
+> Proxy internal auth may accept **any configured candidate** secret after the multi-candidate fix (`INTERNAL_AUTH_SECRET` → `COMPOSIO_SESSION_SECRET` → `WORKER_TO_HARNESS_SECRET` on the proxy). Gateway presents `COMPOSIO_SESSION_SECRET` (then `WORKER_TO_HARNESS_SECRET`) via `x-fromdonna-internal` — it does **not** read `INTERNAL_AUTH_SECRET`.
+>
+> **Recommended config:** set the **same** `COMPOSIO_SESSION_SECRET` on gateway **and** composio-proxy, and **do not set** `INTERNAL_AUTH_SECRET` on the proxy unless you intentionally align it to that same value. Setting `INTERNAL_AUTH_SECRET` to a *different* value than gateway’s `COMPOSIO_SESSION_SECRET` is a classic split-brain that yields permanent mint 401s and empty Composio on sandboxes.
+
+Never put either secret in E2B template, git, or llm/api-proxy.
 
 ### New-user guarantee (do not regress)
 
-Gateway `bootstrapHarness` **requires** harness `/health` → `composio_mcp_ready: true` before provision finishes (mint → inject → health check, with force-new retries). Harness `/bootstrap` returns `composio_mcp: true` only when the token is live in env + config — not merely present in the request body. If mint/inject fails, provisioning fails instead of marking the user ready without Gmail tools.
+**Restored product policy** (hard vs soft — do not blur):
 
-Never put either secret in E2B template, git, or llm/api-proxy.
+| Call site | `requireComposio` | On mint/inject / health miss |
+|-----------|-------------------|------------------------------|
+| **Provision** (first sandbox) | **hard** (`true`) | Fail provision — do **not** mark D1 `ready` without Gmail tools |
+| **replaceRuntime** (recreate) | **hard** (`true`) | Fail replace — same bar as first provision |
+| **Per-message inject** (ready user) | **soft** (`false`) | Chat continues; log “composio MCP NOT injected…”; no user-facing hard error for transient glitches |
+
+Gateway provision / replaceRuntime **hard-require** harness `/health` → `composio_mcp_ready: true` before finishing (mint → inject → health check, with force-new retries where appropriate). Per-message bootstrap keeps Composio **soft-fail** so a transient mint blip does not brick chat.
+
+Harness `/bootstrap` reports `composio_mcp: true` only when the token is live in **process env** + config URL entry — not merely present in the request body.
 
 ### Deploy order
 

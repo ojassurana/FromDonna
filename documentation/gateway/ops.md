@@ -194,11 +194,22 @@ cd ../composio-proxy && printf '%s' 'NEW_COMPOSIO_SESSION_SECRET' | npx wrangler
 Gateway catch-all when inject/bootstrap throws. Common causes:
 
 1. **`LLM_CAPABILITY_SECRET` mismatch** (gateway mint vs llm-proxy verify) → Hermes 401 on every turn  
-2. **Per-message bootstrap hard-failing Composio** (fixed: inject uses `requireComposio:false`; only provision hard-requires)  
+2. **Provision / replaceRuntime hard-failing Composio** — product policy: provision + replaceRuntime **hard-require** harness `/health` → `composio_mcp_ready: true`. Per-message inject is **soft-fail** (`requireComposio: false`) so chat survives transient mint glitches; a soft miss does **not** produce this user-facing string. If new users never leave “Setting up…” / fail on first provision, check Composio mint + secrets (below), not the soft inject path.  
 3. Dead sandbox + replaceRuntime failure  
 
 Check: `npx wrangler tail fromdonna-gateway` and sandbox `~/.hermes/logs/agent.log` for `invalid_capability_token` / `composio`.
 
+### Symptom: Composio mint / internal session **401**
+
+**401 from composio-proxy `/internal/session` means secret mismatch (gateway ↔ proxy), not a stale sticky Composio session.**
+
+| Check | Action |
+|-------|--------|
+| Shared HMAC | Same `COMPOSIO_SESSION_SECRET` on `fromdonna-gateway` **and** `fromdonna-composio-proxy` |
+| Optional proxy override | Prefer **unset** `INTERNAL_AUTH_SECRET` on the proxy. If set, it must equal the gateway secret — a different value is a permanent 401 footgun (see [composio.md](../tooling/composio.md) §8) |
+| Sticky `trs_` | Only relevant **after** auth succeeds; force-new / wipe `user_composio` does **not** fix 401 |
+
+After aligning secrets: re-bootstrap (or re-provision) so harness env gets a fresh `FROMDONNA_COMPOSIO_MCP_TOKEN` and `/health` shows `composio_mcp_ready: true`.
 
 Never commit secrets. Prefer `wrangler secret put` / env injection; do not paste into docs or git.
 

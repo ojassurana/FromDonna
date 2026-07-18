@@ -3,3 +3,9 @@
 **/node_modules/
 **/__pycache__/
 *.pyc
+
+# Orchestration run bus (local only)
+.orchestrate/
+
+# Local composio session secret (never commit)
+.fromdonna_composio_session_secret
