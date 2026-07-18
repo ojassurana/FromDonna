@@ -199,6 +199,12 @@ Gateway catch-all when inject/bootstrap throws. Common causes:
 
 Check: `npx wrangler tail fromdonna-gateway` and sandbox `~/.hermes/logs/agent.log` for `invalid_capability_token` / `composio`.
 
+### Symptom: Composio mint returns null / provision fails with “Something went wrong…” after wipe
+
+If D1 turn errors show `mint HTTP 404: error code: 1042`, the gateway Worker is trying to `fetch()` the composio-proxy **public** `*.workers.dev` URL. Cloudflare blocks Worker→Worker over workers.dev with **error 1042**.
+
+**Fix:** gateway must call composio-proxy via **service binding** `COMPOSIO_PROXY` (`[[services]]` in `cloudflare/gateway/wrangler.toml`). Do not rely on `COMPOSIO_PROXY_URL` for in-Worker mint/connect.
+
 ### Symptom: Composio mint / internal session **401**
 
 **401 from composio-proxy `/internal/session` means secret mismatch (gateway ↔ proxy), not a stale sticky Composio session.**

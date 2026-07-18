@@ -10,6 +10,7 @@ Multi-user app connections (Gmail, Drive, GitHub, …) via **Composio**.
 |---------|------|
 | Connector buckets overview | [general.md](./general.md) |
 | Gateway bootstrap / mint | `cloudflare/gateway/src/composio.ts` |
+| Gateway → proxy | **Service binding** `COMPOSIO_PROXY` (not public `workers.dev` fetch — CF **1042**) |
 | Proxy Worker | `cloudflare/composio-proxy/` |
 | E2B harness apply | `E2B-Template/harness/server.py` (`composioMcp`) |
 | Agent notes | root `AGENTS.md` (Composio section) |

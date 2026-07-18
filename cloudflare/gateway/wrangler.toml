@@ -15,6 +15,12 @@ database_id = "51aa8d76-1d4d-4dff-ac00-7712dcf502bc"
 binding = "USER_STATE"
 bucket_name = "fromdonna-user-state"
 
+# Worker-to-worker: gateway mint/connect MUST use a service binding.
+# Fetching *.workers.dev from another Worker returns CF error 1042 (404).
+[[services]]
+binding = "COMPOSIO_PROXY"
+service = "fromdonna-composio-proxy"
+
 # Public runtime configuration. Secrets are provisioned separately.
 [vars]
 E2B_TEMPLATE = "fromdonna-hermes"

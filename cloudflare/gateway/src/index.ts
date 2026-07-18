@@ -14,7 +14,7 @@ import {
   handleCheckpointUpload,
   putCheckpoint,
 } from "./checkpoint";
-import { ensureUserComposio, mintComposioMcpAccess } from "./composio";
+import { ensureUserComposio, getLastComposioMintError, mintComposioMcpAccess } from "./composio";
 import { normalizeTelegramUpdate, type TelegramUpdate } from "./telegram";
 import {
   addTurnEvent,
@@ -41,6 +41,11 @@ export interface Env {
   COMPOSIO_SESSION_SECRET?: string;
   /** Optional; defaults to https://fromdonna-composio-proxy.code-df4.workers.dev */
   COMPOSIO_PROXY_URL?: string;
+  /**
+   * Service binding to fromdonna-composio-proxy (required for Worker→Worker mint).
+   * Public workers.dev fetch from this Worker returns CF 1042.
+   */
+  COMPOSIO_PROXY?: Fetcher;
 }
 
 type UserAgentRow = {
@@ -514,9 +519,9 @@ async function bootstrapHarness(
       mintOpts,
     );
     if (!composioMcp) {
+      const detail = getLastComposioMintError() || "unknown mint failure";
       lastError =
-        `composio mint returned null (attempt ${attempt + 1}/${mintAttempts.length}); ` +
-        `check COMPOSIO_SESSION_SECRET match on gateway+composio-proxy and COMPOSIO_API_KEY on proxy`;
+        `composio mint returned null (attempt ${attempt + 1}/${mintAttempts.length}): ${detail}`;
       console.error(lastError);
       // Without Composio: still try telegram-only bootstrap when not required.
       if (!requireComposio) {

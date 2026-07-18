@@ -9,9 +9,22 @@ export type ComposioEnv = {
   /** Optional dedicated secret; falls back to WORKER_TO_HARNESS_SECRET */
   COMPOSIO_SESSION_SECRET?: string;
   COMPOSIO_PROXY_URL?: string;
+  /** Service binding — preferred; avoids CF 1042 on workers.dev Worker→Worker fetch */
+  COMPOSIO_PROXY?: Fetcher;
 };
 
 const DEFAULT_COMPOSIO_PROXY = "https://fromdonna-composio-proxy.code-df4.workers.dev";
+
+/** Fetch composio-proxy via service binding when available (same-account Worker). */
+async function proxyFetch(env: ComposioEnv, path: string, init: RequestInit): Promise<Response> {
+  const p = path.startsWith("/") ? path : `/${path}`;
+  if (env.COMPOSIO_PROXY) {
+    // Service binding requires an absolute URL host; path/query is what the target sees.
+    return env.COMPOSIO_PROXY.fetch(new Request(`https://composio-proxy.internal${p}`, init));
+  }
+  const base = proxyBase(env);
+  return fetch(`${base}${p}`, init);
+}
 
 /** Keep in sync with cloudflare/composio-proxy/src/toolkits.ts (Composio Tool Router slugs). */
 export const DEFAULT_COMPOSIO_TOOLKITS = [
@@ -154,6 +167,17 @@ async function persistComposioSession(
     .run();
 }
 
+/** Last mint failure reason (for bootstrap error messages). Cleared on success. */
+let lastMintError = "";
+
+export function getLastComposioMintError(): string {
+  return lastMintError;
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
 /**
  * Mint production-duration MCP access for Hermes via composio-proxy.
  * Reuses sticky Composio session when D1 has one (same user forever).
@@ -167,7 +191,8 @@ export async function mintComposioMcpAccess(
 ): Promise<ComposioMcpAccess | null> {
   const auth = internalAuth(env);
   if (!auth || auth.length < 16) {
-    console.error("composio: missing COMPOSIO_SESSION_SECRET / WORKER_TO_HARNESS_SECRET");
+    lastMintError = "missing COMPOSIO_SESSION_SECRET / WORKER_TO_HARNESS_SECRET (len<16)";
+    console.error("composio:", lastMintError);
     return null;
   }
 
@@ -178,83 +203,101 @@ export async function mintComposioMcpAccess(
   }
   const toolkits = stored?.toolkits ?? [...DEFAULT_COMPOSIO_TOOLKITS];
 
-  try {
-    // Prefer a single internal header. Dual Authorization+x-fromdonna-internal is
-    // supported by the proxy, but one header avoids edge cases and matches ops probes.
-    const res = await fetch(`${proxyBase(env)}/internal/session`, {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        "x-fromdonna-internal": auth,
-      },
-      body: JSON.stringify({
-        user_id: userId,
-        toolkits,
-        runtime_id: runtimeId,
-        force_new_composio_session: !!opts?.forceNewComposioSession,
-        ...(stored?.sessionId && stored?.mcpUrl && !opts?.forceNewComposioSession
-          ? {
-              composio_session_id: stored.sessionId,
-              composio_mcp_url: stored.mcpUrl,
-            }
-          : {}),
-      }),
-    });
-    if (!res.ok) {
-      const detail = await res.text().catch(() => "");
-      // 401 is internal-auth failure — force-new cannot fix a secret mismatch.
-      if (res.status === 401) {
-        console.error(
-          "composio mint 401: internal secret mismatch between gateway and composio-proxy (check COMPOSIO_SESSION_SECRET / INTERNAL_AUTH_SECRET)",
-        );
+  // Retry transient upstream failures (Composio 429 → proxy 502).
+  const maxAttempts = 4;
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    try {
+      // Send both header styles so proxy multi-secret auth always sees a match.
+      // Prefer service binding (COMPOSIO_PROXY) — public workers.dev fetch → CF 1042.
+      const res = await proxyFetch(env, "/internal/session", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-fromdonna-internal": auth,
+          Authorization: `Bearer ${auth}`,
+        },
+        body: JSON.stringify({
+          user_id: userId,
+          toolkits,
+          runtime_id: runtimeId,
+          force_new_composio_session: !!opts?.forceNewComposioSession,
+          ...(stored?.sessionId && stored?.mcpUrl && !opts?.forceNewComposioSession
+            ? {
+                composio_session_id: stored.sessionId,
+                composio_mcp_url: stored.mcpUrl,
+              }
+            : {}),
+        }),
+      });
+      if (!res.ok) {
+        const detail = await res.text().catch(() => "");
+        const snippet = detail.slice(0, 220);
+        // 401 is internal-auth failure — force-new cannot fix a secret mismatch.
+        if (res.status === 401) {
+          lastMintError = `mint HTTP 401 secret mismatch gateway→proxy (auth_len=${auth.length}): ${snippet}`;
+          console.error("composio", lastMintError);
+          return null;
+        }
+        // Sticky session may be dead — retry with force new once when we had a sticky id.
+        if (!opts?.forceNewComposioSession && stored?.sessionId) {
+          console.error(`composio session mint HTTP ${res.status}, retrying force new: ${snippet}`);
+          return mintComposioMcpAccess(env, userId, runtimeId, { forceNewComposioSession: true });
+        }
+        // Rate limit / upstream flakiness — backoff and retry.
+        if ((res.status === 429 || res.status === 502 || res.status === 503) && attempt < maxAttempts - 1) {
+          lastMintError = `mint HTTP ${res.status} attempt ${attempt + 1}: ${snippet}`;
+          console.error("composio", lastMintError, "— backing off");
+          await sleep(800 * (attempt + 1) * (attempt + 1));
+          continue;
+        }
+        lastMintError = `mint HTTP ${res.status}: ${snippet}`;
+        console.error("composio session", lastMintError);
         return null;
       }
-      // Sticky session may be dead (502/etc.) — retry with force new once when we had a sticky id.
-      if (!opts?.forceNewComposioSession && stored?.sessionId) {
-        console.error(`composio session mint HTTP ${res.status}, retrying force new: ${detail.slice(0, 150)}`);
-        return mintComposioMcpAccess(env, userId, runtimeId, { forceNewComposioSession: true });
+      const data = (await res.json()) as {
+        mcp_url?: string;
+        mcp_token?: string;
+        toolkits?: string[];
+        user_id?: string;
+        composio_session_id?: string;
+        composio_mcp_url?: string;
+        exp?: number;
+        ttl_seconds?: number;
+        reused_composio_session?: boolean;
+      };
+      if (!data.mcp_url || !data.mcp_token) {
+        lastMintError = "mint ok but missing mcp_url/mcp_token";
+        console.error("composio session", lastMintError);
+        return null;
       }
-      console.error(`composio session mint HTTP ${res.status}: ${detail.slice(0, 200)}`);
+      if (data.composio_session_id && data.composio_mcp_url) {
+        await persistComposioSession(env, userId, data.composio_session_id, data.composio_mcp_url).catch(
+          (e) => console.error("composio persist session failed:", e),
+        );
+      }
+      lastMintError = "";
+      return {
+        mcp_url: data.mcp_url,
+        mcp_token: data.mcp_token,
+        toolkits: data.toolkits || toolkits,
+        user_id: data.user_id || userId,
+        composio_session_id: data.composio_session_id,
+        composio_mcp_url: data.composio_mcp_url,
+        exp: data.exp,
+        ttl_seconds: data.ttl_seconds,
+        reused_composio_session: data.reused_composio_session,
+      };
+    } catch (error) {
+      lastMintError = `mint fetch error: ${error instanceof Error ? error.message : String(error)}`;
+      console.error("composio session", lastMintError);
+      if (attempt < maxAttempts - 1) {
+        await sleep(500 * (attempt + 1));
+        continue;
+      }
       return null;
     }
-    const data = (await res.json()) as {
-      mcp_url?: string;
-      mcp_token?: string;
-      toolkits?: string[];
-      user_id?: string;
-      composio_session_id?: string;
-      composio_mcp_url?: string;
-      exp?: number;
-      ttl_seconds?: number;
-      reused_composio_session?: boolean;
-    };
-    if (!data.mcp_url || !data.mcp_token) {
-      console.error("composio session mint: missing mcp_url/mcp_token");
-      return null;
-    }
-    if (data.composio_session_id && data.composio_mcp_url) {
-      await persistComposioSession(env, userId, data.composio_session_id, data.composio_mcp_url).catch(
-        (e) => console.error("composio persist session failed:", e),
-      );
-    }
-    return {
-      mcp_url: data.mcp_url,
-      mcp_token: data.mcp_token,
-      toolkits: data.toolkits || toolkits,
-      user_id: data.user_id || userId,
-      composio_session_id: data.composio_session_id,
-      composio_mcp_url: data.composio_mcp_url,
-      exp: data.exp,
-      ttl_seconds: data.ttl_seconds,
-      reused_composio_session: data.reused_composio_session,
-    };
-  } catch (error) {
-    console.error(
-      "composio session mint error:",
-      error instanceof Error ? error.message : error,
-    );
-    return null;
   }
+  return null;
 }
 
 /** Mint Composio Connect / login URL for an allowed toolkit. */
@@ -282,7 +325,7 @@ export async function mintComposioConnectLink(
   }
 
   try {
-    const res = await fetch(`${proxyBase(env)}/internal/connect`, {
+    const res = await proxyFetch(env, "/internal/connect", {
       method: "POST",
       headers: {
         "content-type": "application/json",
