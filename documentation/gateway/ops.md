@@ -81,6 +81,37 @@ npx wrangler d1 execute fromdonna-routing --remote --command \
 
 ---
 
+## Message flow dashboard (per-turn)
+
+There is a **gateway ops UI** that records each inbound Telegram turn and its stages
+(route → bootstrap → inject → outbound `sendMessage` via Bot API proxy).
+
+| | |
+|--|--|
+| **UI** | `https://fromdonna-gateway.code-df4.workers.dev/admin/turns` |
+| **Auth** | `WORKER_TO_HARNESS_SECRET` as Bearer, or `?token=` once (sessionStorage) |
+| **Storage** | D1 tables `message_turns` + `message_turn_events` (7-day retention) |
+| **Migration** | `cloudflare/gateway/migrations/0006_message_turns.sql` |
+
+```bash
+# Apply schema (once)
+cd ~/FromDonna/cloudflare/gateway
+npx wrangler d1 migrations apply fromdonna-routing --remote
+
+# Open UI (paste WORKER_TO_HARNESS_SECRET when prompted)
+# or:
+curl -sS -H "Authorization: Bearer $WORKER_TO_HARNESS_SECRET" \
+  "https://fromdonna-gateway.code-df4.workers.dev/admin/api/turns?limit=20" | jq .
+```
+
+Stages you will typically see:
+
+1. `webhook.received` → `route.start` → `route.ready` (or `route.provisioning`)
+2. `harness.ready` → `bootstrap.ok` → `inject.ok`
+3. `telegram.sendmessage` / `telegram.editmessagetext` (agent replies via proxy)
+4. `checkpoint.harvest` (best-effort after inject)
+5. On failure: `turn.error` + `gateway.user_notice` (`something_went_wrong`)
+
 ## Live logs
 
 ```bash
@@ -97,7 +128,7 @@ cd ~/FromDonna/cloudflare/api-proxy
 npx wrangler tail fromdonna-api-proxy --format pretty
 ```
 
-Note: the success path is quiet; `console.error` surfaces failures (harness HTTP errors, E2B create failures, etc.).
+Note: the success path is quieter in logs; prefer the **message flow dashboard** for per-turn history. `console.error` still surfaces Worker failures (harness HTTP errors, E2B create failures, etc.).
 
 ---
 

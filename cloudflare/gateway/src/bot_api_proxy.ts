@@ -10,6 +10,8 @@
  * to api.telegram.org with the real TELEGRAM_BOT_TOKEN.
  */
 
+import { attachOutboundEvent } from "./turn_trace";
+
 export type ProxyIdentity = {
   userId: string;
   gatewayUserId: string;
@@ -201,8 +203,10 @@ export async function handleBotApiProxy(args: {
   url: URL;
   realBotToken: string;
   proxySecret: string;
+  /** Optional D1 for attaching outbound Bot API calls to the open message turn. */
+  routingDb?: D1Database;
 }): Promise<Response | null> {
-  const { request, url, realBotToken, proxySecret } = args;
+  const { request, url, realBotToken, proxySecret, routingDb } = args;
 
   // File downloads: /telegram-bot-api/file/bot{token}/{path}
   const file = filePath(url.pathname, "/telegram-bot-api/file/bot");
@@ -264,6 +268,7 @@ export async function handleBotApiProxy(args: {
   if (denied) return denied;
 
   const upstreamUrl = `https://api.telegram.org/bot${realBotToken}/${method}${url.search}`;
+  const t0 = Date.now();
   let upstream: Response;
   if (payload.kind === "form" && payload.form) {
     upstream = await fetch(upstreamUrl, { method: "POST", body: payload.form });
@@ -275,6 +280,29 @@ export async function handleBotApiProxy(args: {
     });
   } else {
     upstream = await fetch(upstreamUrl, { method: request.method === "GET" ? "GET" : "POST" });
+  }
+
+  // Trace user-visible outbound methods onto the latest open turn (ops dashboard).
+  if (routingDb && CHAT_SCOPED_METHODS.has(lower) && lower !== "sendchataction") {
+    const textPreview =
+      payload.kind === "json" && payload.json
+        ? typeof payload.json.text === "string"
+          ? payload.json.text.slice(0, 200)
+          : typeof payload.json.caption === "string"
+            ? payload.json.caption.slice(0, 200)
+            : undefined
+        : payload.kind === "form" && payload.form
+          ? formGet(payload.form, "text")?.slice(0, 200) || formGet(payload.form, "caption")?.slice(0, 200)
+          : undefined;
+    await attachOutboundEvent(routingDb, identity.userId, `telegram.${lower}`, {
+      ok: upstream.ok,
+      durationMs: Date.now() - t0,
+      detail: {
+        method: lower,
+        http_status: upstream.status,
+        text: textPreview,
+      },
+    });
   }
 
   const body = await upstream.arrayBuffer();

@@ -145,11 +145,12 @@ export async function mintComposioMcpAccess(
   const toolkits = stored?.toolkits ?? [...DEFAULT_COMPOSIO_TOOLKITS];
 
   try {
+    // Prefer a single internal header. Dual Authorization+x-fromdonna-internal is
+    // supported by the proxy, but one header avoids edge cases and matches ops probes.
     const res = await fetch(`${proxyBase(env)}/internal/session`, {
       method: "POST",
       headers: {
         "content-type": "application/json",
-        authorization: `Bearer ${auth}`,
         "x-fromdonna-internal": auth,
       },
       body: JSON.stringify({
@@ -170,6 +171,11 @@ export async function mintComposioMcpAccess(
       // Sticky session may be dead — retry with force new once
       if (!opts?.forceNewComposioSession && stored?.sessionId) {
         console.error(`composio session mint HTTP ${res.status}, retrying force new: ${detail.slice(0, 150)}`);
+        return mintComposioMcpAccess(env, userId, runtimeId, { forceNewComposioSession: true });
+      }
+      // Always force-new once on 401 (secret rotate / desync) even without sticky id
+      if (!opts?.forceNewComposioSession && res.status === 401) {
+        console.error(`composio session mint HTTP 401, retrying force new: ${detail.slice(0, 150)}`);
         return mintComposioMcpAccess(env, userId, runtimeId, { forceNewComposioSession: true });
       }
       console.error(`composio session mint HTTP ${res.status}: ${detail.slice(0, 200)}`);

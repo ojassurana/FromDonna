@@ -7,6 +7,7 @@
  * privileged door (e.g. Hermes TelegramAdapter → /telegram-bot-api/*).
  */
 
+import { handleAdminTurns } from "./admin_turns";
 import { handleBotApiProxy, mintBotProxyToken } from "./bot_api_proxy";
 import {
   getCheckpointBytes,
@@ -16,6 +17,12 @@ import {
 } from "./checkpoint";
 import { ensureUserComposio, mintComposioMcpAccess } from "./composio";
 import { normalizeTelegramUpdate, type TelegramUpdate } from "./telegram";
+import {
+  addTurnEvent,
+  inboundPreviewFromUpdate,
+  newTurnId,
+  startTurn,
+} from "./turn_trace";
 
 export interface Env {
   FROMDONNA_ROUTING: D1Database;
@@ -419,15 +426,20 @@ async function restoreCheckpointToRuntime(
 
 /**
  * Mint Composio MCP access and bootstrap the harness.
- * Product policy: do not mark a runtime "done" without composio_mcp_ready —
- * otherwise "connect Gmail" has no tools and no login link.
+ *
+ * Default (requireComposio=false): always bring up Telegram. Composio is best-effort —
+ * mint failures must NOT kill first provision (jul 2026: secret desync → failed D1 +
+ * "Something went wrong" for every new user after wipe).
+ *
+ * Pass requireComposio:true only for ops probes that explicitly need MCP ready.
  */
 async function bootstrapHarness(
   env: Env,
   row: Pick<UserAgentRow, "user_id" | "gateway_user_id" | "gateway_conversation_id" | "runtime_id" | "runtime_domain">,
   opts?: { requireComposio?: boolean },
 ): Promise<void> {
-  const requireComposio = opts?.requireComposio !== false;
+  // Soft-default: telegram-ready wins over Composio-hard-fail (prod jul 2026).
+  const requireComposio = opts?.requireComposio === true;
   const proxyToken = await mintBotProxyToken(
     required(env, "WORKER_TO_HARNESS_SECRET"),
     row.user_id,
@@ -734,12 +746,13 @@ async function provision(env: Env, gateway: string, gatewayUserId: string): Prom
     // harness auth (bootstrap sets the secret). So: bootstrap first, restore,
     // then re-bootstrap so composio MCP + reply_to policy win over any
     // checkpoint-overwritten config.yaml.
-    await bootstrapHarness(env, pending);
+    // Composio is best-effort — never hard-fail provision on mint desync.
+    await bootstrapHarness(env, pending, { requireComposio: false });
     await restoreCheckpointToRuntime(env, pending);
     // Second bootstrap is idempotent (same secret): re-applies composio token
     // and restarts/reloads gateway tooling after restore may have overwritten
     // ~/.hermes/config.yaml.
-    await bootstrapHarness(env, pending);
+    await bootstrapHarness(env, pending, { requireComposio: false });
 
     await env.FROMDONNA_ROUTING.prepare(
       `UPDATE user_agents
@@ -790,11 +803,11 @@ async function replaceRuntime(env: Env, row: UserAgentRow): Promise<UserAgentRow
       await pullCheckpointOnce(env, { ...row, runtime_id: oldId }).catch(() => {});
     }
 
-    await bootstrapHarness(env, pending);
+    await bootstrapHarness(env, pending, { requireComposio: false });
     // Critical: replaceRuntime kills the old box — restore then re-bootstrap so
     // composio MCP / telegram proxy win over checkpoint-overwritten config.
     await restoreCheckpointToRuntime(env, pending);
-    await bootstrapHarness(env, pending);
+    await bootstrapHarness(env, pending, { requireComposio: false });
 
     await env.FROMDONNA_ROUTING.prepare(
       `UPDATE user_agents
@@ -837,11 +850,23 @@ async function postTelegramUpdate(env: Env, row: UserAgentRow, update: TelegramU
  * Push a raw Telegram update into the sandbox Hermes Telegram runtime.
  * Returns the live runtime row after a successful inject (for checkpoint pull).
  */
-async function injectTelegramUpdate(env: Env, row: UserAgentRow, update: TelegramUpdate): Promise<UserAgentRow> {
+async function injectTelegramUpdate(
+  env: Env,
+  row: UserAgentRow,
+  update: TelegramUpdate,
+  turnId?: string,
+): Promise<UserAgentRow> {
   if (row.runtime_provider !== "e2b") throw new Error(`Unsupported runtime provider: ${row.runtime_provider}`);
 
   let current = row;
   let lastError = "inject failed";
+  if (turnId) {
+    await addTurnEvent(env.FROMDONNA_ROUTING, turnId, "inject.start", {
+      status: "injecting",
+      runtimeId: current.runtime_id,
+      detail: { attempt: 0 },
+    });
+  }
 
   // Attempt 0: resume existing box. Attempt 1: replace runtime if gone/broken.
   for (let attempt = 0; attempt < 2; attempt++) {
@@ -849,22 +874,59 @@ async function injectTelegramUpdate(env: Env, row: UserAgentRow, update: Telegra
       const alive = await ensureSandboxRunning(env, current.runtime_id);
       if (!alive) {
         lastError = "E2B sandbox missing";
+        if (turnId) {
+          await addTurnEvent(env.FROMDONNA_ROUTING, turnId, "sandbox.missing", {
+            ok: false,
+            detail: { runtime_id: current.runtime_id },
+          });
+        }
         current = await replaceRuntime(env, current);
+        if (turnId) {
+          await addTurnEvent(env.FROMDONNA_ROUTING, turnId, "sandbox.replaced", {
+            runtimeId: current.runtime_id,
+            detail: { runtime_id: current.runtime_id },
+          });
+        }
         // fall through to inject on the new box
       } else {
         // Pause→resume: wait for harness, then re-bootstrap proxy + start gateway.
         // requireComposio:false — per-message path must not 500 the whole turn if
         // Composio mint is slow/down; chat still works. Provision still hard-requires it.
+        const t0 = Date.now();
         await waitForHarness(env, current.runtime_id, current.runtime_domain, 90);
+        if (turnId) {
+          await addTurnEvent(env.FROMDONNA_ROUTING, turnId, "harness.ready", {
+            durationMs: Date.now() - t0,
+            runtimeId: current.runtime_id,
+          });
+        }
+        const t1 = Date.now();
         await bootstrapHarness(env, current, { requireComposio: false });
+        if (turnId) {
+          await addTurnEvent(env.FROMDONNA_ROUTING, turnId, "bootstrap.ok", {
+            durationMs: Date.now() - t1,
+            detail: { requireComposio: false },
+          });
+        }
         // Capture prior turn's staged checkpoint before this turn overwrites state.
         await pullCheckpointOnce(env, current);
+        if (turnId) {
+          await addTurnEvent(env.FROMDONNA_ROUTING, turnId, "checkpoint.pull", {
+            detail: { note: "pre-inject best-effort" },
+          });
+        }
       }
 
       let response = await postTelegramUpdate(env, current, update);
       if (!response.ok) {
         const detail = await response.text().catch(() => "");
         lastError = `Sandbox telegram inject failed with HTTP ${response.status}${detail ? `: ${detail.slice(0, 300)}` : ""}`;
+        if (turnId) {
+          await addTurnEvent(env.FROMDONNA_ROUTING, turnId, "inject.post_failed", {
+            ok: false,
+            detail: { status: response.status, detail: detail.slice(0, 200), retry: true },
+          });
+        }
         // One soft retry on same box after re-bootstrap (stale gateway thread / lock).
         await bootstrapHarness(env, current, { requireComposio: false });
         response = await postTelegramUpdate(env, current, update);
@@ -873,10 +935,23 @@ async function injectTelegramUpdate(env: Env, row: UserAgentRow, update: Telegra
           lastError = `Sandbox telegram inject failed with HTTP ${response.status}${detail2 ? `: ${detail2.slice(0, 300)}` : ""}`;
           if (attempt === 0) {
             current = await replaceRuntime(env, current);
+            if (turnId) {
+              await addTurnEvent(env.FROMDONNA_ROUTING, turnId, "sandbox.replaced", {
+                runtimeId: current.runtime_id,
+                detail: { reason: "inject_retry_exhausted" },
+              });
+            }
             continue;
           }
           throw new Error(lastError);
         }
+      }
+      if (turnId) {
+        await addTurnEvent(env.FROMDONNA_ROUTING, turnId, "inject.ok", {
+          status: "injected",
+          runtimeId: current.runtime_id,
+          detail: { attempt },
+        });
       }
       return current;
     } catch (error) {
@@ -889,6 +964,12 @@ async function injectTelegramUpdate(env: Env, row: UserAgentRow, update: Telegra
       ) {
         try {
           current = await replaceRuntime(env, current);
+          if (turnId) {
+            await addTurnEvent(env.FROMDONNA_ROUTING, turnId, "sandbox.replaced", {
+              runtimeId: current.runtime_id,
+              detail: { reason: "recoverable_error", error: lastError.slice(0, 200) },
+            });
+          }
           continue;
         } catch (replaceError) {
           lastError = replaceError instanceof Error ? replaceError.message : String(replaceError);
@@ -976,32 +1057,84 @@ async function processTelegramUpdate(
   const gateway = "telegram";
   const gatewayUserId = event.actorId;
   const gatewayConversationId = event.conversationId;
+  const userId = internalUserId(gateway, gatewayUserId);
+  const turnId = newTurnId();
+  const inbound = inboundPreviewFromUpdate(update);
+
+  await startTurn(env.FROMDONNA_ROUTING, {
+    turnId,
+    userId,
+    gateway,
+    gatewayUserId,
+    gatewayConversationId,
+    telegramUpdateId:
+      typeof update.update_id === "number"
+        ? update.update_id
+        : typeof update.update_id === "string" && update.update_id
+          ? Number(update.update_id) || null
+          : null,
+    inboundKind: inbound.kind,
+    inboundPreview: inbound.preview,
+  });
 
   try {
+    await addTurnEvent(env.FROMDONNA_ROUTING, turnId, "route.start", { status: "routing" });
+    const tRoute = Date.now();
     const resolved = await resolveReadyRow(env, gateway, gatewayUserId, gatewayConversationId);
     if (resolved === "provisioning") {
+      await addTurnEvent(env.FROMDONNA_ROUTING, turnId, "route.provisioning", {
+        status: "provisioning",
+        durationMs: Date.now() - tRoute,
+        detail: { note: "another request is provisioning or reclaim in progress" },
+      });
       await telegram(env, "sendMessage", {
         chat_id: gatewayConversationId,
         text: "Setting up your private assistant — one moment, then send that again.",
       });
+      await addTurnEvent(env.FROMDONNA_ROUTING, turnId, "gateway.user_notice", {
+        status: "complete",
+        detail: { text: "setting_up" },
+      });
       return;
     }
 
+    await addTurnEvent(env.FROMDONNA_ROUTING, turnId, "route.ready", {
+      durationMs: Date.now() - tRoute,
+      runtimeId: resolved.runtime_id,
+      detail: { status: resolved.status, runtime_id: resolved.runtime_id },
+    });
+
     // Official path: sandbox Hermes Telegram runtime sends via Bot API proxy.
     // Worker does not render agent text itself.
-    const live = await injectTelegramUpdate(env, resolved, update);
+    const live = await injectTelegramUpdate(env, resolved, update, turnId);
     // Separate waitUntil so create/inject time does not starve checkpoint harvest.
     // Goal: proactive R2 backup after agent use (best-effort after this turn;
     // also pulled at the start of the next message / before replace).
-    ctx.waitUntil(harvestCheckpointAfterTurn(env, live));
+    ctx.waitUntil(
+      (async () => {
+        await harvestCheckpointAfterTurn(env, live);
+        await addTurnEvent(env.FROMDONNA_ROUTING, turnId, "checkpoint.harvest", {
+          detail: { runtime_id: live.runtime_id },
+        });
+      })(),
+    );
   } catch (error) {
     console.error(error instanceof Error ? error.message : "processTelegramUpdate failed");
     try {
       const detail = error instanceof Error ? error.message : "processTelegramUpdate failed";
       console.error("processTelegramUpdate", detail);
+      await addTurnEvent(env.FROMDONNA_ROUTING, turnId, "turn.error", {
+        ok: false,
+        status: "error",
+        error: detail,
+        detail: { message: detail.slice(0, 500) },
+      });
       await telegram(env, "sendMessage", {
         chat_id: gatewayConversationId,
         text: "Something went wrong on my side. Please try again in a moment.",
+      });
+      await addTurnEvent(env.FROMDONNA_ROUTING, turnId, "gateway.user_notice", {
+        detail: { text: "something_went_wrong" },
       });
     } catch {
       // ignore
@@ -1052,6 +1185,10 @@ export default {
         return json({ ok: true, service: "fromdonna-gateway", mode: "channel-agnostic" });
       }
 
+      // Ops: message-flow dashboard + JSON API (auth via harness secret / ?token=).
+      const adminTurns = await handleAdminTurns(request, env, url);
+      if (adminTurns) return adminTurns;
+
       // Ops: rebind Telegram webhook with full allowed_updates (auth via harness secret).
       if (request.method === "POST" && url.pathname === "/admin/rebind-webhook") {
         const auth = request.headers.get("authorization") || "";
@@ -1074,6 +1211,7 @@ export default {
         url,
         realBotToken: required(env, "TELEGRAM_BOT_TOKEN"),
         proxySecret: required(env, "WORKER_TO_HARNESS_SECRET"),
+        routingDb: env.FROMDONNA_ROUTING,
       });
       if (proxied) return proxied;
 
