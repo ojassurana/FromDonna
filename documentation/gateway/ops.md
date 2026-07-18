@@ -83,25 +83,25 @@ npx wrangler d1 execute fromdonna-routing --remote --command \
 
 ## Message flow dashboard (per-turn)
 
-There is a **gateway ops UI** that records each inbound Telegram turn and its stages
-(route → bootstrap → inject → outbound `sendMessage` via Bot API proxy).
+**Separate Worker** — not on the gateway. Gateway only **writes** turn rows to D1;
+the ops dashboard **reads** them.
 
 | | |
 |--|--|
-| **UI** | `https://dashboard.fromdonna.com/admin/turns` (also `https://fromdonna-gateway.code-df4.workers.dev/admin/turns`) |
-| **Auth** | `WORKER_TO_HARNESS_SECRET` as Bearer, or `?token=` once (sessionStorage) |
-| **Storage** | D1 tables `message_turns` + `message_turn_events` (7-day retention) |
-| **Migration** | `cloudflare/gateway/migrations/0006_message_turns.sql` |
+| **Worker** | `fromdonna-ops-dashboard` (`cloudflare/ops-dashboard/`) |
+| **UI** | `https://dashboard.fromdonna.com/` (also `https://fromdonna-ops-dashboard.code-df4.workers.dev/`) |
+| **Auth** | **Off for now** (open read UI — re-enable `OPS_ADMIN_SECRET` before any public share) |
+| **Storage** | D1 `fromdonna-routing` tables `message_turns` + `message_turn_events` (7-day retention; written by gateway) |
+| **Schema** | `cloudflare/gateway/migrations/0006_message_turns.sql` |
 
 ```bash
-# Apply schema (once)
-cd ~/FromDonna/cloudflare/gateway
-npx wrangler d1 migrations apply fromdonna-routing --remote
+# Deploy / update dashboard
+cd ~/FromDonna/cloudflare/ops-dashboard
+npm install
+npx wrangler deploy
 
-# Open UI (paste WORKER_TO_HARNESS_SECRET when prompted)
-# or:
-curl -sS -H "Authorization: Bearer $WORKER_TO_HARNESS_SECRET" \
-  "https://fromdonna-gateway.code-df4.workers.dev/admin/api/turns?limit=20" | jq .
+# Open UI (no auth for now), or:
+curl -sS "https://fromdonna-ops-dashboard.code-df4.workers.dev/api/turns?limit=20" | jq .
 ```
 
 Stages you will typically see:
@@ -126,9 +126,13 @@ npx wrangler tail fromdonna-llm-proxy --format pretty
 # API proxy (Exa / HTTP connectors)
 cd ~/FromDonna/cloudflare/api-proxy
 npx wrangler tail fromdonna-api-proxy --format pretty
+
+# Ops dashboard (rare; mostly static)
+cd ~/FromDonna/cloudflare/ops-dashboard
+npx wrangler tail fromdonna-ops-dashboard --format pretty
 ```
 
-Note: the success path is quieter in logs; prefer the **message flow dashboard** for per-turn history. `console.error` still surfaces Worker failures (harness HTTP errors, E2B create failures, etc.).
+Note: prefer the **message flow dashboard** for per-turn history. `console.error` on the gateway still surfaces Worker failures (harness HTTP errors, E2B create failures, etc.).
 
 ---
 
