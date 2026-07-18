@@ -7,7 +7,6 @@
  * privileged door (e.g. Hermes TelegramAdapter → /telegram-bot-api/*).
  */
 
-import { handleAdminTurns } from "./admin_turns";
 import { handleBotApiProxy, mintBotProxyToken } from "./bot_api_proxy";
 import {
   getCheckpointBytes,
@@ -427,18 +426,19 @@ async function restoreCheckpointToRuntime(
 /**
  * Mint Composio MCP access and bootstrap the harness.
  *
- * Default (requireComposio=false): always bring up Telegram. Composio is best-effort —
- * mint failures must NOT kill first provision (jul 2026: secret desync → failed D1 +
- * "Something went wrong" for every new user after wipe).
+ * Default (requireComposio=false): soft — Telegram always comes up; Composio mint is
+ * best-effort. Used by per-message inject so a transient remint glitch never 500s chat.
  *
- * Pass requireComposio:true only for ops probes that explicitly need MCP ready.
+ * Hard (requireComposio=true): provision + replaceRuntime must pass this. Fails (and
+ * kills the sandbox / leaves user not-ready) unless harness /health reports
+ * composio_mcp_ready === true. Do not mark D1 ready without Composio.
  */
 async function bootstrapHarness(
   env: Env,
   row: Pick<UserAgentRow, "user_id" | "gateway_user_id" | "gateway_conversation_id" | "runtime_id" | "runtime_domain">,
   opts?: { requireComposio?: boolean },
 ): Promise<void> {
-  // Soft-default: telegram-ready wins over Composio-hard-fail (prod jul 2026).
+  // Soft-default for inject; callers that provision must pass requireComposio:true.
   const requireComposio = opts?.requireComposio === true;
   const proxyToken = await mintBotProxyToken(
     required(env, "WORKER_TO_HARNESS_SECRET"),
@@ -746,13 +746,14 @@ async function provision(env: Env, gateway: string, gatewayUserId: string): Prom
     // harness auth (bootstrap sets the secret). So: bootstrap first, restore,
     // then re-bootstrap so composio MCP + reply_to policy win over any
     // checkpoint-overwritten config.yaml.
-    // Composio is best-effort — never hard-fail provision on mint desync.
-    await bootstrapHarness(env, pending, { requireComposio: false });
+    // Provision hard-requires Composio: fail (kill sandbox) rather than mark ready
+    // when harness health.composio_mcp_ready is not true.
+    await bootstrapHarness(env, pending, { requireComposio: true });
     await restoreCheckpointToRuntime(env, pending);
     // Second bootstrap is idempotent (same secret): re-applies composio token
     // and restarts/reloads gateway tooling after restore may have overwritten
     // ~/.hermes/config.yaml.
-    await bootstrapHarness(env, pending, { requireComposio: false });
+    await bootstrapHarness(env, pending, { requireComposio: true });
 
     await env.FROMDONNA_ROUTING.prepare(
       `UPDATE user_agents
@@ -803,11 +804,12 @@ async function replaceRuntime(env: Env, row: UserAgentRow): Promise<UserAgentRow
       await pullCheckpointOnce(env, { ...row, runtime_id: oldId }).catch(() => {});
     }
 
-    await bootstrapHarness(env, pending, { requireComposio: false });
+    // Hard-require Composio on replace (same policy as first provision).
+    await bootstrapHarness(env, pending, { requireComposio: true });
     // Critical: replaceRuntime kills the old box — restore then re-bootstrap so
     // composio MCP / telegram proxy win over checkpoint-overwritten config.
     await restoreCheckpointToRuntime(env, pending);
-    await bootstrapHarness(env, pending, { requireComposio: false });
+    await bootstrapHarness(env, pending, { requireComposio: true });
 
     await env.FROMDONNA_ROUTING.prepare(
       `UPDATE user_agents
@@ -890,8 +892,9 @@ async function injectTelegramUpdate(
         // fall through to inject on the new box
       } else {
         // Pause→resume: wait for harness, then re-bootstrap proxy + start gateway.
-        // requireComposio:false — per-message path must not 500 the whole turn if
-        // Composio mint is slow/down; chat still works. Provision still hard-requires it.
+        // requireComposio:false — per-message inject must not 500 the turn if Composio
+        // mint is slow/down; chat still works. Each inject remints (soft) and logs
+        // clearly when MCP is not injected. Provision/replaceRuntime hard-require it.
         const t0 = Date.now();
         await waitForHarness(env, current.runtime_id, current.runtime_domain, 90);
         if (turnId) {
@@ -1184,19 +1187,6 @@ export default {
       if (request.method === "GET" && url.pathname === "/health") {
         return json({ ok: true, service: "fromdonna-gateway", mode: "channel-agnostic" });
       }
-
-      // Ops host convenience: dashboard.fromdonna.com/ → /admin/turns
-      if (
-        request.method === "GET" &&
-        (url.pathname === "/" || url.pathname === "") &&
-        url.hostname === "dashboard.fromdonna.com"
-      ) {
-        return Response.redirect(`${url.origin}/admin/turns`, 302);
-      }
-
-      // Ops: message-flow dashboard + JSON API (auth via harness secret / ?token=).
-      const adminTurns = await handleAdminTurns(request, env, url);
-      if (adminTurns) return adminTurns;
 
       // Ops: rebind Telegram webhook with full allowed_updates (auth via harness secret).
       if (request.method === "POST" && url.pathname === "/admin/rebind-webhook") {

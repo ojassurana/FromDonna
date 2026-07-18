@@ -29,6 +29,40 @@ export const DEFAULT_COMPOSIO_TOOLKITS = [
   "dropbox_sign",
 ] as const;
 
+/**
+ * Aliases → canonical Composio slug.
+ * Keep in sync with cloudflare/composio-proxy/src/toolkits.ts TOOLKIT_ALIASES.
+ */
+const TOOLKIT_ALIASES: Record<string, string> = {
+  google_drive: "googledrive",
+  google_drive_api: "googledrive",
+  "google-drive": "googledrive",
+  drive: "googledrive",
+  gdrive: "googledrive",
+
+  google_calendar: "googlecalendar",
+  "google-calendar": "googlecalendar",
+  calendar: "googlecalendar",
+
+  google_sheets: "googlesheets",
+  "google-sheets": "googlesheets",
+  sheets: "googlesheets",
+
+  google_docs: "googledocs",
+  "google-docs": "googledocs",
+  docs: "googledocs",
+
+  dropboxsign: "dropbox_sign",
+  "dropbox-sign": "dropbox_sign",
+};
+
+/** Normalize common alias / marketing names to canonical Composio Tool Router slugs. */
+export function canonicalizeToolkit(raw: string): string {
+  const t = raw.trim().toLowerCase();
+  if (!t) return "";
+  return TOOLKIT_ALIASES[t] || t;
+}
+
 export type ComposioMcpAccess = {
   mcp_url: string;
   mcp_token: string;
@@ -168,14 +202,16 @@ export async function mintComposioMcpAccess(
     });
     if (!res.ok) {
       const detail = await res.text().catch(() => "");
-      // Sticky session may be dead — retry with force new once
+      // 401 is internal-auth failure — force-new cannot fix a secret mismatch.
+      if (res.status === 401) {
+        console.error(
+          "composio mint 401: internal secret mismatch between gateway and composio-proxy (check COMPOSIO_SESSION_SECRET / INTERNAL_AUTH_SECRET)",
+        );
+        return null;
+      }
+      // Sticky session may be dead (502/etc.) — retry with force new once when we had a sticky id.
       if (!opts?.forceNewComposioSession && stored?.sessionId) {
         console.error(`composio session mint HTTP ${res.status}, retrying force new: ${detail.slice(0, 150)}`);
-        return mintComposioMcpAccess(env, userId, runtimeId, { forceNewComposioSession: true });
-      }
-      // Always force-new once on 401 (secret rotate / desync) even without sticky id
-      if (!opts?.forceNewComposioSession && res.status === 401) {
-        console.error(`composio session mint HTTP 401, retrying force new: ${detail.slice(0, 150)}`);
         return mintComposioMcpAccess(env, userId, runtimeId, { forceNewComposioSession: true });
       }
       console.error(`composio session mint HTTP ${res.status}: ${detail.slice(0, 200)}`);
@@ -237,9 +273,11 @@ export async function mintComposioConnectLink(
     stored = await loadUserComposio(env, userId);
   }
   const toolkits = stored?.toolkits ?? [...DEFAULT_COMPOSIO_TOOLKITS];
-  const tk = toolkit.trim().toLowerCase();
-  if (!toolkits.includes(tk)) {
-    console.error(`composio connect: toolkit not allowed: ${tk}`);
+  // Canonicalize aliases (google_drive → googledrive, etc.) before allowlist check —
+  // matches composio-proxy resolveToolkits / canonicalizeToolkit.
+  const tk = canonicalizeToolkit(toolkit);
+  if (!tk || !toolkits.includes(tk)) {
+    console.error(`composio connect: toolkit not allowed: ${toolkit.trim().toLowerCase()} (canonical: ${tk || "(empty)"})`);
     return null;
   }
 

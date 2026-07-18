@@ -29,15 +29,35 @@ export function sessionSecret(env: Env): string {
   return s;
 }
 
-export function internalSecret(env: Env): string {
-  const s =
-    (env.INTERNAL_AUTH_SECRET || "").trim() ||
-    (env.COMPOSIO_SESSION_SECRET || "").trim() ||
-    (env.WORKER_TO_HARNESS_SECRET || "").trim();
-  if (!s || s.length < 16) {
+/**
+ * All secrets accepted for gateway → /internal/* auth.
+ * Match against ANY configured candidate (≥16 chars) so proxy
+ * INTERNAL_AUTH_SECRET ≠ gateway COMPOSIO_SESSION_SECRET does not 401 forever.
+ * Order preserved; duplicates removed. sessionSecret chain is separate.
+ */
+export function internalSecrets(env: Env): string[] {
+  const raw = [
+    (env.INTERNAL_AUTH_SECRET || "").trim(),
+    (env.COMPOSIO_SESSION_SECRET || "").trim(),
+    (env.WORKER_TO_HARNESS_SECRET || "").trim(),
+  ];
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const s of raw) {
+    if (s.length >= 16 && !seen.has(s)) {
+      seen.add(s);
+      out.push(s);
+    }
+  }
+  if (out.length === 0) {
     throw new Error("INTERNAL_AUTH_SECRET missing/too short");
   }
-  return s;
+  return out;
+}
+
+/** First configured internal secret (single-secret helper / diagnostics). */
+export function internalSecret(env: Env): string {
+  return internalSecrets(env)[0];
 }
 
 /** Production default: 30 days — covers long-lived E2B pause/resume without hourly death. */

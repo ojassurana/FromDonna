@@ -10,14 +10,14 @@
  */
 
 import type { Env } from "./env";
-import { internalSecret, sessionSecret, sessionTtlSeconds } from "./env";
+import { internalSecrets, sessionSecret, sessionTtlSeconds } from "./env";
 import {
   createToolRouterSession,
   createToolkitLink,
   extractRedirectUrl,
   proxyToComposioMcp,
 } from "./composio_api";
-import { defaultToolkits, resolveToolkits } from "./toolkits";
+import { canonicalizeToolkit, defaultToolkits, resolveToolkits } from "./toolkits";
 import {
   bearerToken,
   mintSessionToken,
@@ -30,20 +30,33 @@ function json(body: unknown, status = 200): Response {
   return Response.json(body, { status });
 }
 
+/** Constant-time string equality (length must already match). */
+function timingSafeEqual(a: string, b: string): boolean {
+  if (a.length !== b.length) return false;
+  let ok = 0;
+  for (let i = 0; i < a.length; i++) {
+    ok |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  }
+  return ok === 0;
+}
+
+/**
+ * Accept x-fromdonna-internal OR Authorization: Bearer.
+ * Presented secret must match ANY configured candidate
+ * (INTERNAL_AUTH_SECRET, COMPOSIO_SESSION_SECRET, WORKER_TO_HARNESS_SECRET).
+ */
 function requireInternalAuth(request: Request, env: Env): boolean {
   const presented =
     request.headers.get("x-fromdonna-internal") ||
     bearerToken(request) ||
     "";
+  if (!presented) return false;
   try {
-    const expected = internalSecret(env);
-    if (presented.length !== expected.length) return false;
-    // constant-time-ish compare
-    let ok = 0;
-    for (let i = 0; i < expected.length; i++) {
-      ok |= presented.charCodeAt(i) ^ expected.charCodeAt(i);
+    const candidates = internalSecrets(env);
+    for (const expected of candidates) {
+      if (timingSafeEqual(presented, expected)) return true;
     }
-    return ok === 0;
+    return false;
   } catch {
     return false;
   }
@@ -202,7 +215,8 @@ async function handleInternalConnect(request: Request, env: Env): Promise<Respon
   }
 
   const userId = (body.user_id || "").trim();
-  const toolkit = (body.toolkit || "").trim().toLowerCase();
+  // Canonicalize aliases (google_drive → googledrive) before allowlist membership
+  const toolkit = canonicalizeToolkit(body.toolkit || "");
   if (!userId || !toolkit) {
     return json({ error: { message: "user_id and toolkit required.", code: "invalid_body" } }, 400);
   }
@@ -346,7 +360,7 @@ export default {
 };
 
 // Re-exports for tests
-export { defaultToolkits, resolveToolkits } from "./toolkits";
+export { defaultToolkits, resolveToolkits, canonicalizeToolkit } from "./toolkits";
 export {
   mintSessionToken,
   verifySessionToken,
@@ -354,4 +368,9 @@ export {
   needsRefresh,
   bearerToken,
 } from "./session_token";
-export { DEFAULT_SESSION_TTL_SECONDS, sessionTtlSeconds } from "./env";
+export {
+  DEFAULT_SESSION_TTL_SECONDS,
+  sessionTtlSeconds,
+  internalSecret,
+  internalSecrets,
+} from "./env";

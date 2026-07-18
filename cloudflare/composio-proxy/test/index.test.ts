@@ -1,10 +1,14 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import type { Env } from "../src/env";
+import { internalSecrets } from "../src/env";
 import { handleRequest, mintSessionToken } from "../src/index";
 import { defaultToolkits } from "../src/toolkits";
 
 const SECRET = "test-session-secret-at-least-16-chars";
+const INTERNAL = "internal-auth-secret-16ok";
+const SESSION = "session-secret-at-least-16ch";
+const HARNESS = "worker-to-harness-secret16";
 
 const env: Env = {
   COMPOSIO_API_KEY: "ck_test_not_real",
@@ -12,6 +16,30 @@ const env: Env = {
   INTERNAL_AUTH_SECRET: SECRET,
   PUBLIC_BASE_URL: "https://composio-proxy.test",
 };
+
+/** Split-brain proxy: INTERNAL_AUTH ≠ COMPOSIO_SESSION ≠ WORKER_TO_HARNESS. */
+const splitEnv: Env = {
+  COMPOSIO_API_KEY: "ck_test_not_real",
+  INTERNAL_AUTH_SECRET: INTERNAL,
+  COMPOSIO_SESSION_SECRET: SESSION,
+  WORKER_TO_HARNESS_SECRET: HARNESS,
+  PUBLIC_BASE_URL: "https://composio-proxy.test",
+};
+
+/** Auth-only probe: missing user_id → 400 after auth; 401 if auth fails. */
+async function probeInternalAuth(
+  headers: Record<string, string>,
+  probeEnv: Env = env,
+): Promise<Response> {
+  return handleRequest(
+    new Request("https://composio-proxy.test/internal/session", {
+      method: "POST",
+      headers: { "content-type": "application/json", ...headers },
+      body: JSON.stringify({}),
+    }),
+    probeEnv,
+  );
+}
 
 test("GET /health", async () => {
   const res = await handleRequest(new Request("https://composio-proxy.test/health"), env);
@@ -101,4 +129,111 @@ test("POST /mcp accepts valid token then fails upstream without real Composio (o
 test("404 unknown path", async () => {
   const res = await handleRequest(new Request("https://composio-proxy.test/nope"), env);
   assert.equal(res.status, 404);
+});
+
+// --- Multi-candidate internal auth (diagnosis (b) / RC2) ---
+
+test("internalSecrets returns all distinct ≥16 candidates", () => {
+  const list = internalSecrets(splitEnv);
+  assert.deepEqual(list, [INTERNAL, SESSION, HARNESS]);
+});
+
+test("requireInternalAuth accepts INTERNAL_AUTH_SECRET via Bearer", async () => {
+  const res = await probeInternalAuth({ authorization: `Bearer ${INTERNAL}` }, splitEnv);
+  assert.equal(res.status, 400);
+  const body = (await res.json()) as { error: { code: string } };
+  assert.equal(body.error.code, "invalid_body");
+});
+
+test("requireInternalAuth accepts COMPOSIO_SESSION_SECRET via x-fromdonna-internal", async () => {
+  // Gateway mint style B with COMPOSIO_SESSION_SECRET while proxy also has INTERNAL_AUTH
+  const res = await probeInternalAuth({ "x-fromdonna-internal": SESSION }, splitEnv);
+  assert.equal(res.status, 400);
+  const body = (await res.json()) as { error: { code: string } };
+  assert.equal(body.error.code, "invalid_body");
+});
+
+test("requireInternalAuth accepts WORKER_TO_HARNESS_SECRET via Bearer", async () => {
+  const res = await probeInternalAuth({ authorization: `Bearer ${HARNESS}` }, splitEnv);
+  assert.equal(res.status, 400);
+});
+
+test("requireInternalAuth accepts both header styles for same secret", async () => {
+  const bearer = await probeInternalAuth({ authorization: `Bearer ${SECRET}` }, env);
+  assert.equal(bearer.status, 400);
+
+  const internal = await probeInternalAuth({ "x-fromdonna-internal": SECRET }, env);
+  assert.equal(internal.status, 400);
+
+  // Prefer x-fromdonna-internal when both present (first in requireInternalAuth)
+  const both = await probeInternalAuth(
+    { authorization: `Bearer wrong-secret-not-matching!!`, "x-fromdonna-internal": SECRET },
+    env,
+  );
+  assert.equal(both.status, 400);
+});
+
+test("requireInternalAuth rejects wrong secret with 401", async () => {
+  const res = await probeInternalAuth(
+    { authorization: "Bearer totally-wrong-secret-xx" },
+    splitEnv,
+  );
+  assert.equal(res.status, 401);
+  const body = (await res.json()) as { error: { code: string } };
+  assert.equal(body.error.code, "unauthorized");
+});
+
+test("requireInternalAuth rejects missing auth with 401", async () => {
+  const res = await probeInternalAuth({}, splitEnv);
+  assert.equal(res.status, 401);
+});
+
+// --- Connect toolkit canonicalize (diagnosis (e) / RC5) ---
+
+test("POST /internal/connect accepts alias toolkit (google_drive → googledrive)", async () => {
+  const res = await handleRequest(
+    new Request("https://composio-proxy.test/internal/connect", {
+      method: "POST",
+      headers: {
+        "x-fromdonna-internal": SECRET,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        user_id: "telegram:1",
+        toolkit: "google_drive",
+        toolkits: ["googledrive", "gmail"],
+      }),
+    }),
+    env,
+  );
+  // Must not 403 toolkit_not_allowed — alias canonicalized before allowlist check
+  assert.notEqual(res.status, 403);
+  assert.ok([200, 502].includes(res.status), `unexpected status ${res.status}`);
+  if (res.status === 502) {
+    const body = (await res.json()) as { error: { code: string } };
+    assert.ok(
+      body.error.code === "composio_connect_failed" || body.error.code === "composio_link_failed",
+    );
+  }
+});
+
+test("POST /internal/connect rejects toolkit not in allowlist", async () => {
+  const res = await handleRequest(
+    new Request("https://composio-proxy.test/internal/connect", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${SECRET}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        user_id: "telegram:1",
+        toolkit: "not_a_real_toolkit",
+        toolkits: ["gmail"],
+      }),
+    }),
+    env,
+  );
+  assert.equal(res.status, 403);
+  const body = (await res.json()) as { error: { code: string } };
+  assert.equal(body.error.code, "toolkit_not_allowed");
 });
