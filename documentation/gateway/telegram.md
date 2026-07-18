@@ -2,18 +2,16 @@
 
 ## Outbound delivery mode
 
-Sandbox Hermes uses **native Telegram draft streaming** for DMs:
+**Product default: streaming off.** Baked in `E2B-Template/config/hermes/config.yaml`:
 
 | Setting | Value |
 |---------|--------|
-| `streaming.enabled` | `true` (baked in template `config/hermes/config.yaml`) |
-| `streaming.transport` | `auto` → **`sendMessageDraft`** in private chats (official animated preview) |
-| Groups / topics | Fall back to edit-based progressive updates (Telegram does not support drafts there) |
-| Final message | Normal `sendMessage` (draft is ephemeral until finalized) |
+| `streaming.enabled` | **`false`** |
+| `display.platforms.telegram.streaming` | **`false`** |
+| Why | Mid-turn draft/stream lines can mark content delivered and **suppress the real final answer** on multi-step tool turns (e.g. Gmail via Composio). Prefer a **single final `sendMessage`**. |
+| Proxy | Worker Bot API proxy still allowlists draft methods (`sendMessageDraft`, etc.) under chat-scoped binding if streaming is ever re-enabled — do not re-enable without a live multi-tool retest |
 
-API surface: [Bot API `sendMessageDraft`](https://core.telegram.org/bots/api#sendmessagedraft) (Bot API 9.5+). Same non-zero `draft_id` updates animate in place on clients.
-
-Gateway Bot API proxy allowlists `sendMessageDraft` / rich draft methods under chat-scoped binding (`bot_api_proxy.ts`).
+Do **not** document or ship `streaming.enabled: true` for FromDonna Telegram unless product explicitly flips this after verification.
 
 ## Scope
 
@@ -45,10 +43,12 @@ Source: `cloudflare/gateway/`
 
 | Secret | Purpose |
 |--------|---------|
-| `TELEGRAM_BOT_TOKEN` | Bot API token; outbound `sendMessage` only from Worker |
+| `TELEGRAM_BOT_TOKEN` | Real Bot API token — **Worker only**. Sandbox outbound goes through `/telegram-bot-api/*` proxy; Worker attaches this token. Never inject into E2B. |
 | `TELEGRAM_WEBHOOK_SECRET` | Telegram `secret_token`; checked via `X-Telegram-Bot-Api-Secret-Token` |
 | `E2B_API_KEY` | Create / connect / resume sandboxes |
-| `WORKER_TO_HARNESS_SECRET` | Worker → harness auth; injected into process via `/bootstrap` |
+| `WORKER_TO_HARNESS_SECRET` | Worker → harness auth; injected into process via `/bootstrap`; also used to mint Bot API proxy tokens |
+| `LLM_CAPABILITY_SECRET` | HMAC for short-lived LLM proxy capabilities (`x-llm-capability`) |
+| `COMPOSIO_SESSION_SECRET` | **Same value** on gateway **and** `fromdonna-composio-proxy` (MCP Bearer HMAC + internal mint auth). Missing/mismatched → provision hard-fail / empty Composio. See [../tooling/composio.md](../tooling/composio.md). |
 
 ### Worker vars (`wrangler.toml`)
 
@@ -57,6 +57,7 @@ Source: `cloudflare/gateway/`
 | `E2B_TEMPLATE` | `fromdonna-hermes` |
 | `HARNESS_PORT` | `8788` |
 | `E2B_SANDBOX_DOMAIN` | `e2b.dev` |
+| `COMPOSIO_PROXY_URL` | Public composio-proxy base (for sandbox MCP URL / ops); **in-Worker mint uses service binding** |
 
 ### Worker bindings
 
@@ -64,8 +65,7 @@ Source: `cloudflare/gateway/`
 |---------|----------|
 | `FROMDONNA_ROUTING` | D1 `fromdonna-routing` |
 | `USER_STATE` | R2 `fromdonna-user-state` (runtime checkpoints) |
-
-Also: `LLM_CAPABILITY_SECRET` (HMAC for short-lived proxy tokens).
+| `COMPOSIO_PROXY` | Service binding → `fromdonna-composio-proxy` (mint/connect; avoids CF **1042** on Worker→Worker `workers.dev` fetch) |
 
 ---
 
@@ -74,11 +74,12 @@ Also: `LLM_CAPABILITY_SECRET` (HMAC for short-lived proxy tokens).
 From the user side: **DM the bot → get a private Hermes**. No setup, no “pick a sandbox,” no extra friction.
 
 1. User texts `@fromdonna_bot`
-2. Worker looks up their `(gateway, gateway_user_id)` identity in D1
-3. **No row / failed** → create E2B runtime, `/health`, `/bootstrap`, **R2 restore if any**, mark `ready`
-4. **Ready** → connect/resume → inject update into **official Hermes Telegram gateway** in the sandbox
-5. Hermes replies via **Worker Bot API proxy** (sandbox never holds the real bot token)
-6. After the agent session finishes → sandbox **stages** a checkpoint; Worker **pulls** it to R2 (Architecture B)
+2. Worker **early `sendChatAction(typing)`** with the real bot token (best-effort, in parallel with D1) so the user sees typing during resume/inject — not fake reply text
+3. Worker looks up their `(gateway, gateway_user_id)` identity in D1
+4. **No row / failed** → create E2B runtime, `/health`, `/bootstrap` (incl. Composio mint when configured), **R2 restore if any**, mark `ready` only if provision policy passes (Composio **hard-require** on provision — see [../tooling/composio.md](../tooling/composio.md))
+5. **Ready** → connect/resume → **warm path** (if harness health already shows `gateway_running` + proxy ready): skip per-message `/bootstrap` and skip blocking pre-inject checkpoint pull; else full soft re-bootstrap. Then inject **raw Telegram Update** into **official Hermes Telegram gateway** in the sandbox
+6. Hermes replies via **Worker Bot API proxy** (sandbox holds proxy token only; Worker holds real bot token)
+7. After the agent session finishes → sandbox **stages** a checkpoint; Worker **pulls** it to R2 (Architecture B)
 
 Concurrent first messages: only one request wins the D1 insert claim; others see `provisioning` and are asked to retry shortly. Failed provisions self-heal on the next message. Dead/broken runtimes use `replaceRuntime` (new box + restore + kill old).
 
@@ -94,7 +95,10 @@ User DMs @fromdonna_bot
   → D1 lookup (gateway, gateway_user_id)
        ├─ missing / failed → claim → E2B create → /health → /bootstrap
        │                      → R2 restore (if any) → status=ready
-       └─ ready             → E2B connect (resume + TTL) → re-bootstrap if needed
+       └─ ready             → E2B connect (resume + TTL)
+                              → warm: skip bootstrap + defer checkpoint
+                              → cold: wait /health → soft re-bootstrap
+  (Worker may already have sent sendChatAction typing at webhook)
   → POST /telegram/update  (Bearer + x-llm-capability)
   → Official Hermes TelegramAdapter.process_update
   → Outbound Telegram via Worker /telegram-bot-api/* proxy
@@ -158,8 +162,8 @@ Warm-started on port **8788** in the template.
 
 | Method | Path | Auth | Purpose |
 |--------|------|------|---------|
-| `GET` | `/health` | none | Liveness; `auth_ready`, `telegram_proxy_ready`, `gateway_running` |
-| `POST` | `/bootstrap` | body secret | Inject harness secret + Telegram proxy config + identity |
+| `GET` | `/health` | none | Liveness; `auth_ready`, `telegram_proxy_ready`, `gateway_running`, **`composio_mcp_ready`** (provision hard-requires this true) |
+| `POST` | `/bootstrap` | body secret | Inject harness secret + Telegram proxy + identity + optional `composioMcp` |
 | `POST` | `/telegram/update` | Bearer + `x-llm-capability` | Inject raw Telegram Update into official Hermes gateway |
 | `GET` | `/internal/checkpoint/export` | Bearer | Worker pulls staged runtime checkpoint |
 | `POST` | `/internal/restore` | Bearer | Worker pushes R2 checkpoint after create/replace |
@@ -245,9 +249,12 @@ npx wrangler secret put TELEGRAM_BOT_TOKEN
 npx wrangler secret put TELEGRAM_WEBHOOK_SECRET
 npx wrangler secret put E2B_API_KEY
 npx wrangler secret put WORKER_TO_HARNESS_SECRET
+npx wrangler secret put LLM_CAPABILITY_SECRET
+npx wrangler secret put COMPOSIO_SESSION_SECRET   # same value as composio-proxy
 npx wrangler deploy
 ```
 
+Also deploy/align **composio-proxy** with the **same** `COMPOSIO_SESSION_SECRET` and ensure `[[services]]` `COMPOSIO_PROXY` binding is present (see [../tooling/composio.md](../tooling/composio.md), [ops.md](./ops.md)).
 ### Point Telegram webhook
 
 ```bash
@@ -301,6 +308,7 @@ npx wrangler d1 execute fromdonna-routing --remote --command \
 
 # Harness for a known sandbox
 curl -sS "https://8788-<sandboxId>.e2b.dev/health"
+# expect: auth_ready, telegram_proxy_ready, gateway_running, composio_mcp_ready (after bootstrap)
 ```
 
 ---
@@ -312,13 +320,16 @@ Multi-tenant = **gateway-neutral routing table** on the Worker (`gateway identit
 
 ## What does *not* run in the sandbox
 
-- `hermes gateway` with `TELEGRAM_BOT_TOKEN`
-- Direct calls to `api.telegram.org` using the product bot token
-- Shared Hermes process that holds the token for all users
+- Hermes bound to the **real** `TELEGRAM_BOT_TOKEN` / direct `api.telegram.org` with the product token
+- Shared multi-user Hermes process that holds one bot token for everyone
+- Worker-style “return `{ text }` and let the Worker sendMessage” as the happy path
 
-Hermes in E2B is **agent-only**: tools + LLM loop for **one** user.
+## What *does* run in the sandbox
+
+- Official Hermes **Telegram gateway** (`GatewayRunner` + `TelegramAdapter`) for **one** user
+- Custom Bot API **base URL** + per-user **proxy token** → Worker `/telegram-bot-api/*`
+- Full agent brain: `~/.hermes`, tools, LLM via capability, Composio MCP via capability Bearer
 
 ## Relation to gateway-agnostic design
 
-Telegram is **one adapter**. Same Worker can own WhatsApp and future channels ([gateway.md](./gateway.md)).  
-After the Telegram adapter normalizes the update, the path is identical: **user → sandbox → reply → channel send**.
+Telegram is **one edge adapter** on the Worker plus **one in-sandbox official adapter**. Same Worker can own WhatsApp and future channels ([gateway.md](./gateway.md)) with the same rule: **Worker = network secrets + routing + proxies; sandbox = official channel adapter + Hermes brain.**

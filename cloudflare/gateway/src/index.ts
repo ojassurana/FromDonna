@@ -22,6 +22,11 @@ import {
   newTurnId,
   startTurn,
 } from "./turn_trace";
+import {
+  shouldSendEarlyTyping,
+  shouldSkipBootstrap,
+  shouldSkipPreInjectCheckpoint,
+} from "./warm_path";
 
 export interface Env {
   FROMDONNA_ROUTING: D1Database;
@@ -896,32 +901,65 @@ async function injectTelegramUpdate(
         }
         // fall through to inject on the new box
       } else {
-        // Pause→resume: wait for harness, then re-bootstrap proxy + start gateway.
-        // requireComposio:false — per-message inject must not 500 the turn if Composio
-        // mint is slow/down; chat still works. Each inject remints (soft) and logs
-        // clearly when MCP is not injected. Provision/replaceRuntime hard-require it.
+        // Warm path: single health probe. If gateway is already live, skip
+        // full /bootstrap (composio remint + proxy re-apply + MCP rediscover)
+        // and skip blocking pre-inject checkpoint pull — those dominated
+        // pre-typing latency (~2.5s + ~3.8s on baseline warm DM).
+        // Cold / pause→resume: wait for harness, then bootstrap soft (no
+        // requireComposio so chat still works if mint is slow).
         const t0 = Date.now();
-        await waitForHarness(env, current.runtime_id, current.runtime_domain, 90);
+        let health = await fetchHarnessHealth(env, current.runtime_id, current.runtime_domain);
+        if (!shouldSkipBootstrap(health, { requireComposio: false })) {
+          await waitForHarness(env, current.runtime_id, current.runtime_domain, 90);
+          health = await fetchHarnessHealth(env, current.runtime_id, current.runtime_domain);
+        }
         if (turnId) {
           await addTurnEvent(env.FROMDONNA_ROUTING, turnId, "harness.ready", {
             durationMs: Date.now() - t0,
             runtimeId: current.runtime_id,
+            detail: {
+              warm: shouldSkipBootstrap(health, { requireComposio: false }),
+              gateway_running: health?.gateway_running === true,
+            },
           });
         }
-        const t1 = Date.now();
-        await bootstrapHarness(env, current, { requireComposio: false });
-        if (turnId) {
-          await addTurnEvent(env.FROMDONNA_ROUTING, turnId, "bootstrap.ok", {
-            durationMs: Date.now() - t1,
-            detail: { requireComposio: false },
-          });
+
+        if (shouldSkipBootstrap(health, { requireComposio: false })) {
+          if (turnId) {
+            await addTurnEvent(env.FROMDONNA_ROUTING, turnId, "bootstrap.skipped", {
+              durationMs: 0,
+              detail: {
+                reason: "warm_gateway_ready",
+                composio_mcp_ready: health?.composio_mcp_ready === true,
+              },
+            });
+          }
+        } else {
+          const t1 = Date.now();
+          await bootstrapHarness(env, current, { requireComposio: false });
+          if (turnId) {
+            await addTurnEvent(env.FROMDONNA_ROUTING, turnId, "bootstrap.ok", {
+              durationMs: Date.now() - t1,
+              detail: { requireComposio: false },
+            });
+          }
         }
-        // Capture prior turn's staged checkpoint before this turn overwrites state.
-        await pullCheckpointOnce(env, current);
-        if (turnId) {
-          await addTurnEvent(env.FROMDONNA_ROUTING, turnId, "checkpoint.pull", {
-            detail: { note: "pre-inject best-effort" },
-          });
+
+        // Checkpoint: never block inject on warm path. Cold path still pulls
+        // once before inject so a staged pack is not lost on first resume message.
+        if (shouldSkipPreInjectCheckpoint(health)) {
+          if (turnId) {
+            await addTurnEvent(env.FROMDONNA_ROUTING, turnId, "checkpoint.pull_deferred", {
+              detail: { note: "warm path — harvest after inject / next waitUntil" },
+            });
+          }
+        } else {
+          await pullCheckpointOnce(env, current);
+          if (turnId) {
+            await addTurnEvent(env.FROMDONNA_ROUTING, turnId, "checkpoint.pull", {
+              detail: { note: "pre-inject best-effort (cold path)" },
+            });
+          }
         }
       }
 
@@ -1069,6 +1107,26 @@ async function processTelegramUpdate(
   const turnId = newTurnId();
   const inbound = inboundPreviewFromUpdate(update);
 
+  // Early typing from the edge (real bot token). Fire in parallel with
+  // startTurn so users see "typing…" during D1 route / E2B connect / inject.
+  // Best-effort — never invent reply text; never fail the turn.
+  // Turn-event write waits until after startTurn (FK on message_turns).
+  const tType = Date.now();
+  const earlyTypingSend: Promise<"ok" | "err"> | null = shouldSendEarlyTyping(event)
+    ? telegram(env, "sendChatAction", {
+        chat_id: gatewayConversationId,
+        action: "typing",
+      })
+        .then(() => "ok" as const)
+        .catch((error) => {
+          console.error(
+            "early typing failed:",
+            error instanceof Error ? error.message : error,
+          );
+          return "err" as const;
+        })
+    : null;
+
   await startTurn(env.FROMDONNA_ROUTING, {
     turnId,
     userId,
@@ -1084,6 +1142,18 @@ async function processTelegramUpdate(
     inboundKind: inbound.kind,
     inboundPreview: inbound.preview,
   });
+
+  if (earlyTypingSend) {
+    ctx.waitUntil(
+      earlyTypingSend.then(async (outcome) => {
+        await addTurnEvent(env.FROMDONNA_ROUTING, turnId, "gateway.early_typing", {
+          ok: outcome === "ok",
+          durationMs: Date.now() - tType,
+          detail: { source: "worker_edge" },
+        });
+      }),
+    );
+  }
 
   try {
     await addTurnEvent(env.FROMDONNA_ROUTING, turnId, "route.start", { status: "routing" });
