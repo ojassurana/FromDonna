@@ -3,16 +3,6 @@ name = "fromdonna-gateway"
 main = "src/index.ts"
 compatibility_date = "2026-07-13"
 # Free plan: no custom cpu_ms. Hermes turns run via waitUntil after the channel is ACKed.
-workers_dev = true
-preview_urls = true
-
-# Ops UI host (message-flow dashboard). workers.dev URL still works.
-# Live DNS: dashboard CNAME → fromdonna-gateway.code-df4.workers.dev (proxied)
-# + zone Worker routes (managed here so deploys keep the binding).
-routes = [
-  { pattern = "dashboard.fromdonna.com/*", zone_name = "fromdonna.com" },
-  { pattern = "dashboard.fromdonna.com", zone_name = "fromdonna.com" },
-]
 
 [[d1_databases]]
 binding = "FROMDONNA_ROUTING"
