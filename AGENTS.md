@@ -34,6 +34,18 @@ Production multi-user Gmail/Drive/GitHub/… via **Composio**. Full write-up: [d
 3. **User connects** via Composio `COMPOSIO_MANAGE_CONNECTIONS` / proxy `POST /internal/connect` → `connect.composio.dev` login URL (browser once). Gateway `mintComposioConnectLink` exists but is not a Telegram `/connect` command yet.
 4. After **any** harness/composio template change: **`cd E2B-Template && npm run build:prod`** (alias `fromdonna-hermes`). Existing sandboxes keep old image until recreated.
 
+## Product MCP doors (future MCP connectors)
+
+When adding another **multi-user MCP** (secrets / per-user identity outside E2B) — **not** plain HTTP APIs, **not** a second OAuth vault for Gmail-class apps:
+
+1. **Shared product `/mcp` URL** for all users; identity = **capability Bearer** (process env in harness; yaml `${…}` only).
+2. **Real vendor/product secrets only on the MCP door Worker** — never gateway, E2B, or git.
+3. Hermes is the **MCP client** to our door (`list_tools` → expand into `tools[]`); Worker reverse-proxies or terminates MCP upstream.
+4. Prefer the **same capability/session family** as Composio (HMAC claims, sticky upstream ids in D1 if sessionful, allowlist policy). Do not invent a third auth model lightly.
+5. Full checklist: [documentation/tooling/mcp-proxy-protocol.md](./documentation/tooling/mcp-proxy-protocol.md). Reference implementation: [composio.md](./documentation/tooling/composio.md). Buckets overview: [general.md](./documentation/tooling/general.md).
+
+**Not this bucket:** plain product HTTP APIs → api-proxy; multi-user OAuth apps → extend Composio allowlist first.
+
 ## AWS CLI (this server)
 
 - AWS CLI is installed; config lives in `~/.aws/`.

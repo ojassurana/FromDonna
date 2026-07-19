@@ -33,7 +33,8 @@ Rules:
 | **MCP (generic)** | Vendor/custom MCP with auth | Shared process/URL outside E2B by default | Per-user session/token vaulted outside E2B | Prefer Worker as MCP client; agent gets tools |
 | **API** | Plain HTTP APIs (e.g. **Exa**) | Upstream via **api-proxy** | Product key on api-proxy only | Hermes tools → api-proxy (stub today) → vendor |
 
-Composio is the **OAuth apps** bucket implemented as a **product MCP door** (specialized Worker). Details: [composio.md](./composio.md).
+Composio is the **OAuth apps** bucket implemented as a **product MCP door** (specialized Worker) and the **reference** for future multi-user MCPs. Details: [composio.md](./composio.md).  
+To add another product MCP (not plain HTTP): [mcp-proxy-protocol.md](./mcp-proxy-protocol.md).
 
 ## How each is managed
 
@@ -58,11 +59,13 @@ Full write-up: [composio.md](./composio.md).
 
 ### 3. MCP (generic / non-Composio)
 
-- Multi-user product MCP with secrets: **Worker is the MCP client** (or reverse-proxy like composio-proxy).
+- Multi-user product MCP with secrets: **Worker door** (reverse-proxy or MCP client) — **same pattern as composio-proxy**.
+- Hermes is the **MCP client** to **our** shared `/mcp` URL; identity is a **per-user capability Bearer** in harness process env; real product secrets stay on the Worker.
 - Local stdio MCP with **no secrets** may run in that user’s E2B.
-- Do not reimplement vendor MCP inside an OAuth vault you do not own.
+- Do not reimplement vendor OAuth vaults you do not own (prefer Composio for Gmail-class apps).
 
-**Exception — Composio:** Hermes *is* the MCP client to **our** proxy URL; the proxy holds the product key. That is intentional (native Hermes MCP + capability Bearer).
+**Protocol to add more product MCPs:** [mcp-proxy-protocol.md](./mcp-proxy-protocol.md)  
+**Reference implementation:** [composio.md](./composio.md) (Composio is the first full door, not the only allowed MCP forever).
 
 ### 4. API (Exa live)
 

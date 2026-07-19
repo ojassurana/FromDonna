@@ -9,6 +9,7 @@ Multi-user app connections (Gmail, Drive, GitHub, …) via **Composio**.
 | Related | Path |
 |---------|------|
 | Connector buckets overview | [general.md](./general.md) |
+| **Protocol: adding another product MCP** | [mcp-proxy-protocol.md](./mcp-proxy-protocol.md) (Composio is the reference implementation) |
 | Gateway bootstrap / mint | `cloudflare/gateway/src/composio.ts` |
 | Gateway → proxy | **Service binding** `COMPOSIO_PROXY` (not public `workers.dev` fetch — CF **1042**) |
 | Proxy Worker | `cloudflare/composio-proxy/` |
