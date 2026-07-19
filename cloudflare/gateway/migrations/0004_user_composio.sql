@@ -1,5 +1,6 @@
 -- Per-user Composio binding: forever identity rules (toolkits allowlist).
--- Composio user_id === product user_id. Short-lived MCP tokens are not stored here.
+-- Composio user_id === product user_id.
+-- Capability Bearer (30d default HMAC) is NOT stored here — harness process env only.
 
 CREATE TABLE IF NOT EXISTS user_composio (
   user_id TEXT PRIMARY KEY REFERENCES user_agents(user_id),

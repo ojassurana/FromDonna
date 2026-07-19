@@ -1,6 +1,7 @@
 /**
- * Short-lived MCP session tokens for Hermes → composio-proxy.
- * HMAC-SHA256 over payload; secret never leaves Workers.
+ * Hermes → composio-proxy capability tokens (HMAC-SHA256 over payload).
+ * Production default TTL is 30 days (see env.sessionTtlSeconds) — not a short-lived
+ * per-turn nonce. Secret never leaves Workers.
  */
 
 export type SessionClaims = {

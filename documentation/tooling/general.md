@@ -88,13 +88,14 @@ Full write-up: [composio.md](./composio.md).
 | Gateway D1 | `user_id`, routing, `user_composio` (toolkits + sticky session ids) |
 | Composio | OAuth connections for that `user_id` |
 | R2 | Runtime checkpoints (Hermes home), not OAuth |
-| Sandbox only | Short-lived MCP capability Bearer in Hermes config |
+| Sandbox only | Short-lived **LLM** capability; **Composio MCP capability Bearer in harness process env** (`FROMDONNA_COMPOSIO_MCP_TOKEN` — yaml holds `${…}` placeholder only); API stub until api-proxy capability ships |
 
 ## What each E2B gets
 
 - Code, shell, secret-free CLIs  
 - Hermes config pointing at **Workers** (llm-proxy, api-proxy stub, composio-proxy MCP)  
-- Short-lived **LLM** capability; **Composio** capability Bearer (30d default); **API stub** until capability ships for api-proxy  
+- Short-lived **LLM** capability; **Composio** capability Bearer in **process env** (30d default claim; re-minted on bootstrap); **API stub** until capability ships for api-proxy  
+- Hermes `mcp_servers.composio` yaml uses `Bearer ${FROMDONNA_COMPOSIO_MCP_TOKEN}` — **not** the raw token on disk  
 - **Not** long-lived Gmail/GitHub/Exa/Composio product secrets  
 
 ## Explicit non-goals

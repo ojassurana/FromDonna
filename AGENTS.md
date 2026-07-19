@@ -22,14 +22,16 @@ Production multi-user Gmail/Drive/GitHub/… via **Composio**. Full write-up: [d
 | Piece | Where | Rule |
 |--------|--------|------|
 | `COMPOSIO_API_KEY` | **`fromdonna-composio-proxy` secret only** | Never gateway, never E2B, never git |
-| Shared MCP URL | `https://fromdonna-composio-proxy…/mcp` | Same for all users |
-| Per-user identity | Bearer HMAC session token | Minted by gateway at bootstrap; **30d TTL** default |
+| Shared MCP URL | `https://fromdonna-composio-proxy…/mcp` | Same for all users (product door) |
+| Per-user identity | Bearer HMAC session token | Minted by gateway at bootstrap; **30d TTL** default (not short-lived) |
 | Sticky tool-router session | D1 `user_composio.composio_session_id` | Reuse across E2B recreate |
+| Sticky upstream MCP URL | D1 `user_composio.composio_mcp_url` | Composio-hosted session target — **not** the shared product `/mcp` URL |
 | Toolkit allowlist | D1 `user_composio.toolkits_json` | Forever policy (seeded once) |
+| Capability Bearer | Harness **process env** only | `FROMDONNA_COMPOSIO_MCP_TOKEN`; yaml has `${…}` placeholder only |
 
-1. **Gateway** `ensureUserComposio` + `mintComposioMcpAccess` on harness bootstrap → injects `composioMcp` into sandbox.
-2. **Harness** writes Hermes `mcp_servers.composio` (url + Bearer only).
-3. **User connects** via Composio `COMPOSIO_MANAGE_CONNECTIONS` / `POST /internal/connect` → `connect.composio.dev` login URL (browser once).
+1. **Gateway** `ensureUserComposio` + `mintComposioMcpAccess` on harness bootstrap → injects `composioMcp` into sandbox. Provision/replace = **hard** `requireComposio`; per-message inject = **soft** (warm TG gateway may **skip** bootstrap entirely).
+2. **Harness** writes official Hermes `mcp_servers.composio` block: shared `url`, `Authorization: Bearer ${FROMDONNA_COMPOSIO_MCP_TOKEN}`, `connect_timeout: 60`, `timeout: 180`, `skip_preflight: true`. Real token stays in process env; re-bootstrap reloads MCP if gateway already running.
+3. **User connects** via Composio `COMPOSIO_MANAGE_CONNECTIONS` / proxy `POST /internal/connect` → `connect.composio.dev` login URL (browser once). Gateway `mintComposioConnectLink` exists but is not a Telegram `/connect` command yet.
 4. After **any** harness/composio template change: **`cd E2B-Template && npm run build:prod`** (alias `fromdonna-hermes`). Existing sandboxes keep old image until recreated.
 
 ## AWS CLI (this server)

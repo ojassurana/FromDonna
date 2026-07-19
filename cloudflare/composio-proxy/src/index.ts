@@ -2,7 +2,7 @@
  * FromDonna Composio proxy Worker (fromdonna-composio-proxy).
  *
  * - Holds COMPOSIO_API_KEY
- * - Mints short-lived MCP session tokens for Hermes
+ * - Mints per-user MCP capability tokens for Hermes (default TTL 30d)
  * - Proxies MCP HTTP to Composio tool-router session MCP
  * - Internal APIs for gateway: ensure session + connect links
  *

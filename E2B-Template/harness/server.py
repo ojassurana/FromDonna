@@ -714,7 +714,10 @@ class TelegramProxyBootstrap(BaseModel):
 
 
 class ComposioMcpBootstrap(BaseModel):
-    """Short-lived Composio MCP access via fromdonna-composio-proxy (no API key)."""
+    """Per-user Composio MCP capability via fromdonna-composio-proxy (no API key).
+
+    Token TTL is product-controlled (default 30d on the proxy) — not a per-turn nonce.
+    """
 
     url: str = Field(min_length=8, max_length=512)
     token: str = Field(min_length=16, max_length=4096)

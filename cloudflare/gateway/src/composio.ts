@@ -179,9 +179,11 @@ function sleep(ms: number): Promise<void> {
 }
 
 /**
- * Mint production-duration MCP access for Hermes via composio-proxy.
+ * Mint production-duration (default 30d) MCP access for Hermes via composio-proxy.
  * Reuses sticky Composio session when D1 has one (same user forever).
- * Soft-fails (returns null) if proxy is unreachable — gateway bootstrap still succeeds.
+ * Returns null on failure (never throws). Callers decide hard vs soft:
+ *   - bootstrapHarness({ requireComposio: true })  → provision/replace fails
+ *   - bootstrapHarness({ requireComposio: false }) → inject continues without Composio
  */
 export async function mintComposioMcpAccess(
   env: ComposioEnv,

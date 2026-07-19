@@ -46,11 +46,13 @@ fromdonna-gateway  (Cloudflare Worker)
 | Gateway Worker | `https://fromdonna-gateway.code-df4.workers.dev` | `GET /health` |
 | LLM proxy | `https://fromdonna-llm-proxy.code-df4.workers.dev` | `GET /health` + chat completion |
 | API proxy | `https://fromdonna-api-proxy.code-df4.workers.dev` | `GET /health` + Exa search (stub) |
-| Telegram webhook | Bot API `getWebhookInfo` | URL matches gateway; `last_error` null |
-| D1 | `fromdonna-routing` | `SELECT … FROM user_agents` |
+| **Composio proxy** | `https://fromdonna-composio-proxy.code-df4.workers.dev` | `GET /health`; mint smoke via gateway **service binding** path / internal session (see [../tooling/composio.md](../tooling/composio.md)) |
+| Ops dashboard | `https://dashboard.fromdonna.com/` (`fromdonna-ops-dashboard`) | UI loads; `/api/turns` if used |
+| Telegram webhook | Bot API `getWebhookInfo` | URL matches gateway; `last_error` null; `allowed_updates` includes `callback_query` |
+| D1 | `fromdonna-routing` | `SELECT … FROM user_agents` (+ `user_composio` when diagnosing Gmail) |
 | R2 checkpoints | `fromdonna-user-state` | manifest `users/{userId}/manifests/latest.json` |
 | E2B template | alias `fromdonna-hermes` | `npm run build:prod` / smoke |
-| Per-user harness | `https://8788-{id}.e2b.dev/health` | `auth_ready` + `telegram_proxy_ready` after bootstrap |
+| Per-user harness | `https://8788-{id}.e2b.dev/health` | `auth_ready` + `telegram_proxy_ready` + **`composio_mcp_ready`** after bootstrap |
 
 **Per-user resource model (D1 routing + E2B live runtime + R2 checkpoint):** see [../deployment/memorymanagement.md](../deployment/memorymanagement.md#three-per-user-resources).
 
@@ -69,6 +71,7 @@ export CLOUDFLARE_ACCOUNT_ID="df4acced87263715777b0c2068d03b22"
 echo "gateway:" && curl -sS https://fromdonna-gateway.code-df4.workers.dev/health
 echo "llm:" && curl -sS https://fromdonna-llm-proxy.code-df4.workers.dev/health
 echo "api:" && curl -sS https://fromdonna-api-proxy.code-df4.workers.dev/health
+echo "composio:" && curl -sS https://fromdonna-composio-proxy.code-df4.workers.dev/health
 
 # Webhook (requires TELEGRAM_BOT_TOKEN in env)
 curl -sS "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getWebhookInfo" \
@@ -275,7 +278,7 @@ Details: [../deployment/memorymanagement.md](../deployment/memorymanagement.md).
 
 1. **Gateway Worker** — D1 routing, provision/replaceRuntime, E2B create/connect, bootstrap (incl. Composio mint), inject `/telegram/update`, Bot API proxy, R2 checkpoint harvest/restore
 2. **Harness** — official Hermes Telegram runtime; `/health`, `/bootstrap` (+ `composioMcp`), `/telegram/update`, checkpoint export/restore
-3. **E2B template** — `fromdonna-hermes` warm harness on 8788; checkpoint packer; agent-only config → llm-proxy; **web.backend: exa** via api-proxy; Composio MCP via composio-proxy
+3. **E2B template** — `fromdonna-hermes` warm harness on 8788; checkpoint packer; Hermes config without **real** channel tokens (proxy + capabilities only) → llm-proxy; **web.backend: exa** via api-proxy; Composio MCP via composio-proxy; **official in-sandbox Telegram gateway**
 4. **API proxy** — `fromdonna-api-proxy`; Exa reverse proxy; real `EXA_API_KEY` only here; sandbox uses STUB + `EXA_BASE_URL`
 5. **Composio proxy** — `fromdonna-composio-proxy`; `COMPOSIO_API_KEY` + session HMAC; Hermes MCP capability Bearer; sticky sessions in D1
 6. **LLM proxy** — capability tokens; credentials stay off sandbox

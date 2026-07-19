@@ -65,7 +65,7 @@ One reusable template (e.g. `fromdonna-hermes`) so every user sandbox starts wit
 |-------|----------|--------|
 | **Base OS / runtimes** | Python, Node, `uv`, build tools | Pin versions |
 | **Hermes** | Official install **or** your modified tree | Pin commit/tag |
-| **Hermes config (defaults)** | Tools on/off, agent-only, no gateway tokens | Secrets via env at create only if unavoidable |
+| **Hermes config (defaults)** | Tools on/off; **no real channel tokens** (proxy + capabilities); official TG adapter runs in-sandbox | Secrets via bootstrap / create only if unavoidable |
 | **CLIs** | `gh`, `gog`, `ffmpeg`, `jq`, custom bins | No real API keys in image |
 | **Plugins** | Hermes plugins you ship to all users | Product-wide, not per-user experiments |
 | **Bundled skills** | Skills every user should start with | Per-user skills still grow in live `~/.hermes` |
@@ -128,7 +128,7 @@ For CLIs that need API keys at runtime:
 **Stock**
 
 - Install pinned Hermes release into the image  
-- Minimal agent-only config  
+- Minimal config: **no real bot token**; Telegram via Worker proxy base URL after bootstrap  
 
 **Modified Hermes (your patches / fork)**
 
@@ -183,7 +183,7 @@ wait until port accepts connections
 
 Build captures a snapshot with the process **already running** → `Sandbox.create` is much cheaper than “install + boot Hermes from zero” every time.
 
-**Caveat:** env frozen at start — create-time `envVars` do not update the snapshotted uvicorn. FromDonna handles this with **`POST /bootstrap`** after create, and **capability on each `/turn`**, never long-lived provider keys in the image.
+**Caveat:** env frozen at start — create-time `envVars` do not update the snapshotted uvicorn. FromDonna handles this with **`POST /bootstrap`** after create (harness secret, Telegram proxy, optional `composioMcp`, identity), then live turns via **`POST /telegram/update`** with a short-lived LLM capability header. Legacy **`POST /turn`** is not the primary Telegram path. Never put long-lived provider keys in the image.
 
 ### 9. Build and name
 
@@ -257,9 +257,9 @@ User **R2 files** do not need moving (already durable).
 1. Pin Hermes (commit/version) + CLI versions  
 2. Apply your Hermes mods/plugins/bundled skills in the recipe  
 3. Copy harness (`checkpoint.py`, gateway runtime) + default config  
-4. Default config: agent-only, no channel tokens  
-5. MCP: only secret-free local in-image; privileged MCP via Worker  
-6. Warm `setStartCmd` + port wait  
+4. Default config: no real channel tokens; official in-sandbox Telegram gateway + proxy after bootstrap
+5. MCP: only secret-free local in-image; privileged MCP via Worker
+6. Warm `setStartCmd` + port wait
 7. Build → Worker `E2B_TEMPLATE=fromdonna-hermes` + R2 `USER_STATE` bound  
 8. Smoke: create sandbox → `/health` → `/bootstrap` → inject path → no product secrets in env dump  
 9. After a real turn: confirm R2 `users/{userId}/manifests/latest.json` updates  
