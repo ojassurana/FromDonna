@@ -47,7 +47,6 @@ fromdonna-gateway  (Cloudflare Worker)
 | LLM proxy | `https://fromdonna-llm-proxy.code-df4.workers.dev` | `GET /health` + chat completion |
 | API proxy | `https://fromdonna-api-proxy.code-df4.workers.dev` | `GET /health` + Exa search (stub) |
 | **Composio proxy** | `https://fromdonna-composio-proxy.code-df4.workers.dev` | `GET /health`; mint smoke via gateway **service binding** path / internal session (see [../tooling/composio.md](../tooling/composio.md)) |
-| Ops dashboard | `https://dashboard.fromdonna.com/` (`fromdonna-ops-dashboard`) | UI loads; `/api/turns` if used |
 | Telegram webhook | Bot API `getWebhookInfo` | URL matches gateway; `last_error` null; `allowed_updates` includes `callback_query` |
 | D1 | `fromdonna-routing` | `SELECT … FROM user_agents` (+ `user_composio` when diagnosing Gmail) |
 | R2 checkpoints | `fromdonna-user-state` | manifest `users/{userId}/manifests/latest.json` |
@@ -84,30 +83,11 @@ npx wrangler d1 execute fromdonna-routing --remote --command \
 
 ---
 
-## Message flow dashboard (per-turn)
+## Per-turn traces (D1)
 
-**Separate Worker** — not on the gateway. Gateway only **writes** turn rows to D1;
-the ops dashboard **reads** them.
+Gateway **writes** per-message turn rows to D1 (`message_turns` + `message_turn_events`, 7-day retention). Schema: `cloudflare/gateway/migrations/0006_message_turns.sql`. Query via `wrangler d1 execute` when debugging; there is no separate ops UI Worker.
 
-| | |
-|--|--|
-| **Worker** | `fromdonna-ops-dashboard` (`cloudflare/ops-dashboard/`) |
-| **UI** | `https://dashboard.fromdonna.com/` (also `https://fromdonna-ops-dashboard.code-df4.workers.dev/`) |
-| **Auth** | **Off for now** (open read UI — re-enable `OPS_ADMIN_SECRET` before any public share) |
-| **Storage** | D1 `fromdonna-routing` tables `message_turns` + `message_turn_events` (7-day retention; written by gateway) |
-| **Schema** | `cloudflare/gateway/migrations/0006_message_turns.sql` |
-
-```bash
-# Deploy / update dashboard
-cd ~/FromDonna/cloudflare/ops-dashboard
-npm install
-npx wrangler deploy
-
-# Open UI (no auth for now), or:
-curl -sS "https://fromdonna-ops-dashboard.code-df4.workers.dev/api/turns?limit=20" | jq .
-```
-
-Stages you will typically see:
+Typical stages:
 
 1. `webhook.received` → `route.start` → `route.ready` (or `route.provisioning`)
 2. `harness.ready` → `bootstrap.ok` → `inject.ok`
@@ -130,12 +110,12 @@ npx wrangler tail fromdonna-llm-proxy --format pretty
 cd ~/FromDonna/cloudflare/api-proxy
 npx wrangler tail fromdonna-api-proxy --format pretty
 
-# Ops dashboard (rare; mostly static)
-cd ~/FromDonna/cloudflare/ops-dashboard
-npx wrangler tail fromdonna-ops-dashboard --format pretty
+# Composio proxy
+cd ~/FromDonna/cloudflare/composio-proxy
+npx wrangler tail fromdonna-composio-proxy --format pretty
 ```
 
-Note: prefer the **message flow dashboard** for per-turn history. `console.error` on the gateway still surfaces Worker failures (harness HTTP errors, E2B create failures, etc.).
+`console.error` on the gateway surfaces Worker failures (harness HTTP errors, E2B create failures, etc.). For per-turn history, query D1 `message_turns` / `message_turn_events`.
 
 ---
 

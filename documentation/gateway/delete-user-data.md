@@ -15,7 +15,7 @@ Do **not** destroy the D1 database resource, Workers, templates, or unrelated R2
 | R2 `fromdonna-user-state` | `users/{userId}/checkpoint.tar.gz` + `manifests/latest.json` | Next provision **restores** old brain if left |
 | D1 `user_composio` | Sticky Composio session + toolkits | OAuth / MCP session binding |
 | D1 `user_agents` | Routing (user → runtime) | Optional; clear on full wipe so next DM is a fresh claim |
-| D1 `message_turns` | Per-message turn rows (ops dashboard) | User-linked traffic history |
+| D1 `message_turns` | Per-message turn rows (gateway turn_trace) | User-linked traffic history |
 | D1 `message_turn_events` | Stage events for each turn | Child of `message_turns` (FK) |
 
 **One shared R2 bucket**, per-user **prefixes** — not one bucket per user.

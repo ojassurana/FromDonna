@@ -1,5 +1,5 @@
 /**
- * Per-message turn tracing for the ops dashboard.
+ * Per-message turn tracing (D1 message_turns / message_turn_events).
  *
  * Gateway records stages as a Telegram (or future channel) update flows:
  * webhook received → D1 route/provision → sandbox inject → outbound Bot API.

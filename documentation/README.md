@@ -38,12 +38,6 @@ Architecture and ops notes for the multi-user Hermes product: one Telegram bot, 
 | [tooling/composio.md](./tooling/composio.md) | **Composio** — OAuth vault, capability Bearer, MCP proxy, storage & threat notes |
 | [tooling/api-proxy-worker.md](./tooling/api-proxy-worker.md) | **API proxy** — Exa + protocol for more HTTP connectors; keys never in E2B |
 
-### Ops UI
-
-| Doc | Contents |
-|-----|----------|
-| [gateway/ops.md](./gateway/ops.md) (Message flow dashboard) | **`fromdonna-ops-dashboard`** — `dashboard.fromdonna.com`; turn rows in D1 |
-
 ## Live path (one sentence)
 
 **User DMs `@fromdonna_bot` → gateway Worker + D1 → dedicated E2B (official Hermes Telegram gateway) → LLM proxy (capability) + API proxy (Exa stub) + composio-proxy MCP (per-user Bearer) → reply via Worker Bot API proxy; after use, Worker may pull a runtime checkpoint to R2.**
@@ -55,7 +49,6 @@ cloudflare/gateway/          Channel-agnostic gateway Worker + D1 + R2 checkpoin
 cloudflare/llm-proxy/        OpenAI-compatible inference Worker + host relay
 cloudflare/api-proxy/        HTTP API connectors (Exa first); product API keys
 cloudflare/composio-proxy/   Composio OAuth/MCP door; product COMPOSIO_API_KEY
-cloudflare/ops-dashboard/    Read-only turn dashboard (dashboard.fromdonna.com)
 E2B-Template/                Sandbox image (Hermes, harness, config)
 documentation/               This tree
 ```

@@ -282,7 +282,7 @@ export async function handleBotApiProxy(args: {
     upstream = await fetch(upstreamUrl, { method: request.method === "GET" ? "GET" : "POST" });
   }
 
-  // Trace user-visible outbound methods onto the latest open turn (ops dashboard).
+  // Trace user-visible outbound methods onto the latest open turn.
   if (routingDb && CHAT_SCOPED_METHODS.has(lower) && lower !== "sendchataction") {
     const textPreview =
       payload.kind === "json" && payload.json
