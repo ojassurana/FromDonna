@@ -5,3 +5,4 @@ Product-facing notes on how the **in-sandbox Hermes agent** behaves — files un
 | Doc | Contents |
 |-----|----------|
 | [identity-and-memory.md](./identity-and-memory.md) | **SOUL.md**, **MEMORY.md**, **USER.md** — prompt order, session freeze, `memory` tool |
+| [../Hermes Understanding/README.md](../Hermes%20Understanding/README.md) | **Instructions map** — sequential system-seed layers + hard-coded/example text |
