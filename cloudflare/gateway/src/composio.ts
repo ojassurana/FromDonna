@@ -28,17 +28,30 @@ async function proxyFetch(env: ComposioEnv, path: string, init: RequestInit): Pr
 
 /** Keep in sync with cloudflare/composio-proxy/src/toolkits.ts (Composio Tool Router slugs). */
 export const DEFAULT_COMPOSIO_TOOLKITS = [
+  // Google Workspace
   "gmail",
   "googledrive",
   "googlecalendar",
   "googlesheets",
   "googledocs",
+  "googleslides",
+  "googlemeet",
+  "googletasks",
+  "googlecontacts",
+  "googleforms",
+  "googlephotos",
+  "google_chat",
+  // Microsoft 365
+  "outlook",
+  "one_drive",
+  "excel",
+  "microsoft_teams",
+  "onenote",
+  "share_point",
+  // Other product apps
   "github",
-  "notion",
   "linkedin",
   "dropbox",
-  "splitwise",
-  "outlook",
   "dropbox_sign",
 ] as const;
 
@@ -64,6 +77,47 @@ const TOOLKIT_ALIASES: Record<string, string> = {
   google_docs: "googledocs",
   "google-docs": "googledocs",
   docs: "googledocs",
+
+  google_slides: "googleslides",
+  "google-slides": "googleslides",
+  slides: "googleslides",
+
+  google_meet: "googlemeet",
+  "google-meet": "googlemeet",
+  meet: "googlemeet",
+
+  google_tasks: "googletasks",
+  "google-tasks": "googletasks",
+  tasks: "googletasks",
+
+  google_contacts: "googlecontacts",
+  "google-contacts": "googlecontacts",
+  contacts: "googlecontacts",
+
+  google_forms: "googleforms",
+  "google-forms": "googleforms",
+  forms: "googleforms",
+
+  google_photos: "googlephotos",
+  "google-photos": "googlephotos",
+  photos: "googlephotos",
+
+  googlechat: "google_chat",
+  "google-chat": "google_chat",
+  chat: "google_chat",
+
+  onedrive: "one_drive",
+  "one-drive": "one_drive",
+
+  teams: "microsoft_teams",
+  "microsoft-teams": "microsoft_teams",
+  ms_teams: "microsoft_teams",
+
+  sharepoint: "share_point",
+  "share-point": "share_point",
+
+  "one-note": "onenote",
+  one_note: "onenote",
 
   dropboxsign: "dropbox_sign",
   "dropbox-sign": "dropbox_sign",

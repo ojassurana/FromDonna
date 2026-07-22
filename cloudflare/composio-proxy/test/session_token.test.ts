@@ -13,11 +13,18 @@ import { DEFAULT_SESSION_TTL_SECONDS, sessionTtlSeconds } from "../src/env";
 const SECRET = "test-session-secret-at-least-16-chars";
 
 test("defaultToolkits matches product allowlist length", () => {
-  assert.equal(defaultToolkits().length, 12);
+  assert.equal(defaultToolkits().length, 22);
   assert.ok(defaultToolkits().includes("gmail"));
   assert.ok(defaultToolkits().includes("googledrive"));
+  assert.ok(defaultToolkits().includes("googleslides"));
+  assert.ok(defaultToolkits().includes("one_drive"));
+  assert.ok(defaultToolkits().includes("microsoft_teams"));
+  assert.ok(defaultToolkits().includes("share_point"));
   assert.ok(defaultToolkits().includes("dropbox_sign"));
-  assert.equal(DEFAULT_COMPOSIO_TOOLKITS.length, 12);
+  assert.ok(!defaultToolkits().includes("notion"));
+  assert.ok(!defaultToolkits().includes("splitwise"));
+  assert.ok(!defaultToolkits().includes("onedrive")); // canonical is one_drive
+  assert.equal(DEFAULT_COMPOSIO_TOOLKITS.length, 22);
 });
 
 test("resolveToolkits never expands beyond default allowlist", () => {

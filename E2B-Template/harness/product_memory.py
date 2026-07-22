@@ -20,10 +20,11 @@ CONNECT_APPS_MARKER = "connect-apps"
 # Single §-style entry (Hermes memory delimiter is "\\n§\\n" between entries).
 # Keep compact — MEMORY has a ~2200 char budget and is injected every turn.
 CONNECT_APPS_MEMORY_ENTRY = (
-    "App connect (Gmail, Drive, Calendar, Sheets, Docs, GitHub, Notion, "
-    "LinkedIn, Dropbox, Splitwise, Outlook, Dropbox Sign): always load skill "
-    "`connect-apps` with skill_view and follow it. Composio MCP allowlist only "
-    "— no other OAuth connectors for this Hermes."
+    "App connect (Google: Gmail/Drive/Calendar/Sheets/Docs/Slides/Meet/"
+    "Tasks/Contacts/Forms/Photos/Chat; Microsoft: Outlook/OneDrive/Excel/"
+    "Teams/OneNote/SharePoint; plus GitHub, LinkedIn, Dropbox, Dropbox Sign): "
+    "always load skill `connect-apps` with skill_view and follow it. "
+    "Composio MCP allowlist only — no other OAuth connectors for this Hermes."
 )
 
 ENTRY_DELIMITER = "\n§\n"

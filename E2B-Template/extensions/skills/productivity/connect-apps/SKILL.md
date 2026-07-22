@@ -1,13 +1,13 @@
 ---
 name: connect-apps
-description: "Use when the user asks to connect, link, authorize, log into, or enable any allowed app (Gmail, Google Drive, Calendar, Sheets, Docs, GitHub, Notion, LinkedIn, Dropbox, Splitwise, Outlook, Dropbox Sign). One-shot Composio OAuth: call manage-connections, send the login URL once. Refuse apps outside the product allowlist — no other connectors."
+description: "Use when the user asks to connect, link, authorize, log into, or enable any allowed app (Gmail, Drive, Calendar, Sheets, Docs, Slides, Meet, Tasks, Contacts, Forms, Photos, Chat, Outlook, OneDrive, Excel, Teams, OneNote, SharePoint, GitHub, LinkedIn, Dropbox, Dropbox Sign). One-shot Composio OAuth: call manage-connections, send the login URL once. Refuse apps outside the product allowlist — no other connectors."
 version: 1.0.0
 author: FromDonna
 license: MIT
 platforms: [linux]
 metadata:
   hermes:
-    tags: [composio, oauth, connect, gmail, drive, calendar, github, notion, dropbox]
+    tags: [composio, oauth, connect, gmail, drive, calendar, github, dropbox, outlook, teams]
     category: productivity
 ---
 
@@ -22,7 +22,7 @@ When the user asks to connect an **allowlisted** app, do a **one-shot** flow: ma
 ## When to Use
 
 - User wants to **connect / link / authorize / log into / enable** an allowlisted app
-- Examples: "connect my Gmail", "link Drive", "authorize GitHub", "connect Notion", "enable Calendar"
+- Examples: "connect my Gmail", "link Drive", "authorize GitHub", "enable Calendar", "connect Teams", "link OneDrive"
 - First-time or re-auth for any app on the allowlist below
 
 **Do not use for:**
@@ -33,7 +33,9 @@ When the user asks to connect an **allowlisted** app, do a **one-shot** flow: ma
 
 ## Allowlist (canonical Composio Tool Router slugs)
 
-Only these slugs are supported. Policy source of truth is the product proxy/gateway allowlist; this skill mirrors it.
+Only these slugs are supported. Policy source of truth is the product proxy/gateway allowlist; this skill mirrors it. Every slug below exists in Composio.
+
+### Google Workspace
 
 | User phrasing (examples) | Canonical slug |
 |--------------------------|----------------|
@@ -42,17 +44,39 @@ Only these slugs are supported. Policy source of truth is the product proxy/gate
 | Google Calendar, Calendar | `googlecalendar` |
 | Google Sheets, Sheets | `googlesheets` |
 | Google Docs, Docs | `googledocs` |
+| Google Slides, Slides | `googleslides` |
+| Google Meet, Meet | `googlemeet` |
+| Google Tasks, Tasks | `googletasks` |
+| Google Contacts, Contacts | `googlecontacts` |
+| Google Forms, Forms | `googleforms` |
+| Google Photos, Photos | `googlephotos` |
+| Google Chat, Chat | `google_chat` |
+
+### Microsoft 365
+
+| User phrasing (examples) | Canonical slug |
+|--------------------------|----------------|
+| Outlook, Microsoft Outlook | `outlook` |
+| OneDrive | `one_drive` |
+| Excel, Microsoft Excel | `excel` |
+| Microsoft Teams, Teams | `microsoft_teams` |
+| OneNote | `onenote` |
+| SharePoint | `share_point` |
+
+### Other
+
+| User phrasing (examples) | Canonical slug |
+|--------------------------|----------------|
 | GitHub | `github` |
-| Notion | `notion` |
 | LinkedIn | `linkedin` |
 | Dropbox | `dropbox` |
-| Splitwise | `splitwise` |
-| Outlook, Microsoft Outlook | `outlook` |
 | Dropbox Sign, HelloSign | `dropbox_sign` |
 
-Aliases with underscores (`google_drive`, `google_calendar`, …) map to the no-underscore forms above. Prefer the canonical slug when calling tools.
+Aliases with underscores (`google_drive`, `onedrive`, `sharepoint`, …) map to the canonical forms above. Prefer the canonical slug when calling tools.
 
-**Not supported** (examples — refuse): Slack, Stripe, Zoom, DocuSign, Strava, OneDrive, SharePoint, arbitrary SaaS, "any of 1000 Composio apps", raw Google Workspace CLI OAuth (`google-workspace` skill setup), himalaya App Passwords as a substitute for Composio Gmail connect.
+**Not in Composio as standalone toolkits** (refuse): Microsoft Word, PowerPoint.
+
+**Not supported** (examples — refuse): Notion, Splitwise, Slack, Stripe, Zoom, DocuSign, Strava, arbitrary SaaS, "any of 1000 Composio apps", raw Google Workspace CLI OAuth (`google-workspace` skill setup), himalaya App Passwords as a substitute for Composio Gmail connect.
 
 ## No other connectors
 
@@ -100,6 +124,7 @@ If manage-connections / status says the toolkit is already active, say so in one
 3. **Narrating** “viewing skill / calling COMPOSIO_…” — user-facing progress for tools is disabled; stay quiet and deliver the link.
 4. **Multi-step interviews** (“do you have a Google Cloud project?”) — not needed; Composio hosts OAuth.
 5. **Putting this procedure into SOUL or MEMORY** — procedure lives here. System MEMORY (product seed + harness re-assert) only points at this skill; do not expand MEMORY into a full OAuth runbook.
+6. **Using Word/PowerPoint** — no Composio toolkit; offer Docs/Slides/Excel or OneDrive file work instead.
 
 ## Verification checklist
 

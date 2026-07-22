@@ -115,13 +115,23 @@ Composio **Tool Router slugs** (validated live against Composio).
 Underscore Google names like `google_drive` are **invalid**.
 
 ```text
+# Google Workspace (Composio slugs that exist)
 gmail, googledrive, googlecalendar, googlesheets, googledocs,
-github, notion, linkedin, dropbox, splitwise, outlook, dropbox_sign
+googleslides, googlemeet, googletasks, googlecontacts, googleforms,
+googlephotos, google_chat
+
+# Microsoft 365 (Composio slugs that exist)
+outlook, one_drive, excel, microsoft_teams, onenote, share_point
+
+# Other
+github, linkedin, dropbox, dropbox_sign
 ```
 
-Aliases are canonicalized in the proxy (`google_drive` → `googledrive`, etc.).
+Aliases are canonicalized in the proxy (`google_drive` → `googledrive`, `onedrive` → `one_drive`, `sharepoint` → `share_point`, `teams` → `microsoft_teams`, etc.).
 
-**Not in default** (need project auth configs or bad slugs): `docusign`, `strava`, `onedrive`, `sharepoint`.
+**Not in Composio as standalone toolkits:** Microsoft Word, PowerPoint.
+
+**Not in default** (product policy / not enabled): `notion`, `splitwise`, `docusign`, `strava`, and other non-allowlisted catalog apps.
 
 Source of truth: `cloudflare/composio-proxy/src/toolkits.ts`  
 Gateway seed copy: `cloudflare/gateway/src/composio.ts` (keep in sync).
