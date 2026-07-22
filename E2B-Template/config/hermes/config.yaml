@@ -86,6 +86,50 @@ plugins:
   enabled:
     - fromdonna_transport
 
+# Messaging gateways: hide non-consumer skills from catalog / skill_view / slash.
+# Same denylist on every channel (platform allowlist = all installed − this list).
+# CLI is not listed → full catalog still available if you run hermes CLI in-box.
+skills:
+  platform_disabled:
+    telegram: &messaging_skills_disabled
+      # creative
+      - architecture-diagram
+      - ascii-art
+      - ascii-video
+      - baoyu-infographic
+      - claude-design
+      - comfyui
+      - design-md
+      - excalidraw
+      - humanizer
+      - manim-video
+      - p5js
+      - popular-web-designs
+      - pretext
+      - sketch
+      - songwriting-and-ai-music
+      - touchdesigner-mcp
+      # data-science
+      - jupyter-live-kernel
+      # dogfood
+      - dogfood
+      # mlops
+      - audiocraft-audio-generation
+      - evaluating-llms-harness
+      - huggingface-hub
+      - llama-cpp
+      - segment-anything-model
+      - serving-llms-vllm
+      - weights-and-biases
+      # productivity (single skill)
+      - airtable
+      # smart-home
+      - openhue
+      # yuanbao
+      - yuanbao
+    whatsapp: *messaging_skills_disabled
+    whatsapp_cloud: *messaging_skills_disabled
+
 # Telegram platform is owned by the in-sandbox GatewayRunner bridge.
 # The Bot token is a stub — Worker owns real Bot API delivery.
 platforms:
