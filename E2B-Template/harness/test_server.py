@@ -1,4 +1,5 @@
 import concurrent.futures
+import json
 import sqlite3
 import subprocess
 import threading
@@ -283,3 +284,87 @@ def test_composio_mcp_not_ready_without_token(monkeypatch, tmp_path):
     monkeypatch.delenv("FROMDONNA_COMPOSIO_MCP_TOKEN", raising=False)
     monkeypatch.delenv("FROMDONNA_COMPOSIO_MCP_URL", raising=False)
     assert server._composio_mcp_ready() is False
+
+
+def test_extract_instructions_from_chat_completions_and_responses():
+    chat_body = {
+        "model": "grok-4.5",
+        "messages": [
+            {"role": "system", "content": "You are Donna."},
+            {"role": "user", "content": "hi"},
+        ],
+        "tools": [{"type": "function", "function": {"name": "web_search"}}],
+    }
+    assert server._extract_instructions(chat_body) == "You are Donna."
+
+    responses_body = {
+        "model": "grok-4.5",
+        "instructions": "You are Chitti.",
+        "input": [{"role": "user", "content": "hi"}],
+        "tools": [],
+    }
+    assert server._extract_instructions(responses_body) == "You are Chitti."
+
+
+def test_latest_api_request_returns_dump_summary(tmp_path, monkeypatch):
+    hermes = tmp_path / ".hermes"
+    sessions = hermes / "sessions"
+    sessions.mkdir(parents=True)
+    monkeypatch.setattr(server, "HERMES_HOME", hermes)
+    monkeypatch.setenv("HERMES_DUMP_REQUESTS", "1")
+
+    dump = {
+        "timestamp": "2026-07-22T12:00:00",
+        "session_id": "sess_abc",
+        "reason": "preflight",
+        "request": {
+            "method": "POST",
+            "url": "https://fromdonna-llm-proxy.example/v1/chat/completions",
+            "headers": {"Authorization": "Bearer ***", "Content-Type": "application/json"},
+            "body": {
+                "model": "grok-4.5",
+                "messages": [
+                    {"role": "system", "content": "SOUL seed here"},
+                    {"role": "user", "content": "ping"},
+                ],
+                "tools": [{"type": "function"}, {"type": "function"}],
+            },
+        },
+    }
+    path = sessions / "request_dump_sess_abc_20260722_120000_000000.json"
+    path.write_text(json.dumps(dump), encoding="utf-8")
+
+    listed = server.internal_list_request_dumps(authorization=f"Bearer {SECRET}")
+    assert listed["ok"] is True
+    assert listed["count"] == 1
+    assert listed["files"][0]["filename"] == path.name
+
+    summary = server.internal_latest_api_request(authorization=f"Bearer {SECRET}")
+    assert summary["ok"] is True
+    assert summary["session_id"] == "sess_abc"
+    assert summary["reason"] == "preflight"
+    assert summary["model"] == "grok-4.5"
+    assert summary["instructions"] == "SOUL seed here"
+    assert summary["instructions_chars"] == len("SOUL seed here")
+    assert summary["tools_count"] == 2
+    assert summary["api_shape"] == "chat_completions"
+
+    plain = server.internal_latest_api_request(
+        authorization=f"Bearer {SECRET}",
+        instructions_only=True,
+    )
+    assert plain.body == b"SOUL seed here"
+
+    by_name = server.internal_get_request_dump(
+        path.name,
+        authorization=f"Bearer {SECRET}",
+    )
+    assert by_name["filename"] == path.name
+    assert by_name["instructions"] == "SOUL seed here"
+
+
+def test_latest_api_request_404_when_empty(tmp_path, monkeypatch):
+    monkeypatch.setattr(server, "HERMES_HOME", tmp_path / ".hermes")
+    with pytest.raises(HTTPException) as exc:
+        server.internal_latest_api_request(authorization=f"Bearer {SECRET}")
+    assert exc.value.status_code == 404

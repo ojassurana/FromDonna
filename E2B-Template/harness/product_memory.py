@@ -24,7 +24,7 @@ CONNECT_APPS_MEMORY_ENTRY = (
     "Tasks/Contacts/Forms/Photos/Chat; Microsoft: Outlook/OneDrive/Excel/"
     "Teams/OneNote/SharePoint; plus GitHub, LinkedIn, Dropbox, Dropbox Sign): "
     "always load skill `connect-apps` with skill_view and follow it. "
-    "Composio MCP allowlist only — no other OAuth connectors for this Hermes."
+    "Composio MCP allowlist only — no other OAuth connectors for this product."
 )
 
 ENTRY_DELIMITER = "\n§\n"

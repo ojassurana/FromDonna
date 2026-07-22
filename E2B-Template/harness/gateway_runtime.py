@@ -103,7 +103,7 @@ class GatewayRuntime:
                     )
                     self._thread.start()
             if not self._ready.wait(timeout=120):
-                last_error = RuntimeError("Hermes Telegram gateway failed to start within 120s")
+                last_error = RuntimeError("Donna gateway failed to start within 120s")
                 with self._lock:
                     self._hard_reset_locked()
             elif self._start_error is not None:
@@ -115,7 +115,7 @@ class GatewayRuntime:
             logger.warning("gateway start attempt %d failed: %s", attempt + 1, last_error)
             time.sleep(0.4 * (attempt + 1))
         raise RuntimeError(
-            f"Hermes Telegram gateway failed to start: {last_error}"
+            f"Donna gateway failed to start: {last_error}"
         ) from last_error
 
     def _hard_reset_locked(self) -> None:
@@ -310,6 +310,10 @@ class GatewayRuntime:
         os.environ.setdefault("HERMES_TELEGRAM_INIT_TIMEOUT", "12")
         os.environ.setdefault("HERMES_TELEGRAM_HTTP_CONNECT_TIMEOUT", "8")
         os.environ.setdefault("HERMES_TELEGRAM_HTTP_READ_TIMEOUT", "15")
+        # Preflight dump of every LLM request body → ~/.hermes/sessions/request_dump_*.json
+        # (same mechanism as the Chitti hermes-first-api-request explainer).
+        # Image default is on (template.ts); set HERMES_DUMP_REQUESTS=0 to disable.
+        os.environ.setdefault("HERMES_DUMP_REQUESTS", "1")
         # Never let the adapter open a real Telegram webhook/poll on the shared bot.
         os.environ.pop("TELEGRAM_WEBHOOK_URL", None)
         try:

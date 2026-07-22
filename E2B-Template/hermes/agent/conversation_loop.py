@@ -141,11 +141,11 @@ def _ollama_context_limit_error(agent: Any, request_tokens: int) -> Optional[str
 
     return (
         f"Ollama loaded `{model}` with only {runtime_ctx:,} tokens of runtime "
-        f"context, but Hermes needs at least {MINIMUM_CONTEXT_LENGTH:,} tokens "
+        f"context, but the agent needs at least {MINIMUM_CONTEXT_LENGTH:,} tokens "
         "for reliable tool use.\n\n"
         "Increase the Ollama context for this model and restart/reload the "
         "model before trying again. A known-good starting point is 65,536 "
-        "tokens. In Hermes config, set `model.ollama_num_ctx: 65536` "
+        "tokens. In agent config, set `model.ollama_num_ctx: 65536` "
         "(and `model.context_length: 65536` if you also override the displayed "
         "model context). If you manage the model through an Ollama Modelfile, "
         "set `PARAMETER num_ctx 65536` there instead."
@@ -465,7 +465,7 @@ def _get_continuation_prompt(is_partial_stub: bool, dropped_tools: Optional[List
 # share one trailer to keep the guidance from drifting between the two sites.
 _CONTENT_POLICY_RECOVERY_HINT = (
     "Try rephrasing the request, narrowing the context, or "
-    "adding a fallback provider with `hermes fallback add`."
+    "adding a fallback provider in agent config."
 )
 
 
@@ -976,7 +976,7 @@ def run_conversation(
             failed = True
             _turn_exit_reason = "ollama_runtime_context_too_small"
             messages.append({"role": "assistant", "content": final_response})
-            agent._emit_status("❌ Ollama runtime context is too small for Hermes tool use")
+            agent._emit_status("❌ Ollama runtime context is too small for agent tool use")
             api_call_count -= 1
             agent._api_call_count = api_call_count
             try:
@@ -1740,7 +1740,7 @@ def run_conversation(
                     )
                     _refusal_response = (
                         "⚠️  The model declined to respond to this request "
-                        "(safety refusal — not a Hermes/gateway failure).\n\n"
+                        "(safety refusal — not a runtime/gateway failure).\n\n"
                         f"{_refusal_detail}\n\n"
                         f"{_CONTENT_POLICY_RECOVERY_HINT}"
                     )
@@ -3903,7 +3903,7 @@ def run_conversation(
                     if classified.reason == FailoverReason.content_policy_blocked:
                         _policy_response = (
                             "⚠️  The model provider's safety filter blocked this request "
-                            "(not a Hermes/gateway failure).\n\n"
+                            "(not a runtime/gateway failure).\n\n"
                             f"Provider message: {_nonretryable_summary}\n\n"
                             f"{_CONTENT_POLICY_RECOVERY_HINT}"
                         )

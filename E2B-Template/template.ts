@@ -17,6 +17,12 @@ export const template = Template()
     PATH: "/home/user/.local/bin:/home/user/venv/bin:$PATH",
     FROMDONNA_RUNTIME: "e2b",
     HERMES_HOME: "/home/user/.hermes",
+    // Dump every model API body (system seed / instructions + tools + input)
+    // to ~/.hermes/sessions/request_dump_*.json — same breadcrumb Hermes used
+    // for the Chitti "first API request" explainer. Pull via harness:
+    //   GET /internal/debug/latest-api-request
+    // Set to "0" to disable when dumps get too heavy in prod.
+    HERMES_DUMP_REQUESTS: "1",
     // Exa via dedicated API proxy (real key never in the image). Overridden at
     // create/bootstrap with the live api-proxy URL when needed.
     EXA_API_KEY: "STUB",

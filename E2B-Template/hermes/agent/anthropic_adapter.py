@@ -2547,6 +2547,16 @@ def build_anthropic_kwargs(
                 text = text.replace("Hermes agent", "Claude Code")
                 text = text.replace("hermes-agent", "claude-code")
                 text = text.replace("Nous Research", "Anthropic")
+                # FromDonna identity — same Anthropic filter avoidance.
+                text = text.replace("FromDonna", "Claude Code")
+                text = text.replace("donna-agent", "claude-code")
+                # Whole-word-ish: avoid turning "Madonna" etc. into "MadClaude Code".
+                # Identity strings use "You are Donna" / "as Donna" / standalone Donna.
+                text = text.replace("You are Donna", "You are Claude Code")
+                text = text.replace("as Donna", "as Claude Code")
+                text = text.replace("only as Donna", "only as Claude Code")
+                text = text.replace("Donna's", "Claude Code's")
+                text = text.replace("`Donna`", "`Claude Code`")
                 block["text"] = text
 
         # 3. Normalize tool names so NOTHING goes on the OAuth wire with a

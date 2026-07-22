@@ -15,7 +15,7 @@ metadata:
 
 ## Overview
 
-FromDonna connects third-party apps **only** through the live **Composio MCP** tools already wired into this Hermes (`mcp_servers.composio`). There is no separate OAuth product path, no Nango, no raw Google Cloud desktop OAuth, and no third-party connector kits.
+FromDonna connects third-party apps **only** through the live **Composio MCP** tools already wired into this agent (`mcp_servers.composio`). There is no separate OAuth product path, no Nango, no raw Google Cloud desktop OAuth, and no third-party connector kits.
 
 When the user asks to connect an **allowlisted** app, do a **one-shot** flow: map their words → toolkit slug → call manage-connections → send the login URL once → stop.
 
@@ -80,7 +80,7 @@ Aliases with underscores (`google_drive`, `onedrive`, `sharepoint`, …) map to 
 
 ## No other connectors
 
-**Hard rule for this Hermes / FromDonna sandbox:**
+**Hard rule for this FromDonna sandbox:**
 
 1. **Only** the allowlist above via **Composio MCP** is allowed for app connection.
 2. If the user asks for any other app, provider, or connector path, **refuse that path**. One clean line: that app is not enabled on Donna yet; list only allowlisted alternatives if useful.
@@ -93,7 +93,7 @@ Aliases with underscores (`google_drive`, `onedrive`, `sharepoint`, …) map to 
 
 1. **Map** the user’s phrasing to one canonical slug from the table. If ambiguous between two allowlisted apps, ask **one** specific question. If not on the allowlist → refuse (No other connectors). Completion: slug chosen or refuse sent.
 
-2. **Call Composio manage-connections** using the live MCP tool Hermes already has (name may appear as `COMPOSIO_MANAGE_CONNECTIONS` or similar manage-connections / initiate-connection tool from the `composio` MCP server). Pass the toolkit slug. Prefer manage-connections over multi-step search when the intent is purely “connect this app.” Completion: tool returned a redirect/login URL or a clear already-connected / error payload.
+2. **Call Composio manage-connections** using the live MCP tool the agent already has (name may appear as `COMPOSIO_MANAGE_CONNECTIONS` or similar manage-connections / initiate-connection tool from the `composio` MCP server). Pass the toolkit slug. Prefer manage-connections over multi-step search when the intent is purely “connect this app.” Completion: tool returned a redirect/login URL or a clear already-connected / error payload.
 
 3. **Extract the URL** from the tool result (`redirect_url`, `redirectUrl`, login link, or nested connection request). Prefer a full `https://connect.composio.dev/...` (or current Composio connect host) link. Completion: one concrete HTTPS URL ready to send, or a clear failure reason.
 

@@ -415,7 +415,7 @@ CURATOR_DRY_RUN_BANNER = (
 
 
 CURATOR_REVIEW_PROMPT = (
-    "You are running as Hermes' background skill CURATOR. This is an "
+    "You are running as Donna's background skill CURATOR. This is an "
     "UMBRELLA-BUILDING consolidation pass, not a passive audit and not a "
     "duplicate-finder.\n\n"
     "The goal of the skill collection is a LIBRARY OF CLASS-LEVEL "
@@ -463,7 +463,7 @@ CURATOR_REVIEW_PROMPT = (
     "How to work — not optional:\n"
     "1. Scan the full candidate list. Identify PREFIX CLUSTERS (skills "
     "sharing a first word or domain keyword). Examples you are likely "
-    "to find: hermes-config-*, hermes-dashboard-*, gateway-*, codex-*, "
+    "to find: config-*, dashboard-*, gateway-*, codex-*, "
     "ollama-*, anthropic-*, gemini-*, mcp-*, salvage-*, pr-*, "
     "competitor-*, python-*, security-*, etc. Expect 10-25 clusters.\n"
     "2. For each cluster with 2+ members, do NOT ask 'are these pairs "

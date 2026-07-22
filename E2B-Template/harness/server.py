@@ -1127,6 +1127,201 @@ def internal_checkpoint_export(authorization: str | None = Header(default=None))
         raise HTTPException(status_code=502, detail=f"export_failed: {exc}") from exc
 
 
+def _request_dump_dir() -> Path:
+    """Hermes writes request_dump_*.json under logs_dir = ~/.hermes/sessions."""
+    return HERMES_HOME / "sessions"
+
+
+def _list_request_dumps() -> list[Path]:
+    d = _request_dump_dir()
+    if not d.is_dir():
+        return []
+    return sorted(d.glob("request_dump_*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+
+
+def _extract_instructions(body: dict) -> str | None:
+    """Pull the system seed from either Responses or Chat Completions shape.
+
+    - Responses / Codex: body[\"instructions\"] (string)
+    - Chat Completions (FromDonna default): first system message content
+    """
+    if not isinstance(body, dict):
+        return None
+    instructions = body.get("instructions")
+    if isinstance(instructions, str) and instructions.strip():
+        return instructions
+    messages = body.get("messages")
+    if isinstance(messages, list):
+        for msg in messages:
+            if not isinstance(msg, dict):
+                continue
+            if msg.get("role") != "system":
+                continue
+            content = msg.get("content")
+            if isinstance(content, str):
+                return content
+            if isinstance(content, list):
+                parts: list[str] = []
+                for part in content:
+                    if isinstance(part, dict) and part.get("type") == "text":
+                        text = part.get("text")
+                        if isinstance(text, str) and text:
+                            parts.append(text)
+                    elif isinstance(part, str) and part:
+                        parts.append(part)
+                if parts:
+                    return "\n".join(parts)
+    return None
+
+
+def _summarize_request_dump(payload: dict, path: Path) -> dict:
+    """Build a Chitti-explainer-style summary over a Hermes request dump."""
+    request = payload.get("request") if isinstance(payload.get("request"), dict) else {}
+    body = request.get("body") if isinstance(request.get("body"), dict) else {}
+    if not body and isinstance(payload.get("body"), dict):
+        # Already reshaped (capture/body) form.
+        body = payload["body"]
+        request = payload.get("capture") if isinstance(payload.get("capture"), dict) else request
+
+    instructions = _extract_instructions(body)
+    tools = body.get("tools") if isinstance(body.get("tools"), list) else []
+    messages = body.get("messages") if isinstance(body.get("messages"), list) else None
+    input_items = body.get("input") if isinstance(body.get("input"), list) else None
+    input_count = len(input_items) if input_items is not None else (len(messages) if messages is not None else 0)
+
+    return {
+        "ok": True,
+        "path": str(path),
+        "filename": path.name,
+        "timestamp": payload.get("timestamp") or request.get("timestamp"),
+        "session_id": payload.get("session_id") or request.get("session_id"),
+        "reason": payload.get("reason") or request.get("reason"),
+        "method": request.get("method") or "POST",
+        "url": request.get("url"),
+        "model": body.get("model"),
+        "instructions_chars": len(instructions) if instructions is not None else 0,
+        "tools_count": len(tools),
+        "input_count": input_count,
+        "api_shape": (
+            "responses"
+            if isinstance(body.get("instructions"), str) or input_items is not None
+            else "chat_completions"
+        ),
+        "instructions": instructions,
+        "dump": payload,
+    }
+
+
+@app.get("/internal/debug/request-dumps")
+def internal_list_request_dumps(
+    authorization: str | None = Header(default=None),
+    limit: int = 20,
+):
+    """List Hermes request_dump_*.json files (newest first).
+
+    Enabled when HERMES_DUMP_REQUESTS is truthy (default on in this image).
+    Same dumps as https://chitti-explainers.pages.dev/hermes-first-api-request/
+    """
+    if not _authorized(authorization):
+        raise HTTPException(status_code=401, detail="unauthorized")
+    lim = max(1, min(int(limit or 20), 100))
+    dumps = _list_request_dumps()[:lim]
+    return {
+        "ok": True,
+        "dump_enabled": (os.environ.get("HERMES_DUMP_REQUESTS") or "").strip().lower()
+        in {"1", "true", "yes", "on"},
+        "dir": str(_request_dump_dir()),
+        "count": len(dumps),
+        "files": [
+            {
+                "filename": p.name,
+                "path": str(p),
+                "bytes": p.stat().st_size,
+                "mtime": p.stat().st_mtime,
+            }
+            for p in dumps
+        ],
+    }
+
+
+@app.get("/internal/debug/latest-api-request")
+def internal_latest_api_request(
+    authorization: str | None = Header(default=None),
+    instructions_only: bool = False,
+):
+    """Return the newest Hermes API request dump (full body or instructions only).
+
+    Hermes writes these on every model call when HERMES_DUMP_REQUESTS=1:
+      ~/.hermes/sessions/request_dump_{session}_{ts}.json
+
+    Query:
+      ?instructions_only=true  → only the system seed string (Responses
+                                 ``instructions`` or Chat Completions system msg)
+    """
+    if not _authorized(authorization):
+        raise HTTPException(status_code=401, detail="unauthorized")
+    dumps = _list_request_dumps()
+    if not dumps:
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                "no_request_dumps — send a Telegram message first, or ensure "
+                "HERMES_DUMP_REQUESTS=1 (default on). Dumps land under "
+                f"{_request_dump_dir()}/request_dump_*.json"
+            ),
+        )
+    path = dumps[0]
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"dump_read_failed: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=502, detail="dump_invalid_json")
+
+    summary = _summarize_request_dump(payload, path)
+    if instructions_only:
+        text = summary.get("instructions")
+        if text is None:
+            raise HTTPException(status_code=404, detail="no_instructions_in_dump")
+        from fastapi.responses import PlainTextResponse
+
+        return PlainTextResponse(text, media_type="text/plain; charset=utf-8")
+    return summary
+
+
+@app.get("/internal/debug/request-dumps/{filename}")
+def internal_get_request_dump(
+    filename: str,
+    authorization: str | None = Header(default=None),
+    instructions_only: bool = False,
+):
+    """Fetch one request dump by filename (must match request_dump_*.json)."""
+    if not _authorized(authorization):
+        raise HTTPException(status_code=401, detail="unauthorized")
+    # Path traversal guard: basename only + known prefix.
+    name = Path(filename).name
+    if name != filename or not name.startswith("request_dump_") or not name.endswith(".json"):
+        raise HTTPException(status_code=400, detail="invalid_filename")
+    path = _request_dump_dir() / name
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="dump_not_found")
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"dump_read_failed: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=502, detail="dump_invalid_json")
+    summary = _summarize_request_dump(payload, path)
+    if instructions_only:
+        text = summary.get("instructions")
+        if text is None:
+            raise HTTPException(status_code=404, detail="no_instructions_in_dump")
+        from fastapi.responses import PlainTextResponse
+
+        return PlainTextResponse(text, media_type="text/plain; charset=utf-8")
+    return summary
+
+
 @app.post("/telegram/update")
 def telegram_update(
     body: TelegramUpdateEnvelope,

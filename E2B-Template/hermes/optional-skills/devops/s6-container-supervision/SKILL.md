@@ -1,29 +1,29 @@
 ---
-name: hermes-s6-container-supervision
-description: Modify, debug, or extend the s6-overlay supervision tree inside the Hermes Agent Docker image — adding new services, debugging profile gateways, understanding the Architecture B main-program pattern.
+name: s6-container-supervision
+description: Modify, debug, or extend the s6-overlay supervision tree inside the agent Docker image — adding new services, debugging profile gateways, understanding the Architecture B main-program pattern.
 version: 1.0.0
-author: Hermes Agent
+author: Donna
 license: MIT
 platforms: [linux]
 environments: [s6]
 metadata:
   hermes:
     tags: [docker, s6, supervision, gateway, profiles]
-    related_skills: [hermes-agent, hermes-agent-dev]
+    related_skills: [donna-agent]
 ---
 
-# Hermes s6-overlay Container Supervision
+# s6-overlay Container Supervision
 
 ## When to use this skill
 
 Load this skill when you're working on:
-- Adding or removing a static service in the Hermes Docker image (something that should be supervised at every container start, like the dashboard)
+- Adding or removing a static service in the agent Docker image (something that should be supervised at every container start, like the dashboard)
 - Diagnosing why a per-profile gateway isn't starting, restarting, or surviving `docker restart`
 - Understanding why the container's CMD is `/opt/hermes/docker/main-wrapper.sh` and how leading-dash args reach the user's program
 - Modifying `cont-init.d` boot scripts (UID remap, volume seeding, profile reconciliation)
 - Changing the rendered run-script for per-profile gateways (Phase 4)
 
-If you're just running the Hermes Agent and want to use Docker, see `website/docs/user-guide/docker.md` instead.
+If you're just running the agent and want to use Docker, see `website/docs/user-guide/docker.md` instead.
 
 ## Architecture at a glance
 
@@ -135,8 +135,8 @@ Edit `S6ServiceManager._render_run_script` in `hermes_cli/service_manager.py`. T
 ### Run the docker test harness
 
 ```sh
-docker build -t hermes-agent-harness:latest .
-HERMES_TEST_IMAGE=hermes-agent-harness:latest scripts/run_tests.sh tests/docker/ -v
+docker build -t donna-agent-harness:latest .
+HERMES_TEST_IMAGE=donna-agent-harness:latest scripts/run_tests.sh tests/docker/ -v
 # Expect 19 passed, 0 xfailed against the s6 image
 ```
 
@@ -174,5 +174,5 @@ Check whether something is invoking `s6-svscanctl -t` or `/run/s6/basedir/bin/ha
 
 ## Related skills
 
-- `hermes-agent-dev`: General hermes-agent codebase navigation
-- `hermes-tool-quirks`: Specific Hermes-tool workarounds (sed/grep/etc.) — load when debugging the s6 stack's interaction with hermes built-in tools.
+- `donna-agent`: Product agent guide and capability overview
+- Agent-tool workarounds (sed/grep/etc.) — load when debugging the s6 stack's interaction with built-in tools.

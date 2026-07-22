@@ -77,3 +77,26 @@ These slots exist in the assembler but were empty for that Telegram probe:
 - Full raw dump used for examples: repo/host dump behind
   [hermes-first-api-request](https://chitti-explainers.pages.dev/hermes-first-api-request/)
   (`full-instructions.txt`).
+
+## Live dumps (FromDonna sandbox)
+
+That Chitti explainer was built from Hermes **`HERMES_DUMP_REQUESTS`** preflight files
+(`request_dump_*.json`). FromDonna enables the same flag in the E2B image.
+
+| Piece | Where |
+|--------|--------|
+| Env | `HERMES_DUMP_REQUESTS=1` in `E2B-Template/template.ts` (+ gateway runtime default) |
+| Files | `~/.hermes/sessions/request_dump_{session}_{ts}.json` |
+| Pull API | harness `GET /internal/debug/latest-api-request` (Bearer harness secret) |
+| Plain seed only | `…/latest-api-request?instructions_only=true` |
+
+**Wire shape difference:** Chitti hit xAI **Responses** (`instructions` + `input` + `tools`).
+FromDonna’s baked config uses **chat_completions** via llm-proxy (`messages` + `tools`);
+the harness summary still extracts the system message as `instructions` for easy reading.
+
+After template rebuild + a Telegram turn:
+
+```bash
+curl -sS -H "Authorization: Bearer $WORKER_TO_HARNESS_SECRET" \
+  "https://8788-<sandboxId>.<domain>/internal/debug/latest-api-request" | jq '{model, instructions_chars, tools_count, api_shape}'
+```

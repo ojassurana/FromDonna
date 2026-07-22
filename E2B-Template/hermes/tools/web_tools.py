@@ -712,7 +712,7 @@ def web_search_tool(query: str, limit: int = 5) -> str:
                     "success": False,
                     "error": (
                         "No web search provider configured. "
-                        "Run `hermes tools` to set one up."
+                        "Configure a web search backend in agent config to set one up."
                     ),
                 }
         else:
