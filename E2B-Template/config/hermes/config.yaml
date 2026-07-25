@@ -93,8 +93,8 @@ plugins:
 # Same denylist on every channel (platform allowlist = all installed − this list).
 # CLI is not listed → full catalog still available if you run hermes CLI in-box.
 skills:
-  # 0 = never spawn post-turn skill-creation curator (steals LLM from next DM).
-  creation_nudge_interval: 0
+  # Post-turn skill-creation curator (Hermes default 10). 0 = never spawn.
+  creation_nudge_interval: 10
   platform_disabled:
     telegram: &messaging_skills_disabled
       # creative
@@ -180,15 +180,14 @@ platforms:
 
 agent: {}
 
-# Background self-improvement (post-turn LLM fork) steals the proxy and can
-# delay the *next* user message by seconds–minutes ("Queued follow-up").
-# Consumer product: reply first; memory/skills are still writable mid-turn via tools.
+# Background self-improvement (post-turn LLM fork). Can delay the *next* user
+# message ("Queued follow-up") while it runs. Memory/skills also writable mid-turn.
 memory:
   memory_enabled: true
   user_profile_enabled: true
   write_approval: false
-  # 0 = never spawn post-turn memory curator (see agent_init nudge_interval).
-  nudge_interval: 0
+  # Post-turn memory curator (Hermes default 10). 0 = never spawn.
+  nudge_interval: 10
 
 # ── Composio MCP (official Hermes shape) ─────────────────────────────────
 # Same block Hermes documents for Composio (composio.dev/hermes):
