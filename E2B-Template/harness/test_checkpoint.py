@@ -68,3 +68,52 @@ def test_upload_requires_config(monkeypatch, tmp_path):
         assert False, "expected RuntimeError"
     except RuntimeError as exc:
         assert "checkpoint_not_configured" in str(exc)
+
+
+def test_local_checkpoint_status_handshake(tmp_path, monkeypatch):
+    hermes = tmp_path / ".hermes"
+    hermes.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(hermes))
+    (tmp_path / "workspace").mkdir(exist_ok=True)
+
+    assert ckpt.local_checkpoint_status(hermes_home=hermes)["state"] == "idle"
+
+    ckpt.mark_checkpoint_packing(source="test", hermes_home=hermes)
+    assert ckpt.local_checkpoint_status(hermes_home=hermes)["state"] == "packing"
+
+    # Minimal pack: empty-ish home still produces an archive.
+    (hermes / "SOUL.md").write_text("hi\n", encoding="utf-8")
+    result = ckpt.prepare_local_checkpoint(source="test", hermes_home=hermes)
+    assert result["ok"] is True
+    status = ckpt.local_checkpoint_status(hermes_home=hermes)
+    assert status["state"] == "ready"
+    assert status["bytes"] > 0
+    assert status.get("readyAt") is not None
+
+    packed = ckpt.read_local_checkpoint(consume=True, hermes_home=hermes)
+    assert packed is not None
+    # After consume: ready + tar removed — must NOT look ready (stale harvest race).
+    post = ckpt.local_checkpoint_status(hermes_home=hermes)
+    assert post["state"] == "idle"
+    assert not (hermes / "fromdonna-checkpoint-ready.json").exists()
+    assert not (hermes / "fromdonna-checkpoint-latest.tar.gz").exists()
+
+    # Tar-only leftover must not report ready.
+    (hermes / "fromdonna-checkpoint-latest.tar.gz").write_bytes(b"not-a-real-tar")
+    assert ckpt.local_checkpoint_status(hermes_home=hermes)["state"] == "idle"
+    assert ckpt.read_local_checkpoint(consume=True, hermes_home=hermes) is None
+
+    # Failed marker without a ready archive.
+    for name in (
+        "fromdonna-checkpoint-latest.tar.gz",
+        "fromdonna-checkpoint-ready.json",
+        "fromdonna-checkpoint-packing.json",
+    ):
+        p = hermes / name
+        if p.exists():
+            p.unlink()
+    ckpt.mark_checkpoint_failed("boom", hermes_home=hermes)
+    failed = ckpt.local_checkpoint_status(hermes_home=hermes)
+    assert failed["state"] == "failed"
+    assert "boom" in str(failed.get("error") or "")
+    assert failed.get("failedAt") is not None

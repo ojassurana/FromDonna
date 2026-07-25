@@ -35,6 +35,15 @@ test("derives Grok relay URL from Codex responses path", () => {
     }),
     "https://example.ngrok-free.app/v1/chat/completions",
   );
+  // Production named tunnel (cloudflared → host :9121), not session-bound ngrok.
+  assert.equal(
+    grokRelayUrl({
+      CODEX_RELAY_URL: "https://codex-relay.ojassurana.com/v1/responses",
+      RELAY_SHARED_SECRET: "x",
+      LLM_CAPABILITY_SECRET: "y",
+    }),
+    "https://codex-relay.ojassurana.com/v1/chat/completions",
+  );
   assert.equal(
     grokRelayUrl({
       CODEX_RELAY_URL: "https://example.ngrok-free.app/v1/responses",

@@ -42,7 +42,7 @@ Architecture and ops notes for the multi-user Hermes product: one Telegram bot, 
 
 ## Live path (one sentence)
 
-**User DMs `@fromdonna_bot` → gateway Worker + D1 → dedicated E2B (official Hermes Telegram gateway) → LLM proxy (capability) + API proxy (Exa stub) + composio-proxy MCP (per-user Bearer) → reply via Worker Bot API proxy; after use, Worker may pull a runtime checkpoint to R2.**
+**User DMs `@fromdonna_bot` → gateway Worker + D1 → dedicated E2B (official Hermes Telegram gateway) → LLM proxy (capability) + API proxy (Exa stub) + composio-proxy MCP (per-user Bearer) → reply via Worker Bot API proxy; after the turn, Worker harvests a runtime checkpoint to R2 then pauses the sandbox after ~1 minute of quiet.**
 
 ## Repo map
 

@@ -52,11 +52,33 @@ export function shouldSkipBootstrap(
  * Pre-inject checkpoint pull is best-effort backup. On the warm path it
  * adds multi-second RTT before the user sees typing. Prefer post-inject
  * harvest / waitUntil instead when the harness is already ready.
+ *
+ * When the harness reports no staged pack (`idle` / failed leftover), skip
+ * the dual harness+envd pull attempts — they only add cold-path latency.
+ * Still pull when state is `ready` or `packing` (or unknown without warm).
  */
 export function shouldSkipPreInjectCheckpoint(
   health: WarmPathHealth | null | undefined,
+  stage?: "ready" | "packing" | "failed" | "idle" | "unknown" | null,
 ): boolean {
-  return isWarmHarnessReady(health);
+  if (isWarmHarnessReady(health)) return true;
+  if (stage === "idle" || stage === "failed") return true;
+  return false;
+}
+
+/**
+ * Adaptive sleep between harness /health polls after E2B connect/resume.
+ * Short early delays (process often up within 1–2s); longer later so we
+ * still cover slow cold resume without burning the full 90×500ms budget
+ * as pure wait when the box is already up.
+ *
+ * `attempt` is 0-based index of the sleep *after* a failed probe.
+ */
+export function harnessHealthPollDelayMs(attempt: number): number {
+  if (attempt < 0) return 0;
+  if (attempt < 15) return 100;
+  if (attempt < 40) return 250;
+  return 500;
 }
 
 /**

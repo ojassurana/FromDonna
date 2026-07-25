@@ -23,6 +23,8 @@ import {
   startTurn,
 } from "./turn_trace";
 import {
+  harnessHealthPollDelayMs,
+  isWarmHarnessReady,
   shouldSendEarlyTyping,
   shouldSkipBootstrap,
   shouldSkipPreInjectCheckpoint,
@@ -62,15 +64,47 @@ type UserAgentRow = {
   runtime_id: string;
   runtime_domain: string | null;
   status: "provisioning" | "ready" | "failed";
+  /** Bumped on every inject; post-turn pause skips if epoch changed. */
+  activity_epoch?: number | null;
 };
 
 type E2bSandbox = { sandboxID: string; domain?: string | null };
 
+type CheckpointStageState = "ready" | "packing" | "failed" | "idle" | "unknown";
+
+type HarvestResult = {
+  ok: boolean;
+  /**
+   * True only when this turn's pack reached a terminal stage (ready or failed
+   * for *this* harvest window). Pause must not run while the agent may still
+   * be working (status idle for the whole window).
+   */
+  safeToPause: boolean;
+  reason:
+    | "harvested"
+    | "pack_failed"
+    | "timeout"
+    | "timeout_agent_maybe_running"
+    | "export_failed"
+    | "error";
+  detail?: string;
+};
+
 const json = (body: unknown, status = 200) => Response.json(body, { status });
 const DEFAULT_SANDBOX_DOMAIN = "e2b.dev";
-/** Idle auto-pause keeps the VM disk; this is max lifetime / each connect extension.
- * E2B rejects timeout > 1 hour (HTTP 400). Every message extends by this amount. */
+/** Safety-net continuous TTL while a turn is active. E2B rejects > 1 hour.
+ * Extended on every connect during inject. Not the cost control for idle —
+ * post-turn pause (after terminal pack + quiet) is the primary shutdown path. */
 const SANDBOX_TTL_SECONDS = 3600;
+/** After terminal pack (ready|failed this turn): wait this long with no newer inject, then pause. */
+const POST_TURN_QUIET_MS = 60_000;
+/** Harvest: first probe delay (session may still be scheduling). */
+const CHECKPOINT_HARVEST_INITIAL_MS = 5_000;
+/**
+ * Max wait for packing→ready|failed. Must cover harness session wait (900s) + pack.
+ * If we stop earlier while still idle, we must NOT pause (agent may still be running).
+ */
+const CHECKPOINT_HARVEST_MAX_MS = 16 * 60_000;
 const DEFAULT_WORKER_URL = "https://fromdonna-gateway.code-df4.workers.dev";
 
 function internalUserId(gateway: string, gatewayUserId: string): string {
@@ -189,6 +223,71 @@ async function killSandboxBestEffort(env: Env, sandboxId: string): Promise<void>
   }
 }
 
+/** Pause keeps disk + memory; resume via connect on next message. */
+async function pauseSandboxBestEffort(env: Env, sandboxId: string): Promise<boolean> {
+  try {
+    const response = await fetch(`https://api.e2b.app/sandboxes/${sandboxId}/pause`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "X-API-KEY": required(env, "E2B_API_KEY"),
+      },
+      body: JSON.stringify({ memory: true }),
+    });
+    // 204 = paused; 409 often already paused; 404 gone
+    if (response.status === 204 || response.status === 200 || response.status === 409) {
+      return true;
+    }
+    if (response.status === 404) return false;
+    const detail = await response.text().catch(() => "");
+    console.error(
+      `E2B pause failed for ${sandboxId}: HTTP ${response.status}${detail ? `: ${detail.slice(0, 200)}` : ""}`,
+    );
+    return false;
+  } catch (error) {
+    console.error(
+      `E2B pause error for ${sandboxId}:`,
+      error instanceof Error ? error.message : error,
+    );
+    return false;
+  }
+}
+
+/** Bump on inject so a concurrent/later message cancels a scheduled post-turn pause. */
+async function bumpActivityEpoch(
+  env: Env,
+  gateway: string,
+  gatewayUserId: string,
+): Promise<number> {
+  await env.FROMDONNA_ROUTING.prepare(
+    `UPDATE user_agents
+     SET activity_epoch = COALESCE(activity_epoch, 0) + 1,
+         updated_at = CURRENT_TIMESTAMP
+     WHERE gateway = ?1 AND gateway_user_id = ?2`,
+  )
+    .bind(gateway, gatewayUserId)
+    .run();
+  const row = await env.FROMDONNA_ROUTING.prepare(
+    `SELECT activity_epoch FROM user_agents WHERE gateway = ?1 AND gateway_user_id = ?2`,
+  )
+    .bind(gateway, gatewayUserId)
+    .first<{ activity_epoch: number }>();
+  return Number(row?.activity_epoch ?? 0);
+}
+
+async function readActivityEpoch(
+  env: Env,
+  gateway: string,
+  gatewayUserId: string,
+): Promise<number> {
+  const row = await env.FROMDONNA_ROUTING.prepare(
+    `SELECT activity_epoch FROM user_agents WHERE gateway = ?1 AND gateway_user_id = ?2`,
+  )
+    .bind(gateway, gatewayUserId)
+    .first<{ activity_epoch: number | null }>();
+  return Number(row?.activity_epoch ?? 0);
+}
+
 type HarnessHealth = {
   ok?: boolean;
   auth_ready?: boolean;
@@ -224,7 +323,8 @@ async function waitForHarness(env: Env, sandboxId: string, domain: string | null
     } catch (error) {
       lastError = error instanceof Error ? error.message : "fetch failed";
     }
-    await new Promise((r) => setTimeout(r, 500));
+    // Adaptive backoff: fast polls right after connect/resume, then slower.
+    await new Promise((r) => setTimeout(r, harnessHealthPollDelayMs(i)));
   }
   throw new Error(`Sandbox harness health check failed: ${lastError}`);
 }
@@ -371,25 +471,277 @@ async function pullCheckpointOnce(
   return false;
 }
 
+/** Poll harness status markers (non-consuming). Falls back to unknown on error. */
+async function probeCheckpointStage(
+  env: Env,
+  row: Pick<UserAgentRow, "runtime_id" | "runtime_domain">,
+): Promise<{
+  state: CheckpointStageState;
+  error?: string;
+  readyAt?: number;
+  failedAt?: number;
+  startedAt?: number;
+}> {
+  try {
+    const url = `${harnessBaseUrl(env, row.runtime_id, row.runtime_domain)}/internal/checkpoint/status`;
+    const response = await fetch(url, {
+      method: "GET",
+      headers: { authorization: `Bearer ${required(env, "WORKER_TO_HARNESS_SECRET")}` },
+    });
+    if (!response.ok) return { state: "unknown" };
+    const body = (await response.json()) as {
+      state?: string;
+      error?: string;
+      readyAt?: number;
+      failedAt?: number;
+      startedAt?: number;
+    };
+    const state = body.state;
+    if (state === "ready" || state === "packing" || state === "failed" || state === "idle") {
+      return {
+        state,
+        error: typeof body.error === "string" ? body.error : undefined,
+        readyAt: typeof body.readyAt === "number" ? body.readyAt : undefined,
+        failedAt: typeof body.failedAt === "number" ? body.failedAt : undefined,
+        startedAt: typeof body.startedAt === "number" ? body.startedAt : undefined,
+      };
+    }
+    return { state: "unknown" };
+  } catch {
+    return { state: "unknown" };
+  }
+}
+
 /**
- * After a turn is scheduled, harvest a staged checkpoint when ready.
- * Long-running; must be scheduled via its own ctx.waitUntil so create/inject
- * does not consume the whole background budget before pack finishes.
+ * After inject: wait until THIS turn's pack is terminal (packing→ready|failed),
+ * then pull to R2 if configured. Never treats leftover tar as a fresh ready.
+ * safeToPause is true only after a turn-scoped terminal stage (agent finished packing).
  */
 async function harvestCheckpointAfterTurn(
   env: Env,
   row: Pick<UserAgentRow, "user_id" | "runtime_id" | "runtime_domain">,
-  attempts = 60,
-  delayMs = 10_000,
-): Promise<void> {
-  // Initial delay: agent turn rarely finishes in the first few seconds.
-  await new Promise((r) => setTimeout(r, 15_000));
-  for (let i = 0; i < attempts; i++) {
-    const ok = await pullCheckpointOnce(env, row);
-    if (ok) return;
+): Promise<HarvestResult> {
+  if (!row.runtime_id || row.runtime_id.startsWith("provisioning:")) {
+    return { ok: false, safeToPause: false, reason: "error", detail: "no_runtime" };
+  }
+
+  await new Promise((r) => setTimeout(r, CHECKPOINT_HARVEST_INITIAL_MS));
+
+  const harvestStartedMs = Date.now();
+  const harvestStartedSec = harvestStartedMs / 1000;
+  let sawPacking = false;
+  let consecutiveUnknown = 0;
+
+  const isFreshReady = (probe: { readyAt?: number }): boolean => {
+    // Accept if we saw packing this window, or readyAt is after harvest started
+    // (covers fast packs that finish between polls).
+    if (sawPacking) return true;
+    if (typeof probe.readyAt === "number" && probe.readyAt >= harvestStartedSec - 2) return true;
+    return false;
+  };
+
+  const isFreshFailed = (probe: { failedAt?: number }): boolean => {
+    if (sawPacking) return true;
+    if (typeof probe.failedAt === "number" && probe.failedAt >= harvestStartedSec - 2) return true;
+    return false;
+  };
+
+  while (Date.now() - harvestStartedMs < CHECKPOINT_HARVEST_MAX_MS) {
+    const probe = await probeCheckpointStage(env, row);
+
+    if (probe.state === "packing") {
+      sawPacking = true;
+      consecutiveUnknown = 0;
+      await new Promise((r) => setTimeout(r, 2_000));
+      continue;
+    }
+
+    if (probe.state === "ready" && isFreshReady(probe)) {
+      if (!env.USER_STATE) {
+        // Stage complete; no R2 — still safe to pause after quiet.
+        return { ok: true, safeToPause: true, reason: "harvested", detail: "no_r2_stage_only" };
+      }
+      const ok = await pullCheckpointOnce(env, row);
+      if (ok) return { ok: true, safeToPause: true, reason: "harvested" };
+      await new Promise((r) => setTimeout(r, 2_000));
+      const retry = await pullCheckpointOnce(env, row);
+      if (retry) return { ok: true, safeToPause: true, reason: "harvested" };
+      // Pack finished this turn; export failed — still safe to pause (agent done).
+      return {
+        ok: false,
+        safeToPause: true,
+        reason: "export_failed",
+        detail: "export_failed_after_ready",
+      };
+    }
+
+    if (probe.state === "failed" && isFreshFailed(probe)) {
+      return {
+        ok: false,
+        safeToPause: true,
+        reason: "pack_failed",
+        detail: probe.error?.slice(0, 200),
+      };
+    }
+
+    // Stale ready/failed from a previous turn — keep waiting for packing of this turn.
+    if (probe.state === "ready" || probe.state === "failed") {
+      consecutiveUnknown = 0;
+      const elapsed = Date.now() - harvestStartedMs;
+      await new Promise((r) => setTimeout(r, elapsed < 120_000 ? 3_000 : 8_000));
+      continue;
+    }
+
+    // idle / unknown: agent may still be running.
+    if (probe.state === "unknown") {
+      consecutiveUnknown += 1;
+      // Old image without status: only pull after we have been waiting a while,
+      // and only treat success as terminal if export actually returns a body.
+      // Do NOT pause solely on opportunistic pull of a leftover tar (export
+      // now requires ready marker, so this is rare).
+      if (consecutiveUnknown >= 5 && env.USER_STATE) {
+        const ok = await pullCheckpointOnce(env, row);
+        if (ok) return { ok: true, safeToPause: true, reason: "harvested", detail: "unknown_fallback" };
+      }
+    } else {
+      consecutiveUnknown = 0;
+    }
+
+    // After packing, brief idle before ready marker is visible — try pull once.
+    if (sawPacking && probe.state === "idle" && env.USER_STATE) {
+      const ok = await pullCheckpointOnce(env, row);
+      if (ok) return { ok: true, safeToPause: true, reason: "harvested" };
+    }
+
+    const elapsed = Date.now() - harvestStartedMs;
+    const delayMs = elapsed < 120_000 ? 3_000 : 8_000;
     await new Promise((r) => setTimeout(r, delayMs));
   }
-  console.log(`checkpoint harvest timed out for ${row.user_id} after ${attempts} attempts`);
+
+  // Timed out without a turn-scoped terminal stage.
+  if (sawPacking && env.USER_STATE) {
+    const lastChance = await pullCheckpointOnce(env, row);
+    if (lastChance) return { ok: true, safeToPause: true, reason: "harvested" };
+    // Packing was observed; agent likely finished — allow pause even if export missed.
+    return {
+      ok: false,
+      safeToPause: true,
+      reason: "timeout",
+      detail: "timeout_after_packing",
+    };
+  }
+
+  console.log(
+    `checkpoint harvest timed out (agent may still be running) for ${row.user_id}`,
+  );
+  return {
+    ok: false,
+    safeToPause: false,
+    reason: "timeout_agent_maybe_running",
+    detail: "no_packing_observed_within_budget",
+  };
+}
+
+/**
+ * After a terminal pack: if no newer inject for POST_TURN_QUIET_MS, pause the VM.
+ * Newer activity_epoch (another message) cancels the pause.
+ */
+async function pauseAfterQuietIfIdle(
+  env: Env,
+  row: Pick<UserAgentRow, "gateway" | "gateway_user_id" | "runtime_id" | "user_id">,
+  epochAtSchedule: number,
+): Promise<"paused" | "skipped_newer_activity" | "skipped_no_runtime" | "pause_failed"> {
+  if (!row.runtime_id || row.runtime_id.startsWith("provisioning:")) {
+    return "skipped_no_runtime";
+  }
+
+  await new Promise((r) => setTimeout(r, POST_TURN_QUIET_MS));
+
+  const current = await readActivityEpoch(env, row.gateway, row.gateway_user_id);
+  if (current !== epochAtSchedule) {
+    return "skipped_newer_activity";
+  }
+
+  // Confirm runtime_id still matches (replaceRuntime may have remapped).
+  const live = await lookup(env, row.gateway, row.gateway_user_id);
+  if (!live || live.runtime_id !== row.runtime_id || live.status !== "ready") {
+    return "skipped_newer_activity";
+  }
+
+  const paused = await pauseSandboxBestEffort(env, row.runtime_id);
+  return paused ? "paused" : "pause_failed";
+}
+
+/**
+ * Full post-turn lifecycle: wait for terminal pack → harvest → 1 min quiet → pause.
+ * Never pauses while status stayed idle for the whole window (agent may still run).
+ * Must run in ctx.waitUntil (long-running).
+ */
+async function runPostTurnLifecycle(
+  env: Env,
+  row: UserAgentRow,
+  epochAtSchedule: number,
+  turnId?: string,
+): Promise<void> {
+  try {
+    const harvest = await harvestCheckpointAfterTurn(env, row);
+    if (turnId) {
+      await addTurnEvent(env.FROMDONNA_ROUTING, turnId, "checkpoint.harvest", {
+        ok: harvest.ok,
+        detail: {
+          runtime_id: row.runtime_id,
+          reason: harvest.reason,
+          safeToPause: harvest.safeToPause,
+          ...(harvest.detail ? { error: harvest.detail } : {}),
+        },
+      });
+    }
+
+    if (!harvest.safeToPause) {
+      if (turnId) {
+        await addTurnEvent(env.FROMDONNA_ROUTING, turnId, "sandbox.pause", {
+          ok: false,
+          detail: {
+            runtime_id: row.runtime_id,
+            outcome: "skipped_agent_maybe_running",
+            reason: harvest.reason,
+            epoch: epochAtSchedule,
+          },
+        });
+      }
+      return;
+    }
+
+    const pauseOutcome = await pauseAfterQuietIfIdle(env, row, epochAtSchedule);
+    if (turnId) {
+      await addTurnEvent(env.FROMDONNA_ROUTING, turnId, "sandbox.pause", {
+        ok: pauseOutcome === "paused",
+        detail: {
+          runtime_id: row.runtime_id,
+          outcome: pauseOutcome,
+          quiet_ms: POST_TURN_QUIET_MS,
+          epoch: epochAtSchedule,
+        },
+      });
+    }
+    if (pauseOutcome === "paused") {
+      console.log(`sandbox paused after quiet for ${row.user_id} (${row.runtime_id})`);
+    }
+  } catch (error) {
+    console.error(
+      `post-turn lifecycle error for ${row.user_id}:`,
+      error instanceof Error ? error.message : error,
+    );
+    if (turnId) {
+      await addTurnEvent(env.FROMDONNA_ROUTING, turnId, "sandbox.pause", {
+        ok: false,
+        detail: {
+          outcome: "lifecycle_error",
+          error: error instanceof Error ? error.message.slice(0, 200) : String(error).slice(0, 200),
+        },
+      });
+    }
+  }
 }
 
 /**
@@ -872,11 +1224,14 @@ async function injectTelegramUpdate(
 
   let current = row;
   let lastError = "inject failed";
+  // Cancel any in-flight post-turn pause for this user (new activity).
+  const epoch = await bumpActivityEpoch(env, current.gateway, current.gateway_user_id);
+  current = { ...current, activity_epoch: epoch };
   if (turnId) {
     await addTurnEvent(env.FROMDONNA_ROUTING, turnId, "inject.start", {
       status: "injecting",
       runtimeId: current.runtime_id,
-      detail: { attempt: 0 },
+      detail: { attempt: 0, activity_epoch: epoch },
     });
   }
 
@@ -945,19 +1300,28 @@ async function injectTelegramUpdate(
           }
         }
 
-        // Checkpoint: never block inject on warm path. Cold path still pulls
-        // once before inject so a staged pack is not lost on first resume message.
-        if (shouldSkipPreInjectCheckpoint(health)) {
+        // Checkpoint: never block inject on warm path. On cold path, only pull
+        // when a pack is actually staged (ready/packing); skip idle/failed so
+        // dual harness+envd probes do not pad resume latency for no benefit.
+        const stageProbe = shouldSkipPreInjectCheckpoint(health)
+          ? { state: "idle" as const }
+          : await probeCheckpointStage(env, current);
+        if (shouldSkipPreInjectCheckpoint(health, stageProbe.state)) {
           if (turnId) {
             await addTurnEvent(env.FROMDONNA_ROUTING, turnId, "checkpoint.pull_deferred", {
-              detail: { note: "warm path — harvest after inject / next waitUntil" },
+              detail: {
+                note: isWarmHarnessReady(health)
+                  ? "warm path — harvest after inject / next waitUntil"
+                  : "no staged pack (idle/failed) — skip pre-inject pull",
+                stage: stageProbe.state,
+              },
             });
           }
         } else {
           await pullCheckpointOnce(env, current);
           if (turnId) {
             await addTurnEvent(env.FROMDONNA_ROUTING, turnId, "checkpoint.pull", {
-              detail: { note: "pre-inject best-effort (cold path)" },
+              detail: { note: "pre-inject best-effort (cold path)", stage: stageProbe.state },
             });
           }
         }
@@ -1185,17 +1549,10 @@ async function processTelegramUpdate(
     // Official path: sandbox Hermes Telegram runtime sends via Bot API proxy.
     // Worker does not render agent text itself.
     const live = await injectTelegramUpdate(env, resolved, update, turnId);
-    // Separate waitUntil so create/inject time does not starve checkpoint harvest.
-    // Goal: proactive R2 backup after agent use (best-effort after this turn;
-    // also pulled at the start of the next message / before replace).
-    ctx.waitUntil(
-      (async () => {
-        await harvestCheckpointAfterTurn(env, live);
-        await addTurnEvent(env.FROMDONNA_ROUTING, turnId, "checkpoint.harvest", {
-          detail: { runtime_id: live.runtime_id },
-        });
-      })(),
-    );
+    // Post-turn lifecycle in its own waitUntil: harvest staged checkpoint →
+    // 1 min quiet (unless newer activity_epoch) → E2B pause.
+    const epochAtSchedule = Number(live.activity_epoch ?? 0);
+    ctx.waitUntil(runPostTurnLifecycle(env, live, epochAtSchedule, turnId));
   } catch (error) {
     console.error(error instanceof Error ? error.message : "processTelegramUpdate failed");
     try {

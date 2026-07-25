@@ -90,10 +90,11 @@ Gateway **writes** per-message turn rows to D1 (`message_turns` + `message_turn_
 Typical stages:
 
 1. `webhook.received` → `route.start` → `route.ready` (or `route.provisioning`)
-2. `harness.ready` → `bootstrap.ok` → `inject.ok`
+2. `harness.ready` → `bootstrap.ok` / `bootstrap.skipped` → `inject.ok`
 3. `telegram.sendmessage` / `telegram.editmessagetext` (agent replies via proxy)
-4. `checkpoint.harvest` (best-effort after inject)
-5. On failure: `turn.error` + `gateway.user_notice` (`something_went_wrong`)
+4. `checkpoint.harvest` — after inject; `ok` + `reason` + `safeToPause` (`harvested` | `pack_failed` | `timeout_agent_maybe_running` | `export_failed` | …)
+5. `sandbox.pause` — only if `safeToPause`; after ~60s quiet if epoch unchanged (`paused` | `skipped_newer_activity` | `skipped_agent_maybe_running` | …)
+6. On failure: `turn.error` + `gateway.user_notice` (`something_went_wrong`)
 
 ## Live logs
 
@@ -130,7 +131,39 @@ npx wrangler tail fromdonna-composio-proxy --format pretty
 | Harness 401 missing_llm_capability | Gateway not sending header | Deploy current gateway (`x-llm-capability`) |
 | Hermes text is proxy stream error | Old LLM proxy rejecting `stream:true` | Deploy current llm-proxy (SSE shim) |
 | All LLM calls fail | Relay/ngrok down or URL stale | Restart relay + ngrok; update `CODEX_RELAY_URL`; redeploy llm-proxy |
-| Sandbox unreachable after idle | Paused without resume | Gateway `connect` + `autoResume`; manual `connect` if needed |
+| Sandbox unreachable after idle | Expected post-turn **pause** (or autoPause safety) | Next DM should `connect`/auto-resume; if 404 → replaceRuntime + R2 restore |
+| Slow first reply after ~1 min quiet | Resume after pause | Normal; warm path should be faster on rapid follow-ups (pause cancelled via `activity_epoch`) |
+| `checkpoint.harvest` always timeout | Old template without status markers / pack never runs | Rebuild E2B template; check harness logs for checkpoint stage; `GET …/internal/checkpoint/status` |
+| `checkpoint.harvest` pack_failed | Pack error on sandbox | Inspect harness logs; size cap / disk; turn event `detail.error` |
+| Sandbox never pauses (cost) | `skipped_agent_maybe_running` (long turn / no packing), `skipped_newer_activity`, or pause API fail | Check `checkpoint.harvest` reason + `safeToPause`; long turns fall back to autoPause 1h; confirm migration `0007` |
+| Pause mid-reply / agent freeze | Should not happen after safeToPause fix; if seen, check old gateway deploy | Deploy current gateway; require packing/terminal before pause |
+| D1 missing `activity_epoch` | Migration not applied | **Must apply before gateway deploy:** `npx wrangler d1 migrations apply fromdonna-routing --remote` |
+
+### Verify checkpoint + pause for one user
+
+```bash
+# D1 routing + activity epoch
+npx wrangler d1 execute fromdonna-routing --remote --command \
+  "SELECT user_id, status, runtime_id, activity_epoch, updated_at
+   FROM user_agents WHERE user_id = 'telegram:<id>';"
+
+# Recent turn stages (harvest + pause)
+npx wrangler d1 execute fromdonna-routing --remote --command \
+  "SELECT te.ts, te.stage, te.ok, te.detail_json
+   FROM message_turn_events te
+   JOIN message_turns t ON t.turn_id = te.turn_id
+   WHERE t.user_id = 'telegram:<id>'
+   ORDER BY te.ts DESC LIMIT 30;"
+
+# R2 manifest (after a successful harvest)
+npx wrangler r2 object get \
+  "fromdonna-user-state/users/telegram:<id>/manifests/latest.json" \
+  --file /tmp/man.json --remote && cat /tmp/man.json
+
+# Harness checkpoint status (sandbox must be running/resumed)
+curl -sS -H "Authorization: Bearer $WORKER_TO_HARNESS_SECRET" \
+  "https://8788-<runtime_id>.e2b.dev/internal/checkpoint/status"
+```
 
 ---
 

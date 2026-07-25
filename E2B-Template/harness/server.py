@@ -1097,6 +1097,23 @@ async def internal_restore(
     return {"ok": True, "bytes": len(body)}
 
 
+@app.get("/internal/checkpoint/status")
+def internal_checkpoint_status(authorization: str | None = Header(default=None)):
+    """Non-consuming harvest handshake: idle | packing | ready | failed.
+
+    Worker polls this after a turn instead of blindly GETting export.
+    Does not consume the staged tar.
+    """
+    if not _authorized(authorization):
+        raise HTTPException(status_code=401, detail="unauthorized")
+    try:
+        import checkpoint as ckpt
+
+        return ckpt.local_checkpoint_status(hermes_home=HERMES_HOME)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"status_failed: {exc}") from exc
+
+
 @app.get("/internal/checkpoint/export")
 def internal_checkpoint_export(authorization: str | None = Header(default=None)):
     """Worker pulls a staged checkpoint (avoids sandbox→Worker CF 1010 blocks).

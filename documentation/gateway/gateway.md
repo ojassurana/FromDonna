@@ -33,7 +33,7 @@ User (any app)
 | **Sandbox = full Hermes brain** | Official channel adapter (Telegram today), `~/.hermes`, tools, sessions — not a dumb `{text}` reply RPC |
 | **Real channel tokens stay on Worker** | Sandbox gets a **proxy token** + custom base URL, never `TELEGRAM_BOT_TOKEN` |
 | **Many users, one bot** | Identity is platform user/chat id + D1 row, not “who holds the token” |
-| **One user → one primary sandbox** | Create/resume on demand; pause when idle (E2B autoPause + autoResume) |
+| **One user → one primary sandbox** | Create/resume on demand; **pause after turn** (harvest → ~60s quiet → E2B pause). `autoPause` + 1h TTL is a safety net only. See [telegram.md](./telegram.md#e2b-lifecycle-worker) + [memorymanagement.md](../deployment/memorymanagement.md) |
 
 **Three per-user resources** (D1 row + E2B sandbox + R2 prefix): [../deployment/memorymanagement.md#three-per-user-resources](../deployment/memorymanagement.md#three-per-user-resources).
 
@@ -46,7 +46,7 @@ User (any app)
 | Provision | Worker + E2B API | Create sandbox, `/health`, `/bootstrap` (auth + proxies + Composio), **R2 restore** |
 | Agent + official channel adapter | E2B (per user) | Hermes `GatewayRunner` / `TelegramAdapter`, tools, memory; **proxy** channel credentials only |
 | Outbound channel | Sandbox → Worker Bot API proxy | Hermes sends via Worker; Worker swaps in real token |
-| Checkpoint | Worker + R2 | Harvest staged tar after use; restore on create/replace |
+| Checkpoint + pause | Worker + R2 + E2B | After turn: status handshake → harvest to R2 → 1 min quiet → pause; restore on create/replace |
 | Inference | LLM proxy Worker | OpenAI-compatible edge; real credentials stay off sandbox |
 | API connectors | API proxy Worker | Exa (etc.); product HTTP keys off sandbox and off gateway |
 | OAuth apps | Composio proxy Worker | MCP door; gateway mints capability via **service binding** (not public `workers.dev` fetch) |

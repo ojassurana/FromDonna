@@ -200,7 +200,9 @@ Worker endpoints:
 | Method | Path | Purpose |
 |--------|------|---------|
 | `POST` | `/internal/checkpoint` | Optional push (ops/tests; not relied on from E2B) |
-| `GET` | `/internal/checkpoint/status?userId=` | Ops: exists / size / manifest |
+| `GET` | `/internal/checkpoint/status?userId=` | Ops (Worker): R2 exists / size / manifest for a user |
+| Harness `GET` | `/internal/checkpoint/status` | Live stage handshake: `idle` \| `packing` \| `ready` \| `failed` |
+| Harness `GET` | `/internal/checkpoint/export` | Worker pull of staged tar (consumes ready marker) |
 
 ---
 
@@ -208,20 +210,37 @@ Worker endpoints:
 
 On create:
 
-- `autoPause: true`
-- `autoResume: { enabled: true }`
-- `timeout: 3600` (seconds) — E2B max continuous TTL; each connect extends
+- `autoPause: true` + `autoResume: { enabled: true }` — **safety net** if explicit post-turn pause never fires
+- `timeout: 3600` (seconds) — E2B max continuous TTL while active; each inject `connect` extends
 - `secure: true`
 - `allow_internet_access: true`
 - metadata: `fromdonna_user_id`
 
 Before each inject:
 
+- Bump D1 `user_agents.activity_epoch` (cancels any in-flight post-turn pause for this user)
 - `POST /sandboxes/{id}/connect` with `{ timeout: 3600 }` to resume if paused and extend TTL
 - Host URL shape: `https://{HARNESS_PORT}-{sandboxId}.{domain}/…`  
   (E2B may omit `domain` in create response; Worker defaults to `e2b.dev`)
 
+After each successful inject (separate `waitUntil`):
+
+1. **Checkpoint harvest** — poll harness `GET /internal/checkpoint/status` until a **turn-scoped** terminal stage:
+   - `packing` observed then `ready` | `failed`, or
+   - `ready`/`failed` with timestamp after harvest start  
+   On fresh `ready`: `GET /internal/checkpoint/export` → R2 (export consumes ready+tar).  
+   Leftover tar alone is **not** ready (avoids stale harvest + mid-turn pause).  
+   Budget ~**16 min** (covers harness session wait up to 900s + pack).
+2. **Quiet** — only if harvest set `safeToPause` (terminal pack this turn); wait **~60s**  
+3. **Pause** — if `activity_epoch` unchanged and `runtime_id` still current → `POST /sandboxes/{id}/pause` (`memory: true`)
+
+If harvest times out while still `idle` (agent may still be running) → **do not pause**; fall back to E2B `autoPause` + 1h TTL.
+
+If a new message arrives during quiet, epoch bumps → pause is **skipped**; next inject `connect` keeps the box running.
+
 If connect is **404** or inject/bootstrap stays broken → **`replaceRuntime`**: new sandbox from template, restore R2, kill old id.
+
+Full memory/checkpoint detail: [../deployment/memorymanagement.md](../deployment/memorymanagement.md).
 
 ---
 
@@ -229,11 +248,12 @@ If connect is **404** or inject/bootstrap stays broken → **`replaceRuntime`**:
 
 | Topic | Behavior |
 |-------|----------|
-| Webhook ACK | Telegram is ACKed with `{ ok: true }` immediately; provision + inject + harvest in `waitUntil` |
+| Webhook ACK | Telegram is ACKed with `{ ok: true }` immediately; provision + inject + harvest/pause in `waitUntil` |
 | Message types | Text, callbacks, media updates allowed (webhook `allowed_updates`); official Hermes handles UX |
 | Outbound | Sandbox Hermes via Bot API proxy — Worker does not re-render agent text on the happy path |
 | Errors | User gets a short “try again” message; details go to Worker logs only |
 | Free Workers plan | No custom `cpu_ms`; long turns depend on network wait + platform limits |
+| Cost control | Primary: post-turn pause after harvest + 1 min quiet. Safety: E2B autoPause on 1h TTL |
 
 ---
 

@@ -5,6 +5,9 @@
 model:
   provider: custom
   default: "grok-4.5"
+  # Explicit length skips OpenRouter/catalog probe on every turn (was ~100–200ms
+  # of "Could not detect context length" + dual get_model_context_length logs).
+  context_length: 131072
 
 providers:
   custom:
@@ -90,6 +93,8 @@ plugins:
 # Same denylist on every channel (platform allowlist = all installed − this list).
 # CLI is not listed → full catalog still available if you run hermes CLI in-box.
 skills:
+  # 0 = never spawn post-turn skill-creation curator (steals LLM from next DM).
+  creation_nudge_interval: 0
   platform_disabled:
     telegram: &messaging_skills_disabled
       # creative
@@ -174,6 +179,16 @@ platforms:
           - new
 
 agent: {}
+
+# Background self-improvement (post-turn LLM fork) steals the proxy and can
+# delay the *next* user message by seconds–minutes ("Queued follow-up").
+# Consumer product: reply first; memory/skills are still writable mid-turn via tools.
+memory:
+  memory_enabled: true
+  user_profile_enabled: true
+  write_approval: false
+  # 0 = never spawn post-turn memory curator (see agent_init nudge_interval).
+  nudge_interval: 0
 
 # ── Composio MCP (official Hermes shape) ─────────────────────────────────
 # Same block Hermes documents for Composio (composio.dev/hermes):

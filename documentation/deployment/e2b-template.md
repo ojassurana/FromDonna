@@ -25,7 +25,7 @@ Source tree: `E2B-Template/`
 - Agent-only Hermes config (no channel tokens; **Exa as default web backend**)
 - Default Donna `SOUL.md` (`config/hermes/SOUL.md` → `~/.hermes/SOUL.md`)
 - Product plugins under `extensions/plugins` (e.g. `fromdonna_transport`)
-- FastAPI harness: `/health`, `/bootstrap`, `/telegram/update`, `/internal/checkpoint/export`, `/internal/restore`, legacy `/turn`
+- FastAPI harness: `/health`, `/bootstrap`, `/telegram/update`, `/internal/checkpoint/status`, `/internal/checkpoint/export`, `/internal/restore`, legacy `/turn`
 - Checkpoint pack/stage helpers (`checkpoint.py`)
 - `exa-py` (Hermes `[messaging,exa]`); Exa SDK base URL points at api-proxy
 - `setStartCmd` starts uvicorn and waits for port 8788
@@ -164,10 +164,12 @@ Typical extras in the image:
   - `GET /health` — liveness + gateway/proxy readiness  
   - `POST /bootstrap` — Worker secret + Telegram proxy + identity + optional **`composioMcp`** (writes Hermes `mcp_servers.composio`; no product API key)  
   - `POST /telegram/update` — inject Update into official Hermes Telegram gateway  
+  - `GET /internal/checkpoint/status` — stage handshake (`idle` \| `packing` \| `ready` \| `failed`)  
   - `GET /internal/checkpoint/export` — Worker pull of staged runtime checkpoint  
   - `POST /internal/restore` — apply R2 checkpoint after create/replace  
   - `POST /turn` — legacy path  
-- **Checkpoint packer** (`checkpoint.py`) — filtered agent-home + workspace tar  
+- **Checkpoint packer** (`checkpoint.py`) — filtered agent-home + workspace tar; packing/ready/failed markers for harvest  
+
 - **Composio** — capability Bearer only at bootstrap; OAuth vault stays on composio-proxy ([../tooling/composio.md](../tooling/composio.md))  
 - **Thin tools** / wrappers that call Workers for API / MCP  
 
@@ -199,12 +201,17 @@ Worker on first need (implemented in `cloudflare/gateway`):
 ```text
 POST api.e2b.app/sandboxes
   templateID: fromdonna-hermes
-  autoPause + autoResume
+  autoPause + autoResume   # safety net; primary idle path is post-turn pause
+  timeout: 3600
   metadata.fromdonna_user_id
 → wait GET https://8788-{id}.e2b.dev/health
 → POST /bootstrap { secret, userId, workerUrl, telegramProxy, composioMcp? }
 → POST /internal/restore  (R2 blob if any)
 → D1 status=ready
+
+Per turn (after inject):
+→ poll GET /internal/checkpoint/status → export on ready → R2
+→ ~60s quiet (unless activity_epoch bumped) → POST E2B …/pause
 ```
 
 `composioMcp` is minted by the gateway from composio-proxy (shared MCP URL + per-user Bearer). See [../tooling/composio.md](../tooling/composio.md).

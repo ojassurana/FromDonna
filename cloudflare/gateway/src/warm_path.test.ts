@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  harnessHealthPollDelayMs,
   isWarmHarnessReady,
   shouldSendEarlyTyping,
   shouldSkipBootstrap,
@@ -55,9 +56,33 @@ describe("shouldSkipPreInjectCheckpoint", () => {
     expect(shouldSkipPreInjectCheckpoint(WARM)).toBe(true);
   });
 
-  it("does not skip when cold / not ready", () => {
+  it("does not skip when cold with unknown/ready pack", () => {
     expect(shouldSkipPreInjectCheckpoint({ ...WARM, gateway_running: false })).toBe(false);
     expect(shouldSkipPreInjectCheckpoint(null)).toBe(false);
+    expect(shouldSkipPreInjectCheckpoint(null, "ready")).toBe(false);
+    expect(shouldSkipPreInjectCheckpoint(null, "packing")).toBe(false);
+    expect(shouldSkipPreInjectCheckpoint(null, "unknown")).toBe(false);
+  });
+
+  it("skips cold when stage is idle or failed (no useful staged pack)", () => {
+    expect(shouldSkipPreInjectCheckpoint(null, "idle")).toBe(true);
+    expect(shouldSkipPreInjectCheckpoint({ ...WARM, gateway_running: false }, "failed")).toBe(
+      true,
+    );
+  });
+});
+
+describe("harnessHealthPollDelayMs", () => {
+  it("uses fast polls early after connect/resume", () => {
+    expect(harnessHealthPollDelayMs(0)).toBe(100);
+    expect(harnessHealthPollDelayMs(14)).toBe(100);
+  });
+
+  it("backs off for slower cold resume tails", () => {
+    expect(harnessHealthPollDelayMs(15)).toBe(250);
+    expect(harnessHealthPollDelayMs(39)).toBe(250);
+    expect(harnessHealthPollDelayMs(40)).toBe(500);
+    expect(harnessHealthPollDelayMs(89)).toBe(500);
   });
 });
 

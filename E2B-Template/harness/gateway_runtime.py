@@ -311,9 +311,20 @@ class GatewayRuntime:
         os.environ.setdefault("HERMES_TELEGRAM_HTTP_CONNECT_TIMEOUT", "8")
         os.environ.setdefault("HERMES_TELEGRAM_HTTP_READ_TIMEOUT", "15")
         # Preflight dump of every LLM request body → ~/.hermes/sessions/request_dump_*.json
-        # (same mechanism as the Chitti hermes-first-api-request explainer).
-        # Image default is on (template.ts); set HERMES_DUMP_REQUESTS=0 to disable.
-        os.environ.setdefault("HERMES_DUMP_REQUESTS", "1")
+        # Force OFF for product latency: create-time env may set HERMES_DUMP_REQUESTS=1
+        # (template.ts historically did), and setdefault would not override it — each
+        # dump is ~100–150KB sync I/O on the agent path. Opt in with HERMES_FORCE_REQUEST_DUMPS=1.
+        if os.environ.get("HERMES_FORCE_REQUEST_DUMPS", "").strip() == "1":
+            os.environ["HERMES_DUMP_REQUESTS"] = "1"
+        else:
+            os.environ["HERMES_DUMP_REQUESTS"] = "0"
+        # Telegram text batch: Hermes waits a quiet period before starting the agent.
+        # Floor is 0.08s in the adapter; force it so short DMs dispatch ASAP
+        # (default 0.3s / adaptive 0.18s was pure dead air before LLM).
+        # Use assignment (not setdefault) so create-time/image env cannot leave a slower value.
+        os.environ["HERMES_TELEGRAM_TEXT_BATCH_DELAY_SECONDS"] = "0.08"
+        os.environ["HERMES_TELEGRAM_TEXT_BATCH_SPLIT_DELAY_SECONDS"] = "0.08"
+        os.environ["HERMES_TELEGRAM_MEDIA_BATCH_DELAY_SECONDS"] = "0.3"
         # Never let the adapter open a real Telegram webhook/poll on the shared bot.
         os.environ.pop("TELEGRAM_WEBHOOK_URL", None)
         try:
@@ -439,12 +450,20 @@ class GatewayRuntime:
                         try:
                             import checkpoint as ckpt
 
-                            # Stage locally; Worker pulls via GET /internal/checkpoint/export
+                            # Stage locally; Worker polls GET /internal/checkpoint/status
+                            # then pulls via GET /internal/checkpoint/export
                             # (sandbox→workers.dev POST is often blocked with CF error 1010).
+                            ckpt.mark_checkpoint_packing(source="gateway-session")
                             result = ckpt.prepare_local_checkpoint(source="gateway-session")
                             logger.info("checkpoint staged after session: %s", result)
-                        except Exception:
+                        except Exception as exc:
                             logger.exception("checkpoint stage failed")
+                            try:
+                                import checkpoint as ckpt
+
+                                ckpt.mark_checkpoint_failed(str(exc))
+                            except Exception:
+                                logger.exception("checkpoint failed marker write failed")
 
                     threading.Thread(
                         target=_checkpoint_when_idle,

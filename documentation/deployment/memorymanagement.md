@@ -65,8 +65,8 @@ Gateway Worker, LLM proxy, API proxy, Telegram bot token / webhook secrets, E2B 
 | Event | D1 | E2B | R2 |
 |-------|----|-----|-----|
 | First message / provision | Insert/update row → `ready` + `runtime_id` | Create from template, bootstrap, optional restore | Read checkpoint if present |
-| Idle → next message | Lookup `runtime_id` | Resume / connect same sandbox | Unchanged (no restore) |
-| After agent session | Unchanged (or status touch) | Stage tar on disk | Worker harvest → put objects |
+| Idle → next message | Lookup `runtime_id`; bump `activity_epoch` on inject | Resume / `connect` same sandbox | Unchanged (no restore) |
+| After agent session | Unchanged (epoch already bumped) | Stage tar (`packing` → `ready`/`failed`); Worker harvest; **1 min quiet → pause** | Worker harvest → put objects (best-effort) |
 | replaceRuntime / dead box | New `runtime_id` | New VM; kill old | Restore into new VM if objects exist |
 
 ### Ops: inspect one user’s three usages
@@ -93,16 +93,44 @@ Details of pack/exclude/harvest and pause vs restore are in the sections below.
 | Action | Data on the box |
 |--------|------------------|
 | **Create** from template | Fresh image; then Worker **restores** R2 checkpoint if one exists |
-| **Pause** | Disk + memory **kept** (sleep). Not deleted. |
+| **Pause** (primary: post-turn) | After harvest attempt + **~60s quiet** with no newer inject → Worker `POST …/pause` (disk + memory kept). E2B `autoPause` + 1h TTL remains a **safety net** only. |
 | **Resume** (`connect`) | Same computer continues; `~/.hermes` + workspace as left |
 | **replaceRuntime** (404 / broken harness) | New VM; **restore from R2**; old id killed |
 | **Delete / kill** without backup | That VM’s disk is **gone** |
+
+### Post-turn order (live)
+
+```text
+Inject returns (agent may still be running in-sandbox)
+  → Worker waitUntil starts harvest poll
+Agent session finishes
+  → harness stages checkpoint (packing → ready | failed)
+  → Worker sees turn-scoped terminal stage → export to R2 (if USER_STATE bound)
+  → wait ~60s quiet (cancel if activity_epoch bumped by a new message)
+  → Worker pauses E2B sandbox
+```
+
+**Safety invariants (do not relax):**
+
+| Rule | Why |
+|------|-----|
+| `ready` requires ready **marker** (not leftover tar) | Prevents harvesting a previous turn and pausing mid-session |
+| Export **consumes** ready + tar | Next turn cannot see false ready |
+| Stale `failed` ignored until packing (or failedAt after harvest start) | Prior pack failure must not abort this turn’s harvest |
+| Pause only if `safeToPause` (terminal pack this turn) | Never pause while status stayed idle for the whole window (agent may still run) |
+| Harvest budget ≥ ~16 min | Covers harness session wait (900s) + pack |
+
+| Control | Role |
+|---------|------|
+| `activity_epoch` (D1 `user_agents`) | Bumped on every inject; scheduled pause skips if epoch changed |
+| `POST_TURN_QUIET_MS` (60s) | Quiet window after **terminal pack** before pause |
+| `timeout: 3600` + `autoPause: true` | Safety net if pause path never runs (e.g. harvest timeout while agent still busy) |
 
 ### When R2 restore is needed vs not
 
 | Event | Same disk? | R2 restore? |
 |-------|------------|-------------|
-| Idle pause → next message | Yes | **No** |
+| Post-turn pause → next message | Yes | **No** |
 | connect 404 / failed resume → replace | No | **Yes** |
 | Failed / stuck provision → new create | No | **Yes** if prior checkpoint |
 | Template rebuild / deliberate kill | No | **Yes** if you care about continuity |
@@ -150,23 +178,31 @@ Filtered **agent-home** + **workspace**:
 
 #### How backup runs (not sandbox → Worker POST)
 
-Sandbox **outbound POST** to `*.workers.dev` is often blocked by Cloudflare **error 1010**. Live path:
+Sandbox **outbound POST** to `*.workers.dev` is often blocked by Cloudflare **error 1010**. Live path is a **stage handshake + Worker pull**:
 
 ```text
 Agent session finishes
-  → harness stages tar on disk
+  → harness marks packing, then packs:
+      ~/.hermes/fromdonna-checkpoint-packing.json   (in progress)
       ~/.hermes/fromdonna-checkpoint-latest.tar.gz
-      ~/.hermes/fromdonna-checkpoint-ready.json
-  → Worker harvests (async, separate waitUntil):
-      1) GET harness /internal/checkpoint/export
-      2) fallback: E2B envd GET /files (staged tar)
-  → R2 put + manifest
+      ~/.hermes/fromdonna-checkpoint-ready.json     (success)
+      — or —
+      ~/.hermes/fromdonna-checkpoint-failed.json    (pack error; harvest stops early)
+  → Worker (async waitUntil):
+      1) poll GET harness /internal/checkpoint/status  (idle|packing|ready|failed)
+      2) on ready: GET /internal/checkpoint/export → R2 put + manifest
+      3) fallback: E2B envd file read if status path is down
+      4) then post-turn quiet + pause (see lifecycle above)
 ```
 
-Also pulled:
+Turn-trace stages: `checkpoint.harvest` (`ok` + `reason`: harvested | pack_failed | timeout | …), then `sandbox.pause`.
 
-- At the **start of the next message** (safety net)
+Also pulled (safety nets):
+
+- At the **start of the next message** on **cold** path (warm path defers)
 - **Before replace/kill** when the old box is still reachable
+
+Harvest is **best-effort**: soft-fail does not block chat; next turn / replace may still recover from an older R2 object or live disk.
 
 #### How restore runs
 
@@ -182,7 +218,7 @@ Worker GET R2 checkpoint (if any)
 | Situation | Action |
 |-----------|--------|
 | Normal use / pause / unpause | **No R2 required** — disk stays |
-| After agent use | Stage → Worker **pull** → R2 (async; may land shortly after the reply) |
+| After agent use | Stage handshake → Worker **pull** → R2 → 1 min quiet → pause |
 | Create / replaceRuntime | Worker **restore** from R2 if present |
 
 ### Product files (tools → R2)
