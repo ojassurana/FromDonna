@@ -16,6 +16,10 @@
 /** Canonical Composio toolkit slugs we enable for every new Donna user. */
 export const DEFAULT_COMPOSIO_TOOLKITS = [
   // Google Workspace
+  // NOTE (2026-07-26): omit google_chat, googlecontacts, googleforms —
+  // Composio Tool Router returns 400 "require auth configs but none exist and
+  // cannot be auto-created". Those block ALL session create → cold provision
+  // hang (waitUntil 30s cancel) for every new user.
   "gmail",
   "googledrive",
   "googlecalendar",
@@ -24,16 +28,13 @@ export const DEFAULT_COMPOSIO_TOOLKITS = [
   "googleslides",
   "googlemeet",
   "googletasks",
-  "googlecontacts",
-  "googleforms",
   "googlephotos",
-  "google_chat",
   // Microsoft 365
+  // NOTE: onenote also fails the same auth-config gate — omit until configured.
   "outlook",
   "one_drive",
   "excel",
   "microsoft_teams",
-  "onenote",
   "share_point",
   // Other product apps
   "github",

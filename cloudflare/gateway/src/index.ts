@@ -17,14 +17,7 @@ import {
 import { ensureUserComposio, getLastComposioMintError, mintComposioMcpAccess } from "./composio";
 import { normalizeTelegramUpdate, type TelegramUpdate } from "./telegram";
 import {
-  addTurnEvent,
-  inboundPreviewFromUpdate,
-  newTurnId,
-  startTurn,
-} from "./turn_trace";
-import {
   harnessHealthPollDelayMs,
-  isWarmHarnessReady,
   shouldSendEarlyTyping,
   shouldSkipBootstrap,
   shouldSkipPreInjectCheckpoint,
@@ -681,66 +674,27 @@ async function runPostTurnLifecycle(
   env: Env,
   row: UserAgentRow,
   epochAtSchedule: number,
-  turnId?: string,
 ): Promise<void> {
   try {
     const harvest = await harvestCheckpointAfterTurn(env, row);
-    if (turnId) {
-      await addTurnEvent(env.FROMDONNA_ROUTING, turnId, "checkpoint.harvest", {
-        ok: harvest.ok,
-        detail: {
-          runtime_id: row.runtime_id,
-          reason: harvest.reason,
-          safeToPause: harvest.safeToPause,
-          ...(harvest.detail ? { error: harvest.detail } : {}),
-        },
-      });
-    }
-
     if (!harvest.safeToPause) {
-      if (turnId) {
-        await addTurnEvent(env.FROMDONNA_ROUTING, turnId, "sandbox.pause", {
-          ok: false,
-          detail: {
-            runtime_id: row.runtime_id,
-            outcome: "skipped_agent_maybe_running",
-            reason: harvest.reason,
-            epoch: epochAtSchedule,
-          },
-        });
-      }
+      console.log(
+        `post-turn skip pause for ${row.user_id}: ${harvest.reason} (safeToPause=false)`,
+      );
       return;
     }
 
     const pauseOutcome = await pauseAfterQuietIfIdle(env, row, epochAtSchedule);
-    if (turnId) {
-      await addTurnEvent(env.FROMDONNA_ROUTING, turnId, "sandbox.pause", {
-        ok: pauseOutcome === "paused",
-        detail: {
-          runtime_id: row.runtime_id,
-          outcome: pauseOutcome,
-          quiet_ms: POST_TURN_QUIET_MS,
-          epoch: epochAtSchedule,
-        },
-      });
-    }
     if (pauseOutcome === "paused") {
       console.log(`sandbox paused after quiet for ${row.user_id} (${row.runtime_id})`);
+    } else {
+      console.log(`post-turn pause outcome for ${row.user_id}: ${pauseOutcome}`);
     }
   } catch (error) {
     console.error(
       `post-turn lifecycle error for ${row.user_id}:`,
       error instanceof Error ? error.message : error,
     );
-    if (turnId) {
-      await addTurnEvent(env.FROMDONNA_ROUTING, turnId, "sandbox.pause", {
-        ok: false,
-        detail: {
-          outcome: "lifecycle_error",
-          error: error instanceof Error ? error.message.slice(0, 200) : String(error).slice(0, 200),
-        },
-      });
-    }
   }
 }
 
@@ -1218,7 +1172,6 @@ async function injectTelegramUpdate(
   env: Env,
   row: UserAgentRow,
   update: TelegramUpdate,
-  turnId?: string,
 ): Promise<UserAgentRow> {
   if (row.runtime_provider !== "e2b") throw new Error(`Unsupported runtime provider: ${row.runtime_provider}`);
 
@@ -1227,13 +1180,6 @@ async function injectTelegramUpdate(
   // Cancel any in-flight post-turn pause for this user (new activity).
   const epoch = await bumpActivityEpoch(env, current.gateway, current.gateway_user_id);
   current = { ...current, activity_epoch: epoch };
-  if (turnId) {
-    await addTurnEvent(env.FROMDONNA_ROUTING, turnId, "inject.start", {
-      status: "injecting",
-      runtimeId: current.runtime_id,
-      detail: { attempt: 0, activity_epoch: epoch },
-    });
-  }
 
   // Attempt 0: resume existing box. Attempt 1: replace runtime if gone/broken.
   for (let attempt = 0; attempt < 2; attempt++) {
@@ -1241,19 +1187,7 @@ async function injectTelegramUpdate(
       const alive = await ensureSandboxRunning(env, current.runtime_id);
       if (!alive) {
         lastError = "E2B sandbox missing";
-        if (turnId) {
-          await addTurnEvent(env.FROMDONNA_ROUTING, turnId, "sandbox.missing", {
-            ok: false,
-            detail: { runtime_id: current.runtime_id },
-          });
-        }
         current = await replaceRuntime(env, current);
-        if (turnId) {
-          await addTurnEvent(env.FROMDONNA_ROUTING, turnId, "sandbox.replaced", {
-            runtimeId: current.runtime_id,
-            detail: { runtime_id: current.runtime_id },
-          });
-        }
         // fall through to inject on the new box
       } else {
         // Warm path: single health probe. If gateway is already live, skip
@@ -1262,42 +1196,14 @@ async function injectTelegramUpdate(
         // pre-typing latency (~2.5s + ~3.8s on baseline warm DM).
         // Cold / pause→resume: wait for harness, then bootstrap soft (no
         // requireComposio so chat still works if mint is slow).
-        const t0 = Date.now();
         let health = await fetchHarnessHealth(env, current.runtime_id, current.runtime_domain);
         if (!shouldSkipBootstrap(health, { requireComposio: false })) {
           await waitForHarness(env, current.runtime_id, current.runtime_domain, 90);
           health = await fetchHarnessHealth(env, current.runtime_id, current.runtime_domain);
         }
-        if (turnId) {
-          await addTurnEvent(env.FROMDONNA_ROUTING, turnId, "harness.ready", {
-            durationMs: Date.now() - t0,
-            runtimeId: current.runtime_id,
-            detail: {
-              warm: shouldSkipBootstrap(health, { requireComposio: false }),
-              gateway_running: health?.gateway_running === true,
-            },
-          });
-        }
 
-        if (shouldSkipBootstrap(health, { requireComposio: false })) {
-          if (turnId) {
-            await addTurnEvent(env.FROMDONNA_ROUTING, turnId, "bootstrap.skipped", {
-              durationMs: 0,
-              detail: {
-                reason: "warm_gateway_ready",
-                composio_mcp_ready: health?.composio_mcp_ready === true,
-              },
-            });
-          }
-        } else {
-          const t1 = Date.now();
+        if (!shouldSkipBootstrap(health, { requireComposio: false })) {
           await bootstrapHarness(env, current, { requireComposio: false });
-          if (turnId) {
-            await addTurnEvent(env.FROMDONNA_ROUTING, turnId, "bootstrap.ok", {
-              durationMs: Date.now() - t1,
-              detail: { requireComposio: false },
-            });
-          }
         }
 
         // Checkpoint: never block inject on warm path. On cold path, only pull
@@ -1306,24 +1212,8 @@ async function injectTelegramUpdate(
         const stageProbe = shouldSkipPreInjectCheckpoint(health)
           ? { state: "idle" as const }
           : await probeCheckpointStage(env, current);
-        if (shouldSkipPreInjectCheckpoint(health, stageProbe.state)) {
-          if (turnId) {
-            await addTurnEvent(env.FROMDONNA_ROUTING, turnId, "checkpoint.pull_deferred", {
-              detail: {
-                note: isWarmHarnessReady(health)
-                  ? "warm path — harvest after inject / next waitUntil"
-                  : "no staged pack (idle/failed) — skip pre-inject pull",
-                stage: stageProbe.state,
-              },
-            });
-          }
-        } else {
+        if (!shouldSkipPreInjectCheckpoint(health, stageProbe.state)) {
           await pullCheckpointOnce(env, current);
-          if (turnId) {
-            await addTurnEvent(env.FROMDONNA_ROUTING, turnId, "checkpoint.pull", {
-              detail: { note: "pre-inject best-effort (cold path)", stage: stageProbe.state },
-            });
-          }
         }
       }
 
@@ -1331,12 +1221,6 @@ async function injectTelegramUpdate(
       if (!response.ok) {
         const detail = await response.text().catch(() => "");
         lastError = `Sandbox telegram inject failed with HTTP ${response.status}${detail ? `: ${detail.slice(0, 300)}` : ""}`;
-        if (turnId) {
-          await addTurnEvent(env.FROMDONNA_ROUTING, turnId, "inject.post_failed", {
-            ok: false,
-            detail: { status: response.status, detail: detail.slice(0, 200), retry: true },
-          });
-        }
         // One soft retry on same box after re-bootstrap (stale gateway thread / lock).
         await bootstrapHarness(env, current, { requireComposio: false });
         response = await postTelegramUpdate(env, current, update);
@@ -1345,23 +1229,10 @@ async function injectTelegramUpdate(
           lastError = `Sandbox telegram inject failed with HTTP ${response.status}${detail2 ? `: ${detail2.slice(0, 300)}` : ""}`;
           if (attempt === 0) {
             current = await replaceRuntime(env, current);
-            if (turnId) {
-              await addTurnEvent(env.FROMDONNA_ROUTING, turnId, "sandbox.replaced", {
-                runtimeId: current.runtime_id,
-                detail: { reason: "inject_retry_exhausted" },
-              });
-            }
             continue;
           }
           throw new Error(lastError);
         }
-      }
-      if (turnId) {
-        await addTurnEvent(env.FROMDONNA_ROUTING, turnId, "inject.ok", {
-          status: "injected",
-          runtimeId: current.runtime_id,
-          detail: { attempt },
-        });
       }
       return current;
     } catch (error) {
@@ -1374,12 +1245,6 @@ async function injectTelegramUpdate(
       ) {
         try {
           current = await replaceRuntime(env, current);
-          if (turnId) {
-            await addTurnEvent(env.FROMDONNA_ROUTING, turnId, "sandbox.replaced", {
-              runtimeId: current.runtime_id,
-              detail: { reason: "recoverable_error", error: lastError.slice(0, 200) },
-            });
-          }
           continue;
         } catch (replaceError) {
           lastError = replaceError instanceof Error ? replaceError.message : String(replaceError);
@@ -1467,109 +1332,47 @@ async function processTelegramUpdate(
   const gateway = "telegram";
   const gatewayUserId = event.actorId;
   const gatewayConversationId = event.conversationId;
-  const userId = internalUserId(gateway, gatewayUserId);
-  const turnId = newTurnId();
-  const inbound = inboundPreviewFromUpdate(update);
 
-  // Early typing from the edge (real bot token). Fire in parallel with
-  // startTurn so users see "typing…" during D1 route / E2B connect / inject.
-  // Best-effort — never invent reply text; never fail the turn.
-  // Turn-event write waits until after startTurn (FK on message_turns).
-  const tType = Date.now();
-  const earlyTypingSend: Promise<"ok" | "err"> | null = shouldSendEarlyTyping(event)
-    ? telegram(env, "sendChatAction", {
+  // Early typing from the edge (real bot token). Fire-and-forget so users see
+  // "typing…" during D1 route / E2B connect / inject. Best-effort only.
+  if (shouldSendEarlyTyping(event)) {
+    ctx.waitUntil(
+      telegram(env, "sendChatAction", {
         chat_id: gatewayConversationId,
         action: "typing",
-      })
-        .then(() => "ok" as const)
-        .catch((error) => {
-          console.error(
-            "early typing failed:",
-            error instanceof Error ? error.message : error,
-          );
-          return "err" as const;
-        })
-    : null;
-
-  await startTurn(env.FROMDONNA_ROUTING, {
-    turnId,
-    userId,
-    gateway,
-    gatewayUserId,
-    gatewayConversationId,
-    telegramUpdateId:
-      typeof update.update_id === "number"
-        ? update.update_id
-        : typeof update.update_id === "string" && update.update_id
-          ? Number(update.update_id) || null
-          : null,
-    inboundKind: inbound.kind,
-    inboundPreview: inbound.preview,
-  });
-
-  if (earlyTypingSend) {
-    ctx.waitUntil(
-      earlyTypingSend.then(async (outcome) => {
-        await addTurnEvent(env.FROMDONNA_ROUTING, turnId, "gateway.early_typing", {
-          ok: outcome === "ok",
-          durationMs: Date.now() - tType,
-          detail: { source: "worker_edge" },
-        });
+      }).catch((error) => {
+        console.error(
+          "early typing failed:",
+          error instanceof Error ? error.message : error,
+        );
       }),
     );
   }
 
   try {
-    await addTurnEvent(env.FROMDONNA_ROUTING, turnId, "route.start", { status: "routing" });
-    const tRoute = Date.now();
     const resolved = await resolveReadyRow(env, gateway, gatewayUserId, gatewayConversationId);
     if (resolved === "provisioning") {
-      await addTurnEvent(env.FROMDONNA_ROUTING, turnId, "route.provisioning", {
-        status: "provisioning",
-        durationMs: Date.now() - tRoute,
-        detail: { note: "another request is provisioning or reclaim in progress" },
-      });
       await telegram(env, "sendMessage", {
         chat_id: gatewayConversationId,
         text: "Setting up your private assistant — one moment, then send that again.",
       });
-      await addTurnEvent(env.FROMDONNA_ROUTING, turnId, "gateway.user_notice", {
-        status: "complete",
-        detail: { text: "setting_up" },
-      });
       return;
     }
 
-    await addTurnEvent(env.FROMDONNA_ROUTING, turnId, "route.ready", {
-      durationMs: Date.now() - tRoute,
-      runtimeId: resolved.runtime_id,
-      detail: { status: resolved.status, runtime_id: resolved.runtime_id },
-    });
-
     // Official path: sandbox Hermes Telegram runtime sends via Bot API proxy.
     // Worker does not render agent text itself.
-    const live = await injectTelegramUpdate(env, resolved, update, turnId);
+    const live = await injectTelegramUpdate(env, resolved, update);
     // Post-turn lifecycle in its own waitUntil: harvest staged checkpoint →
     // 1 min quiet (unless newer activity_epoch) → E2B pause.
     const epochAtSchedule = Number(live.activity_epoch ?? 0);
-    ctx.waitUntil(runPostTurnLifecycle(env, live, epochAtSchedule, turnId));
+    ctx.waitUntil(runPostTurnLifecycle(env, live, epochAtSchedule));
   } catch (error) {
-    console.error(error instanceof Error ? error.message : "processTelegramUpdate failed");
+    const detail = error instanceof Error ? error.message : "processTelegramUpdate failed";
+    console.error("processTelegramUpdate", detail);
     try {
-      const detail = error instanceof Error ? error.message : "processTelegramUpdate failed";
-      console.error("processTelegramUpdate", detail);
-      await addTurnEvent(env.FROMDONNA_ROUTING, turnId, "turn.error", {
-        ok: false,
-        status: "error",
-        error: detail,
-        detail: { message: detail.slice(0, 500) },
-      });
       await telegram(env, "sendMessage", {
         chat_id: gatewayConversationId,
         text: "Something went wrong on my side. Please try again in a moment.",
-      });
-      await addTurnEvent(env.FROMDONNA_ROUTING, turnId, "gateway.user_notice", {
-        detail: { text: "something_went_wrong" },
       });
     } catch {
       // ignore
@@ -1642,7 +1445,6 @@ export default {
         url,
         realBotToken: required(env, "TELEGRAM_BOT_TOKEN"),
         proxySecret: required(env, "WORKER_TO_HARNESS_SECRET"),
-        routingDb: env.FROMDONNA_ROUTING,
       });
       if (proxied) return proxied;
 

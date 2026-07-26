@@ -29,6 +29,10 @@ async function proxyFetch(env: ComposioEnv, path: string, init: RequestInit): Pr
 /** Keep in sync with cloudflare/composio-proxy/src/toolkits.ts (Composio Tool Router slugs). */
 export const DEFAULT_COMPOSIO_TOOLKITS = [
   // Google Workspace
+  // Keep in sync with composio-proxy/src/toolkits.ts.
+  // Omit google_chat / googlecontacts / googleforms / onenote until Composio
+  // auth configs exist (otherwise Tool Router session create 400s and cold
+  // provision never reaches ready — waitUntil cancelled at 30s).
   "gmail",
   "googledrive",
   "googlecalendar",
@@ -37,16 +41,12 @@ export const DEFAULT_COMPOSIO_TOOLKITS = [
   "googleslides",
   "googlemeet",
   "googletasks",
-  "googlecontacts",
-  "googleforms",
   "googlephotos",
-  "google_chat",
   // Microsoft 365
   "outlook",
   "one_drive",
   "excel",
   "microsoft_teams",
-  "onenote",
   "share_point",
   // Other product apps
   "github",

@@ -24,7 +24,7 @@ test("defaultToolkits matches product allowlist length", () => {
   assert.ok(!defaultToolkits().includes("notion"));
   assert.ok(!defaultToolkits().includes("splitwise"));
   assert.ok(!defaultToolkits().includes("onedrive")); // canonical is one_drive
-  assert.equal(DEFAULT_COMPOSIO_TOOLKITS.length, 22);
+  assert.equal(DEFAULT_COMPOSIO_TOOLKITS.length, 18);
 });
 
 test("resolveToolkits never expands beyond default allowlist", () => {

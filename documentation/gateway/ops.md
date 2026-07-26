@@ -83,18 +83,9 @@ npx wrangler d1 execute fromdonna-routing --remote --command \
 
 ---
 
-## Per-turn traces (D1)
+## Per-turn traces (removed)
 
-Gateway **writes** per-message turn rows to D1 (`message_turns` + `message_turn_events`, 7-day retention). Schema: `cloudflare/gateway/migrations/0006_message_turns.sql`. Query via `wrangler d1 execute` when debugging; there is no separate ops UI Worker.
-
-Typical stages:
-
-1. `webhook.received` → `route.start` → `route.ready` (or `route.provisioning`)
-2. `harness.ready` → `bootstrap.ok` / `bootstrap.skipped` → `inject.ok`
-3. `telegram.sendmessage` / `telegram.editmessagetext` (agent replies via proxy)
-4. `checkpoint.harvest` — after inject; `ok` + `reason` + `safeToPause` (`harvested` | `pack_failed` | `timeout_agent_maybe_running` | `export_failed` | …)
-5. `sandbox.pause` — only if `safeToPause`; after ~60s quiet if epoch unchanged (`paused` | `skipped_newer_activity` | `skipped_agent_maybe_running` | …)
-6. On failure: `turn.error` + `gateway.user_notice` (`something_went_wrong`)
+Gateway no longer writes per-message stage traces to D1 (`message_turns` / `message_turn_events`). Those tables may still exist from migration `0006` but are unused on the hot path. Debug with `wrangler tail fromdonna-gateway` and E2B harness logs instead.
 
 ## Live logs
 
@@ -116,7 +107,7 @@ cd ~/FromDonna/cloudflare/composio-proxy
 npx wrangler tail fromdonna-composio-proxy --format pretty
 ```
 
-`console.error` on the gateway surfaces Worker failures (harness HTTP errors, E2B create failures, etc.). For per-turn history, query D1 `message_turns` / `message_turn_events`.
+`console.error` on the gateway surfaces Worker failures (harness HTTP errors, E2B create failures, etc.).
 
 ---
 

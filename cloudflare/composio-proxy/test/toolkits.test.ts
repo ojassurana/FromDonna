@@ -12,12 +12,15 @@ test("default toolkits use Composio no-underscore Google slugs", () => {
   assert.ok(d.includes("googledrive"));
   assert.ok(d.includes("googlecalendar"));
   assert.ok(d.includes("googleslides"));
-  assert.ok(d.includes("google_chat"));
   assert.ok(d.includes("one_drive"));
   assert.ok(d.includes("microsoft_teams"));
   assert.ok(d.includes("share_point"));
   assert.ok(d.includes("excel"));
-  assert.ok(d.includes("onenote"));
+  // Require auth configs that may not exist on the project — omitted from defaults.
+  assert.ok(!d.includes("google_chat"));
+  assert.ok(!d.includes("googlecontacts"));
+  assert.ok(!d.includes("googleforms"));
+  assert.ok(!d.includes("onenote"));
   assert.ok(!d.includes("google_drive"));
   assert.ok(!d.includes("onedrive")); // alias only; canonical is one_drive
 });
