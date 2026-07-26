@@ -549,6 +549,9 @@ class TelegramAdapter(BasePlatformAdapter):
             min_value=1.0,
             max_value=300.0,
         )
+        # FromDonna thinking-dots bubble state (per chat).
+        # chat_id -> {mode, message_id?, draft_id?, stop_event, task, ...}
+        self._fromdonna_thinking: Dict[str, Dict[str, Any]] = {}
         # Buffer rapid/album photo updates so Telegram image bursts are handled
         # as a single MessageEvent instead of self-interrupting multiple turns.
         self._media_batch_delay_seconds = env_float("HERMES_TELEGRAM_MEDIA_BATCH_DELAY_SECONDS", 0.8)
@@ -3604,6 +3607,9 @@ class TelegramAdapter(BasePlatformAdapter):
                                 await self.send_typing(chat_id, metadata=metadata)
                             except Exception:
                                 pass  # Typing failures are non-fatal
+                        await self._fromdonna_maybe_clear_thinking_dots(
+                            chat_id, metadata=metadata, success=True,
+                        )
                     return rich_result
 
             # Format and split message if needed
@@ -3851,6 +3857,10 @@ class TelegramAdapter(BasePlatformAdapter):
                     await self.send_typing(chat_id, metadata=metadata)
                 except Exception:
                     pass  # Typing failures are non-fatal
+
+            await self._fromdonna_maybe_clear_thinking_dots(
+                chat_id, metadata=metadata, success=True,
+            )
 
             return SendResult(
                 success=True,
@@ -8532,8 +8542,378 @@ class TelegramAdapter(BasePlatformAdapter):
             logger.debug("[%s] clear reactions failed: %s", self.name, e)
             return False
 
+    # ── FromDonna thinking-dots UX (parallel; never blocks agent runtime) ─
+
+    def _fromdonna_thinking_dots_enabled(self) -> bool:
+        """Thinking-dots bubble while a turn is in flight (default on)."""
+        raw = os.getenv("FROMDONNA_THINKING_DOTS", "true").lower()
+        if raw in {"false", "0", "no", "off"}:
+            return False
+        config = getattr(self, "config", None)
+        extra = getattr(config, "extra", None) or {}
+        if isinstance(extra, dict) and extra.get("thinking_dots") is False:
+            return False
+        if isinstance(extra, dict) and extra.get("fromdonna_ux") is False:
+            return False
+        return True
+
+    def _fromdonna_thinking_map(self) -> Dict[str, Dict[str, Any]]:
+        """Per-chat thinking-dots state; safe for partial adapters (``__new__``)."""
+        store = getattr(self, "_fromdonna_thinking", None)
+        if not isinstance(store, dict):
+            store = {}
+            self._fromdonna_thinking = store
+        return store
+
+    def _fromdonna_schedule(self, coro: Any, *, label: str) -> None:
+        """Fire-and-forget a UX coroutine so agent runtime is never awaited on it."""
+        try:
+            task = asyncio.create_task(coro)
+
+            def _consume(t: asyncio.Task) -> None:
+                try:
+                    exc = t.exception()
+                    if exc is not None:
+                        logger.debug(
+                            "[%s] fromdonna %s task failed: %s",
+                            getattr(self, "name", "telegram"),
+                            label,
+                            exc,
+                        )
+                except (asyncio.CancelledError, Exception):
+                    pass
+
+            task.add_done_callback(_consume)
+        except Exception as e:
+            logger.debug(
+                "[%s] fromdonna %s schedule failed: %s",
+                getattr(self, "name", "telegram"),
+                label,
+                e,
+            )
+
+    async def _fromdonna_post_thinking_frame(
+        self,
+        *,
+        mode: str,
+        chat_key: str,
+        frame: str,
+        draft_id: Optional[int],
+        message_id: Optional[int],
+        dots_meta: Dict[str, Any],
+    ) -> Optional[int]:
+        """Post one dots frame. Returns message_id for message-mode first send."""
+        bot = getattr(self, "_bot", None)
+        if not bot:
+            return message_id
+        tg_chat_id = normalize_telegram_chat_id(chat_key)
+
+        if mode == "draft" and draft_id is not None and hasattr(bot, "send_message_draft"):
+            kwargs: Dict[str, Any] = {
+                "chat_id": tg_chat_id,
+                "draft_id": int(draft_id),
+                "text": frame,
+            }
+            thread_id = self._metadata_thread_id(dots_meta)
+            if thread_id is not None:
+                try:
+                    kwargs["message_thread_id"] = int(thread_id)
+                except (TypeError, ValueError):
+                    pass
+            await bot.send_message_draft(**kwargs)
+            return message_id
+
+        if mode == "message":
+            if message_id is None:
+                thread_id = self._metadata_thread_id(dots_meta)
+                thread_kwargs = self._thread_kwargs_for_send(
+                    chat_key,
+                    thread_id,
+                    dots_meta,
+                    reply_to_message_id=None,
+                    reply_to_mode="off",
+                )
+                send_kwargs: Dict[str, Any] = {
+                    "chat_id": tg_chat_id,
+                    "text": frame,
+                    "disable_notification": True,
+                }
+                send_kwargs.update(thread_kwargs)
+                try:
+                    send_kwargs.update(self._link_preview_kwargs())
+                except Exception:
+                    pass
+                msg = await bot.send_message(**send_kwargs)
+                mid = getattr(msg, "message_id", None)
+                if mid is None and isinstance(msg, dict):
+                    mid = msg.get("message_id")
+                return int(mid) if mid is not None else None
+            await bot.edit_message_text(
+                chat_id=tg_chat_id,
+                message_id=int(message_id),
+                text=frame,
+            )
+            return message_id
+        return message_id
+
+    async def _fromdonna_start_thinking_dots(
+        self,
+        event: MessageEvent,
+        *,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Post a temporary thinking bubble and animate ``.`` → ``..`` → ``...``.
+
+        Prefers native ``sendMessageDraft`` in private chats (ephemeral, client
+        animates same draft_id). Falls back to a silent real message + edits
+        when drafts are unavailable. The animate loop is its own task.
+        """
+        import time as _time
+
+        from plugins.platforms.telegram.fromdonna_ux import (
+            DOTS_FRAMES,
+            THINKING_DOTS_METADATA_KEY,
+            dots_edit_interval,
+            dots_retry_after_seconds,
+            next_dots_frame,
+            thinking_draft_id,
+        )
+
+        src = getattr(event, "source", None)
+        chat_id = getattr(src, "chat_id", None)
+        if not chat_id or not self._bot:
+            return
+        chat_key = str(chat_id)
+
+        # Replace any leftover bubble from a previous turn in this chat.
+        await self._fromdonna_clear_thinking_dots(chat_key)
+
+        dots_meta: Dict[str, Any] = {THINKING_DOTS_METADATA_KEY: True}
+        if metadata:
+            dots_meta.update(metadata)
+        if src is not None:
+            thread_id = getattr(src, "thread_id", None)
+            if thread_id is not None and "thread_id" not in dots_meta:
+                dots_meta["thread_id"] = str(thread_id)
+
+        chat_type = (getattr(src, "chat_type", None) or "").lower()
+        want_draft = self.supports_draft_streaming(
+            chat_type=chat_type or "dm",
+            metadata=dots_meta,
+        )
+        draft_id: Optional[int] = None
+        if want_draft:
+            draft_id = thinking_draft_id(
+                chat_id=chat_key,
+                message_id=getattr(event, "message_id", None),
+            )
+
+        first_frame, next_idx = next_dots_frame(0)
+        mode = "draft" if want_draft else "message"
+        message_id: Optional[int] = None
+        try:
+            message_id = await self._fromdonna_post_thinking_frame(
+                mode=mode,
+                chat_key=chat_key,
+                frame=first_frame,
+                draft_id=draft_id,
+                message_id=None,
+                dots_meta=dots_meta,
+            )
+        except Exception as e:
+            if mode == "draft":
+                # Draft unavailable for this chat/runtime — fall back to message.
+                logger.debug(
+                    "[%s] thinking-dots draft failed, falling back to message: %s",
+                    getattr(self, "name", "telegram"),
+                    e,
+                )
+                mode = "message"
+                draft_id = None
+                try:
+                    message_id = await self._fromdonna_post_thinking_frame(
+                        mode="message",
+                        chat_key=chat_key,
+                        frame=first_frame,
+                        draft_id=None,
+                        message_id=None,
+                        dots_meta=dots_meta,
+                    )
+                except Exception as e2:
+                    logger.debug(
+                        "[%s] thinking-dots send failed: %s",
+                        getattr(self, "name", "telegram"),
+                        e2,
+                    )
+                    return
+            else:
+                logger.debug(
+                    "[%s] thinking-dots send failed: %s",
+                    getattr(self, "name", "telegram"),
+                    e,
+                )
+                return
+
+        if mode == "message" and message_id is None:
+            return
+
+        stop_event = asyncio.Event()
+        state: Dict[str, Any] = {
+            "mode": mode,
+            "message_id": str(message_id) if message_id is not None else None,
+            "draft_id": draft_id,
+            "stop_event": stop_event,
+            "frame_index": next_idx,
+            "task": None,
+            "last_text": first_frame,
+        }
+        self._fromdonna_thinking_map()[chat_key] = state
+
+        async def _animate() -> None:
+            idx = next_idx
+            started = _time.monotonic()
+            mid = message_id
+            while not stop_event.is_set():
+                elapsed = _time.monotonic() - started
+                interval = dots_edit_interval(elapsed)
+                if interval is None:
+                    final = DOTS_FRAMES[-1] if DOTS_FRAMES else "..."
+                    if state.get("last_text") != final and self._bot:
+                        try:
+                            mid = await self._fromdonna_post_thinking_frame(
+                                mode=mode,
+                                chat_key=chat_key,
+                                frame=final,
+                                draft_id=draft_id,
+                                message_id=mid,
+                                dots_meta=dots_meta,
+                            )
+                            state["last_text"] = final
+                            if mid is not None:
+                                state["message_id"] = str(mid)
+                        except Exception:
+                            pass
+                    try:
+                        await stop_event.wait()
+                    except Exception:
+                        pass
+                    return
+                try:
+                    await asyncio.wait_for(stop_event.wait(), timeout=interval)
+                    return
+                except asyncio.TimeoutError:
+                    pass
+                if stop_event.is_set() or not self._bot:
+                    return
+                frame, idx = next_dots_frame(idx)
+                state["frame_index"] = idx
+                if frame == state.get("last_text"):
+                    continue
+                try:
+                    mid = await self._fromdonna_post_thinking_frame(
+                        mode=mode,
+                        chat_key=chat_key,
+                        frame=frame,
+                        draft_id=draft_id,
+                        message_id=mid,
+                        dots_meta=dots_meta,
+                    )
+                    state["last_text"] = frame
+                    if mid is not None:
+                        state["message_id"] = str(mid)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    err_l = str(e).lower()
+                    if "message is not modified" in err_l:
+                        state["last_text"] = frame
+                        continue
+                    if "message to edit not found" in err_l or "message can't be edited" in err_l:
+                        return
+                    if (
+                        getattr(e, "retry_after", None) is not None
+                        or "retry after" in err_l
+                        or "flood" in err_l
+                        or "too many requests" in err_l
+                    ):
+                        delay = dots_retry_after_seconds(e, default=interval * 2)
+                        try:
+                            await asyncio.wait_for(stop_event.wait(), timeout=delay)
+                            return
+                        except asyncio.TimeoutError:
+                            continue
+                    logger.debug(
+                        "[%s] thinking-dots edit failed (stopping): %s",
+                        getattr(self, "name", "telegram"),
+                        e,
+                    )
+                    return
+
+        state["task"] = asyncio.create_task(_animate())
+
+    async def _fromdonna_clear_thinking_dots(self, chat_id: str) -> None:
+        """Stop the dots animation; delete real-message bubble if any."""
+        chat_key = str(chat_id)
+        state = self._fromdonna_thinking_map().pop(chat_key, None)
+        if not state:
+            return
+        stop_event = state.get("stop_event")
+        if stop_event is not None:
+            stop_event.set()
+        task = state.get("task")
+        if task is not None and not task.done():
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
+        # Draft mode is ephemeral — nothing to delete. Message mode removes the
+        # temporary status bubble so it never lingers next to the real reply.
+        if state.get("mode") != "message":
+            return
+        message_id = state.get("message_id")
+        bot = getattr(self, "_bot", None)
+        if message_id and bot:
+            try:
+                delete_fn = getattr(self, "delete_message", None)
+                if callable(delete_fn):
+                    await delete_fn(chat_key, str(message_id))
+            except Exception as e:
+                logger.debug(
+                    "[%s] thinking-dots delete failed: %s",
+                    getattr(self, "name", "telegram"),
+                    e,
+                )
+
+    async def _fromdonna_maybe_clear_thinking_dots(
+        self,
+        chat_id: str,
+        *,
+        metadata: Optional[Dict[str, Any]] = None,
+        success: bool = True,
+    ) -> None:
+        """Delete/stop thinking-dots when a real assistant message lands."""
+        from plugins.platforms.telegram.fromdonna_ux import (
+            should_clear_thinking_dots_on_outbound,
+        )
+
+        if not should_clear_thinking_dots_on_outbound(
+            success=success, metadata=metadata,
+        ):
+            return
+        await self._fromdonna_clear_thinking_dots(chat_id)
+
     async def on_processing_start(self, event: MessageEvent) -> None:
-        """Add an in-progress reaction when message processing begins."""
+        """Lifecycle start: schedule thinking-dots in parallel; optional 👀.
+
+        Thinking-dots is fire-and-forget (``create_task``) so Bot API I/O never
+        delays the agent main path. Stock TELEGRAM_REACTIONS 👀 remains optional.
+        """
+        if self._fromdonna_thinking_dots_enabled():
+            self._fromdonna_schedule(
+                self._fromdonna_start_thinking_dots(event),
+                label="thinking-dots-start",
+            )
         if not self._reactions_enabled():
             return
         chat_id = getattr(event.source, "chat_id", None)
@@ -8542,21 +8922,19 @@ class TelegramAdapter(BasePlatformAdapter):
             await self._set_reaction(chat_id, message_id, "\U0001f440")
 
     async def on_processing_complete(self, event: MessageEvent, outcome: ProcessingOutcome) -> None:
-        """Swap the in-progress reaction for a final success/failure reaction.
+        """Lifecycle complete: clear thinking-dots; optional 👍/👎/clear 👀.
 
-        Unlike Discord (additive reactions), Telegram's set_message_reaction
-        replaces all existing reactions in one call — no remove step needed.
-
-        On CANCELLED outcomes (e.g. the user runs ``/stop``, or a session is
-        interrupted mid-flight), we explicitly clear the 👀 in-progress
-        reaction so it doesn't linger on the user's message indefinitely.
-        Without this clear, the only way to remove the 👀 was to wait for
-        another agent run to swap it to 👍/👎 — which never happens if the
-        cancellation was the last activity in the chat.
+        Thinking-dots clear is scheduled in parallel so complete-hook latency
+        does not stall the next turn handoff. Message-mode delete is best-effort.
         """
+        chat_id = getattr(getattr(event, "source", None), "chat_id", None)
+        if chat_id and self._fromdonna_thinking_dots_enabled():
+            self._fromdonna_schedule(
+                self._fromdonna_clear_thinking_dots(str(chat_id)),
+                label="thinking-dots-clear",
+            )
         if not self._reactions_enabled():
             return
-        chat_id = getattr(event.source, "chat_id", None)
         message_id = getattr(event, "message_id", None)
         if not (chat_id and message_id):
             return

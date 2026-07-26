@@ -68,8 +68,13 @@ def test_gateway_runtime_preserves_reply_to_mode_off():
     assert 'reply_to_mode = "off"' in src or "TELEGRAM_REPLY_TO_MODE\"] = \"off\"" in src
 
 
-def test_no_fromdonna_thinking_dots_module():
-    assert not (ROOT / "hermes/plugins/platforms/telegram/fromdonna_ux.py").exists()
+def test_fromdonna_thinking_dots_module_present():
+    """Thinking-dots bubble helpers ship with the Telegram adapter."""
+    path = ROOT / "hermes/plugins/platforms/telegram/fromdonna_ux.py"
+    assert path.exists()
+    text = path.read_text(encoding="utf-8")
+    assert "DOTS_FRAMES" in text
+    assert "should_clear_thinking_dots_on_outbound" in text
 
 
 def test_soul_has_no_composio_oauth_procedure():
