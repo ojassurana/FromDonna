@@ -183,8 +183,8 @@ agent: {}
 # Background self-improvement (post-turn LLM fork). Can delay the *next* user
 # message ("Queued follow-up") while it runs. Memory/skills also writable mid-turn.
 memory:
-  memory_enabled: true
-  user_profile_enabled: true
+  memory_enabled: false
+  user_profile_enabled: false
   write_approval: false
   # Post-turn memory curator off (0). Skills still use creation_nudge_interval.
   nudge_interval: 0
