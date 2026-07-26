@@ -146,7 +146,7 @@ Typically `/home/user/.hermes` on the sandbox:
 | `config.yaml` | Settings / tools policy |
 | `skills/` | Bundled + user/agent skills |
 | `state.db` / `sessions/` | Conversation store |
-| `SOUL.md`, `memories/MEMORY.md`, `memories/USER.md` | Identity + curated memory ([identity-and-memory.md](../hermes/identity-and-memory.md)) |
+| `SOUL.md`, `memories/MEMORY.md`, `memories/USER.md` | Identity + curated memory files on disk. **Product config currently has Hermes `memory_enabled: false`** (tool off; skill nudge may still run). See [identity-and-memory.md](../hermes/identity-and-memory.md). |
 | `plugins/`, cron, logs, … | Other Hermes runtime state |
 
 **Day to day:** stays on the sandbox (pause preserves it).

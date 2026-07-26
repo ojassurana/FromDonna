@@ -28,7 +28,7 @@ Architecture and ops notes for the multi-user Hermes product: one Telegram bot, 
 | Doc | Contents |
 |-----|----------|
 | [hermes/README.md](./hermes/README.md) | Index for Hermes agent-runtime notes |
-| [hermes/identity-and-memory.md](./hermes/identity-and-memory.md) | **SOUL / MEMORY / USER** — prompt order, freeze policy, `memory` tool |
+| [hermes/identity-and-memory.md](./hermes/identity-and-memory.md) | **SOUL / MEMORY / USER** — prompt order, freeze policy, template flags (`memory_enabled: false`) |
 | [Hermes Understanding/README.md](./Hermes%20Understanding/README.md) | **Instructions map** — sequential system-seed layers + hard-coded/example text |
 
 ### Tooling

@@ -22,9 +22,9 @@ E2B-Template/
 │   └── hermes/               ← default agent-only Hermes config (no product secrets)
 │       ├── config.yaml
 │       ├── config.yaml.example
-│       ├── SOUL.md           ← Donna persona seeded to ~/.hermes/SOUL.md
+│       ├── SOUL.md           ← Donna persona ("You are Donna.") → ~/.hermes/SOUL.md
 │       └── memories/
-│           └── MEMORY.md     ← seed notes (e.g. use connect-apps skill)
+│           └── MEMORY.md     ← compact connect-apps pointer (memory tool OFF in config)
 ├── hermes/                   ← vendored Hermes fork (agent source pin)
 ├── extensions/               ← product plugins, bundled skills, agent tools
 │   ├── plugins/              ← → ~/.hermes/plugins
@@ -48,9 +48,13 @@ E2B-Template/
 |-------------------------|-------------------|
 | Hermes (pinned / your fork) | Channel tokens |
 | Default config + extensions you ship to everyone | Nango / OAuth secrets |
-| CLIs on PATH | Per-user `~/.hermes` brain |
+| Donna SOUL + compact MEMORY seed | Live agent writes to MEMORY/USER (`memory_enabled: false`) |
+| Skill self-improvement nudge on (`creation_nudge_interval: 10`) | Memory background review (`nudge_interval: 0`) |
+| CLIs on PATH | Per-user `~/.hermes` brain growth beyond seeds |
 | Secret-free local MCP | User R2 files |
 | Harness process (optional warm start) | |
+
+Product identity/memory policy: [documentation/hermes/identity-and-memory.md](../documentation/hermes/identity-and-memory.md).
 
 ## Prerequisites
 

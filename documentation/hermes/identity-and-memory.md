@@ -90,10 +90,30 @@ Session start
 
 ## FromDonna product notes
 
-- Live brain for each user is **that sandbox’s** `~/.hermes` (see [../deployment/memorymanagement.md](../deployment/memorymanagement.md)).
-- Template seeds **Donna** identity via `E2B-Template/config/hermes/SOUL.md` → image `/home/user/.hermes/SOUL.md` (see [../deployment/e2b-template.md](../deployment/e2b-template.md)). Hermes does not overwrite an existing SOUL after first use.
-- Per-user memories (`MEMORY.md` / `USER.md`) grow after first use.
-- Template upgrade / sandbox kill / `replaceRuntime`: Worker restores the R2 **runtime checkpoint** (filtered agent-home + workspace) when one exists — Architecture B stage + Worker pull (not needed for ordinary pause/unpause).
+Live brain for each user is **that sandbox’s** `~/.hermes` (see [../deployment/memorymanagement.md](../deployment/memorymanagement.md)). Template upgrade / sandbox kill / `replaceRuntime`: Worker restores the R2 **runtime checkpoint** when one exists — Architecture B (not needed for ordinary pause/unpause).
+
+### Current template policy (`E2B-Template/config/hermes/`)
+
+| File / key | Product default | Notes |
+|------------|-----------------|--------|
+| **SOUL.md** | Seeded Donna persona | Starts with explicit **`You are Donna.`** Persona-only — no Composio/OAuth runbooks. Path: `config/hermes/SOUL.md` → image `~/.hermes/SOUL.md`. Hermes does not overwrite an existing SOUL after first use. |
+| **MEMORY.md** | Compact product seed only | Single connect-apps pointer (Nous-style short note). Full OAuth procedure lives in skill `connect-apps`, not MEMORY. |
+| **USER.md** | Not seeded | File is created only if something writes it. |
+| `memory.memory_enabled` | **`false`** | Built-in `memory` tool **off** — agent does not add/replace/remove MEMORY/USER via Hermes memory. |
+| `memory.user_profile_enabled` | **`false`** | User-profile store off with memory. |
+| `memory.nudge_interval` | **`0`** | Post-turn **memory** background review (self-improvement fork) **never** spawns. |
+| `skills.creation_nudge_interval` | **`10`** | Post-turn **skill** self-improvement review still on (Hermes default cadence). |
+| `display.memory_notifications` | **`off`** | No `💾 Self-improvement review: …` chat notices (skill review may still run quietly). |
+
+Source of truth: `E2B-Template/config/hermes/config.yaml` + `SOUL.md` + `memories/MEMORY.md`. After changing these, rebuild the template (`cd E2B-Template && npm run build:prod`). Existing sandboxes keep old home until recreated; R2 restore can bring back older SOUL/MEMORY.
+
+### What we removed
+
+- **`harness/product_memory.py`** — previously re-asserted the connect-apps MEMORY line on `/bootstrap` and after R2 restore. **Deleted.** MEMORY seed is template-bake only; if the agent (or restore) drops it, nothing re-glues it.
+
+### Security note (not yet product-locked)
+
+Hermes soft-scans “edit SOUL/config” intent; there is **no** root-only file lock on SOUL/config/MEMORY in the image today. Disabling `memory_enabled` turns off the official memory tool path; shell/`write_file` can still touch disk unless further denied.
 
 ---
 
@@ -102,5 +122,5 @@ Session start
 | Doc | Contents |
 |-----|----------|
 | [../deployment/memorymanagement.md](../deployment/memorymanagement.md) | Sandbox vs R2 vs `~/.hermes` lifecycle |
-| [../deployment/e2b-template.md](../deployment/e2b-template.md) | What is baked into the image vs live home |
+| [../deployment/e2b-template.md](../deployment/e2b-template.md) | What is baked into the image vs live home; Hermes config defaults |
 | Upstream Hermes | `website/docs/developer-guide/prompt-assembly.md`, `guides/use-soul-with-hermes.md` |

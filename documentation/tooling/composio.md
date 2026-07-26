@@ -153,7 +153,7 @@ Ops can also mint a link without Hermes:
 
 Gateway helper `mintComposioConnectLink` exists in `cloudflare/gateway/src/composio.ts` but is **not** wired to a Telegram `/connect` command yet — product path is Hermes manage-connections (or direct proxy internal connect).
 
-Composio wiring lives in Hermes `mcp_servers.composio` + tool schemas + `connect-apps` skill (not SOUL — SOUL stays persona-only).
+Composio wiring lives in Hermes `mcp_servers.composio` + tool schemas + `connect-apps` skill (not SOUL — SOUL stays persona-only). Template **MEMORY.md** may hold a one-line pointer to load `connect-apps` via `skill_view`; full allowlist/procedure stays in the skill. Built-in Hermes `memory` tool is currently **off** in product config (`memory_enabled: false`) — see [../hermes/identity-and-memory.md](../hermes/identity-and-memory.md).
 
 ---
 

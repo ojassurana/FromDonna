@@ -24,7 +24,8 @@ display:
   tool_progress: false
   # Hide model thinking / reasoning bubbles (CLI default is on; we want quiet).
   show_reasoning: false
-  # Hide "💾 Self-improvement review: …" chat notices (review still runs).
+  # Hide "💾 Self-improvement review: …" chat notices (skill review may still run;
+  # memory tool + memory nudge are off below).
   memory_notifications: off
   # Consumer UX: no mid-turn status spam or "I'm busy" / first-time busy tips.
   # (busy tips are only attached to busy-ack messages, so this disables both.)
@@ -180,8 +181,8 @@ platforms:
 
 agent: {}
 
-# Background self-improvement (post-turn LLM fork). Can delay the *next* user
-# message ("Queued follow-up") while it runs. Memory/skills also writable mid-turn.
+# Built-in MEMORY/USER tool off for product. Post-turn skill self-improvement
+# still uses skills.creation_nudge_interval (can delay next message while running).
 memory:
   memory_enabled: false
   user_profile_enabled: false

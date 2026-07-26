@@ -396,7 +396,7 @@ graph TB
 | `E2B-Template/` | Image `fromdonna-hermes` (+ dev tag) via `template.ts` / `deploy-template.sh` |
 | `E2B-Template/hermes/` | Vendored Hermes **source fork** baked into image |
 | `E2B-Template/harness/` | Sandbox HTTP entry (`/telegram/update`, `/bootstrap`, `/health`) |
-| `E2B-Template/config/hermes/` | Product defaults incl. `SOUL.md`, streaming off |
+| `E2B-Template/config/hermes/` | Product defaults: Donna SOUL, MEMORY seed, **memory tool off**, skill nudge on, TG streaming off |
 
 **Sibling (not monorepo agent stack):**
 - `donna-page` → fromdonna.com waitlist (KV)
@@ -620,7 +620,12 @@ graph TB
 | TG streaming | **off** | Multi-tool turns can swallow final reply if mid-turn draft marked delivered |
 | Default model | `grok-4.5` in template config | Product default; still explicit at proxy call |
 | Typing | Hermes `sendChatAction` (+ optional Worker edge early typing) | User sees activity before first token |
-| Persona | `E2B-Template/config/hermes/SOUL.md` | Donna PA-with-tools; not host Chitti SOUL |
+| Persona | `E2B-Template/config/hermes/SOUL.md` | **You are Donna.** PA-with-tools; not host Chitti SOUL |
+| Built-in MEMORY/USER tool | **`memory_enabled: false`** | Product does not use Hermes file memory for learning yet |
+| Memory background review | **`nudge_interval: 0`** | No post-turn memory self-improvement fork |
+| Skill background review | **`creation_nudge_interval: 10`** | Skills may still self-update after complex turns |
+| MEMORY seed | Compact connect-apps pointer | Procedure in skill, not SOUL/MEMORY runbook |
+| product_memory harness | **Removed** | No bootstrap/restore re-assert of MEMORY |
 
 ---
 

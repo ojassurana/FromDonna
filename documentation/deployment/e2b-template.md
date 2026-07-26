@@ -15,15 +15,35 @@ Source tree: `E2B-Template/`
 | Gateway var | `E2B_TEMPLATE=fromdonna-hermes` |
 | Harness port | `8788` (uvicorn warm start) |
 | Hermes config | `config/hermes/config.yaml` → LLM proxy + `grok-4.5` + **`web.backend: exa`** |
-| Hermes SOUL | `config/hermes/SOUL.md` → baked to `/home/user/.hermes/SOUL.md` (Donna persona) |
+| Hermes SOUL | `config/hermes/SOUL.md` → `/home/user/.hermes/SOUL.md` (**You are Donna.**) |
+| Hermes MEMORY seed | `config/hermes/memories/MEMORY.md` → compact connect-apps pointer only |
+| Built-in memory tool | **`memory.memory_enabled: false`** (USER profile off; memory nudge `0`) |
+| Skill self-improvement | **`skills.creation_nudge_interval: 10`** (post-turn skill review on) |
 | Harness code | `E2B-Template/harness/` (`server.py`, `gateway_runtime.py`, `checkpoint.py`) |
 | Web / Exa | Stub `EXA_API_KEY=STUB` + `EXA_BASE_URL` → [api-proxy](../tooling/api-proxy-worker.md); real key never in image |
+
+### Hermes agent defaults (product policy)
+
+Baked from `config/hermes/config.yaml` (re-read after template rebuild):
+
+| Key | Value | Meaning |
+|-----|--------|---------|
+| `memory.memory_enabled` | `false` | No Hermes `memory` tool writes to MEMORY/USER |
+| `memory.user_profile_enabled` | `false` | No USER.md profile injection path |
+| `memory.nudge_interval` | `0` | No post-turn **memory** background review fork |
+| `skills.creation_nudge_interval` | `10` | Post-turn **skill** curator still runs (~every 10 turns) |
+| `display.memory_notifications` | `off` | Quiet UX — no 💾 review chat spam |
+| `display.streaming` / TG | `false` | Single final reply (avoids mid-turn draft swallowing finals) |
+| `web.backend` | `exa` | Via api-proxy stub key |
+
+**SOUL** is persona-only (`You are Donna.…`). **MEMORY** seed is a short Composio connect-apps pointer (not a runbook). Connect procedure lives in skill `extensions/skills/productivity/connect-apps/`. There is **no** harness `product_memory` re-assert anymore (removed). Detail: [../hermes/identity-and-memory.md](../hermes/identity-and-memory.md).
 
 ### What is baked today
 
 - Vendored Hermes under `E2B-Template/hermes/`
-- Agent-only Hermes config (no channel tokens; **Exa as default web backend**)
+- Agent-only Hermes config (no channel tokens; **Exa as default web backend**; memory tool off as above)
 - Default Donna `SOUL.md` (`config/hermes/SOUL.md` → `~/.hermes/SOUL.md`)
+- Compact `MEMORY.md` seed (connect-apps pointer)
 - Product plugins under `extensions/plugins` (e.g. `fromdonna_transport`)
 - FastAPI harness: `/health`, `/bootstrap`, `/telegram/update`, `/internal/checkpoint/status`, `/internal/checkpoint/export`, `/internal/restore`, legacy `/turn`
 - Checkpoint pack/stage helpers (`checkpoint.py`)
