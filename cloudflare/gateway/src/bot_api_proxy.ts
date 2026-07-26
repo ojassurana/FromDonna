@@ -201,8 +201,10 @@ export async function handleBotApiProxy(args: {
   url: URL;
   realBotToken: string;
   proxySecret: string;
+  /** Best-effort: final assistant text from sandbox Bot API for presence ring. */
+  onOutboundText?: (identity: ProxyIdentity, text: string) => Promise<void>;
 }): Promise<Response | null> {
-  const { request, url, realBotToken, proxySecret } = args;
+  const { request, url, realBotToken, proxySecret, onOutboundText } = args;
 
   // File downloads: /telegram-bot-api/file/bot{token}/{path}
   const file = filePath(url.pathname, "/telegram-bot-api/file/bot");
@@ -275,6 +277,25 @@ export async function handleBotApiProxy(args: {
     });
   } else {
     upstream = await fetch(upstreamUrl, { method: request.method === "GET" ? "GET" : "POST" });
+  }
+
+  // After successful sendMessage, remember assistant text for contextual acks.
+  if (
+    onOutboundText &&
+    upstream.ok &&
+    lower === "sendmessage" &&
+    payload.kind === "json" &&
+    payload.json &&
+    typeof payload.json.text === "string"
+  ) {
+    const text = payload.json.text.trim();
+    if (text) {
+      try {
+        await onOutboundText(identity, text);
+      } catch {
+        // never fail Bot API proxy on ring-buffer write
+      }
+    }
   }
 
   const body = await upstream.arrayBuffer();

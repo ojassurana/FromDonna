@@ -47,7 +47,9 @@ Source: `cloudflare/gateway/`
 | `TELEGRAM_WEBHOOK_SECRET` | Telegram `secret_token`; checked via `X-Telegram-Bot-Api-Secret-Token` |
 | `E2B_API_KEY` | Create / connect / resume sandboxes |
 | `WORKER_TO_HARNESS_SECRET` | Worker → harness auth; injected into process via `/bootstrap`; also used to mint Bot API proxy tokens |
-| `LLM_CAPABILITY_SECRET` | HMAC for short-lived LLM proxy capabilities (`x-llm-capability`) |
+| `LLM_CAPABILITY_SECRET` | HMAC for short-lived LLM proxy capabilities (`x-llm-capability` + presence tiny-LLM Bearer) |
+
+Optional vars: `LLM_PROXY_URL` (default prod llm-proxy), `PRESENCE_ACK_ENABLED` (`1` / `0`).
 | `COMPOSIO_SESSION_SECRET` | **Same value** on gateway **and** `fromdonna-composio-proxy` (MCP Bearer HMAC + internal mint auth). Missing/mismatched → provision hard-fail / empty Composio. See [../tooling/composio.md](../tooling/composio.md). |
 
 ### Worker vars (`wrangler.toml`)
@@ -74,14 +76,63 @@ Source: `cloudflare/gateway/`
 From the user side: **DM the bot → get a private Hermes**. No setup, no “pick a sandbox,” no extra friction.
 
 1. User texts `@fromdonna_bot`
-2. Worker **early `sendChatAction(typing)`** with the real bot token (best-effort, in parallel with D1) so the user sees typing during resume/inject — not fake reply text
-3. Worker looks up their `(gateway, gateway_user_id)` identity in D1
-4. **No row / failed** → create E2B runtime, `/health`, `/bootstrap` (incl. Composio mint when configured), **R2 restore if any**, mark `ready` only if provision policy passes (Composio **hard-require** on provision — see [../tooling/composio.md](../tooling/composio.md))
-5. **Ready** → connect/resume → **warm path** (if harness health already shows `gateway_running` + proxy ready): skip per-message `/bootstrap` and skip blocking pre-inject checkpoint pull; else full soft re-bootstrap. Then inject **raw Telegram Update** into **official Hermes Telegram gateway** in the sandbox
-6. Hermes replies via **Worker Bot API proxy** (sandbox holds proxy token only; Worker holds real bot token)
-7. After the agent session finishes → sandbox **stages** a checkpoint; Worker **pulls** it to R2 (Architecture B)
+2. Worker **early `sendChatAction(typing)`** with the real bot token (best-effort, in parallel with D1) so the user sees typing during resume/inject
+3. Worker **presence ack** (best-effort, parallel): short **contextual** WIP line via real bot token — not always “On it.” (see [Presence acks](#presence-acks-edge--not-hermes))
+4. Worker looks up their `(gateway, gateway_user_id)` identity in D1
+5. **No row / failed** → create E2B runtime, `/health`, `/bootstrap` (incl. Composio mint when configured), **R2 restore if any**, mark `ready` only if provision policy passes (Composio **hard-require** on provision — see [../tooling/composio.md](../tooling/composio.md))
+6. **Ready** → connect/resume → **warm path** (if harness health already shows `gateway_running` + proxy ready): skip per-message `/bootstrap` and skip blocking pre-inject checkpoint pull; else full soft re-bootstrap. Then inject **raw Telegram Update** into **official Hermes Telegram gateway** in the sandbox
+7. Hermes stays **quiet mid-turn** (template: no busy_ack / interim / tool_progress / TG streaming) and sends the **final** answer via **Worker Bot API proxy**
+8. After the agent session finishes → sandbox **stages** a checkpoint; Worker **pulls** it to R2 (Architecture B)
 
 Concurrent first messages: only one request wins the D1 insert claim; others see `provisioning` and are asked to retry shortly. Failed provisions self-heal on the next message. Dead/broken runtimes use `replaceRuntime` (new box + restore + kill old).
+
+### Presence acks (edge — not Hermes)
+
+**Why:** Hermes product config keeps mid-turn chat outputs **off** so multi-tool turns do not mark `content_delivered` and swallow the final. Users still need immediate presence. The **gateway** sends short WIP lines with the real bot token; Hermes only owns the final answer.
+
+| Piece | Behavior |
+|--------|----------|
+| Trigger | Inbound user `message` with text |
+| Content | Contextual (last ~10 snippets in D1 `user_presence_ring` + current text): rules map first, optional **tiny LLM** via llm-proxy with hard deadline (~400ms), fallback pool (“On it.” / …) |
+| Cap (v1) | One edge presence line per user message before Hermes final (progress-edit later) |
+| Hermes | Unchanged final path; template mid-turn flags stay off |
+| Disable | `PRESENCE_ACK_ENABLED=0` on gateway Worker |
+| Code | `cloudflare/gateway/src/presence.ts` |
+
+#### Tiny LLM request (product llm-proxy)
+
+Product proxy exposes **`POST /v1/chat/completions`** only (not OpenAI `/v1/responses`). Gateway mints a short-lived capability with `LLM_CAPABILITY_SECRET` (same family as sandbox turns).
+
+**HTTP**
+
+```http
+POST https://fromdonna-llm-proxy.code-df4.workers.dev/v1/chat/completions
+Authorization: Bearer <gateway-minted-capability>
+Content-Type: application/json
+```
+
+**JSON body** (built by `buildPresenceAckChatCompletionRequest`):
+
+```json
+{
+  "model": "grok-4.5",
+  "temperature": 0.4,
+  "max_tokens": 24,
+  "stream": false,
+  "messages": [
+    {
+      "role": "system",
+      "content": "<PRESENCE_ACK_SYSTEM_PROMPT — one WIP Donna line, ≤8 words, human intent only, no tools>"
+    },
+    {
+      "role": "user",
+      "content": "Recent chat (oldest → newest):\nUser: …\nDonna: …\nUser: <current>\n\nWrite the single WIP status line now."
+    }
+  ]
+}
+```
+
+System prompt constant: `PRESENCE_ACK_SYSTEM_PROMPT` in `presence.ts`. Status lines are stripped from the “last N” context; user + assistant finals are kept.
 
 ---
 
@@ -99,9 +150,10 @@ User DMs @fromdonna_bot
                               → warm: skip bootstrap + defer checkpoint
                               → cold: wait /health → soft re-bootstrap
   (Worker may already have sent sendChatAction typing at webhook)
+  (Worker presence ack in parallel — contextual WIP via Bot API)
   → POST /telegram/update  (Bearer + x-llm-capability)
-  → Official Hermes TelegramAdapter.process_update
-  → Outbound Telegram via Worker /telegram-bot-api/* proxy
+  → Official Hermes TelegramAdapter.process_update  (mid-turn chat quiet)
+  → Outbound Telegram final via Worker /telegram-bot-api/* proxy
   → (async) stage checkpoint → Worker harvest → R2
 ```
 

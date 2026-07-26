@@ -15,6 +15,15 @@ import {
   putCheckpoint,
 } from "./checkpoint";
 import { ensureUserComposio, getLastComposioMintError, mintComposioMcpAccess } from "./composio";
+import {
+  DEFAULT_PRESENCE_CONFIG,
+  appendPresenceSnippets,
+  callPresenceTinyLlm,
+  isPresenceStatusLine,
+  loadPresenceRing,
+  resolvePresenceAckPreferFast,
+  type PresenceSnippet,
+} from "./presence";
 import { normalizeTelegramUpdate, type TelegramUpdate } from "./telegram";
 import {
   harnessHealthPollDelayMs,
@@ -46,6 +55,13 @@ export interface Env {
    * Public workers.dev fetch from this Worker returns CF 1042.
    */
   COMPOSIO_PROXY?: Fetcher;
+  /**
+   * Product llm-proxy base (no trailing slash) for presence tiny-LLM acks.
+   * Defaults to https://fromdonna-llm-proxy.code-df4.workers.dev
+   */
+  LLM_PROXY_URL?: string;
+  /** Set to "0" / "false" to disable edge presence acks. */
+  PRESENCE_ACK_ENABLED?: string;
 }
 
 type UserAgentRow = {
@@ -145,14 +161,112 @@ async function mintLlmCapability(env: Env, userId: string): Promise<string> {
 }
 
 async function telegram(env: Env, method: string, body: Record<string, unknown>): Promise<void> {
+  await telegramJson(env, method, body);
+}
+
+/** Telegram Bot API call returning parsed JSON result (ok/result). */
+async function telegramJson(
+  env: Env,
+  method: string,
+  body: Record<string, unknown>,
+): Promise<unknown> {
   const response = await fetch(`https://api.telegram.org/bot${required(env, "TELEGRAM_BOT_TOKEN")}/${method}`, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify(body),
   });
+  const detail = await response.text().catch(() => "");
   if (!response.ok) {
-    const detail = await response.text().catch(() => "");
     throw new Error(`Telegram ${method} failed with HTTP ${response.status}${detail ? `: ${detail.slice(0, 200)}` : ""}`);
+  }
+  try {
+    return detail ? JSON.parse(detail) : null;
+  } catch {
+    return null;
+  }
+}
+
+function presenceEnabled(env: Env): boolean {
+  const flag = (env.PRESENCE_ACK_ENABLED || "1").toLowerCase();
+  return flag !== "0" && flag !== "false" && flag !== "off";
+}
+
+function llmProxyBaseUrl(env: Env): string {
+  return (env.LLM_PROXY_URL || DEFAULT_PRESENCE_CONFIG.llmProxyBaseUrl).replace(/\/$/, "");
+}
+
+/**
+ * Edge presence ack: contextual WIP line before Hermes final.
+ * Hermes mid-turn outputs stay off in template; this is the only pre-final chat text.
+ */
+async function sendPresenceAck(args: {
+  env: Env;
+  userId: string;
+  chatId: string;
+  currentUserText: string;
+}): Promise<void> {
+  const { env, userId, chatId, currentUserText } = args;
+  if (!presenceEnabled(env)) return;
+  const text = currentUserText.trim();
+  if (!text) return;
+
+  const snippets = await loadPresenceRing(env.FROMDONNA_ROUTING, userId);
+  let capability: string | null = null;
+  try {
+    capability = await mintLlmCapability(env, userId);
+  } catch (error) {
+    console.error(
+      "presence capability mint failed:",
+      error instanceof Error ? error.message : error,
+    );
+  }
+
+  const ack = await resolvePresenceAckPreferFast({
+    snippets,
+    currentUserText: text,
+    seed: userId,
+    config: {
+      llmProxyBaseUrl: llmProxyBaseUrl(env),
+      tinyLlmAck: Boolean(capability),
+    },
+    callTinyLlm: capability
+      ? (body) =>
+          callPresenceTinyLlm({
+            llmProxyBaseUrl: llmProxyBaseUrl(env),
+            capabilityToken: capability!,
+            body,
+          })
+      : undefined,
+  });
+
+  await telegram(env, "sendMessage", {
+    chat_id: chatId,
+    text: ack.text,
+  });
+
+  const additions: PresenceSnippet[] = [
+    { role: "user", text },
+    { role: "status", text: ack.text },
+  ];
+  await appendPresenceSnippets(env.FROMDONNA_ROUTING, userId, additions);
+  console.log(`presence ack source=${ack.source} user=${userId}`);
+}
+
+/** Keep Telegram "typing…" alive while inject is in flight (bounded). */
+async function typingUntil(
+  env: Env,
+  chatId: string,
+  stop: { done: boolean },
+  maxMs = 120_000,
+): Promise<void> {
+  const started = Date.now();
+  while (!stop.done && Date.now() - started < maxMs) {
+    try {
+      await telegram(env, "sendChatAction", { chat_id: chatId, action: "typing" });
+    } catch {
+      // ignore
+    }
+    await new Promise((r) => setTimeout(r, 4000));
   }
 }
 
@@ -1332,6 +1446,7 @@ async function processTelegramUpdate(
   const gateway = "telegram";
   const gatewayUserId = event.actorId;
   const gatewayConversationId = event.conversationId;
+  const userId = internalUserId(gateway, gatewayUserId);
 
   // Early typing from the edge (real bot token). Fire-and-forget so users see
   // "typing…" during D1 route / E2B connect / inject. Best-effort only.
@@ -1349,9 +1464,36 @@ async function processTelegramUpdate(
     );
   }
 
+  // Contextual presence ack (slot 1) — parallel with routing/inject, not Hermes.
+  // Hermes template keeps mid-turn outputs off; final answer still comes from sandbox.
+  if (event.type === "message" && event.message.text?.trim()) {
+    const userText = event.message.text.trim();
+    ctx.waitUntil(
+      sendPresenceAck({
+        env,
+        userId,
+        chatId: gatewayConversationId,
+        currentUserText: userText,
+      }).catch((error) => {
+        console.error(
+          "presence ack failed:",
+          error instanceof Error ? error.message : error,
+        );
+      }),
+    );
+  }
+
+  const typingStop = { done: false };
+  if (shouldSendEarlyTyping(event)) {
+    ctx.waitUntil(
+      typingUntil(env, gatewayConversationId, typingStop).catch(() => {}),
+    );
+  }
+
   try {
     const resolved = await resolveReadyRow(env, gateway, gatewayUserId, gatewayConversationId);
     if (resolved === "provisioning") {
+      typingStop.done = true;
       await telegram(env, "sendMessage", {
         chat_id: gatewayConversationId,
         text: "Setting up your private assistant — one moment, then send that again.",
@@ -1360,13 +1502,15 @@ async function processTelegramUpdate(
     }
 
     // Official path: sandbox Hermes Telegram runtime sends via Bot API proxy.
-    // Worker does not render agent text itself.
+    // Worker does not render agent final text itself (only edge presence status).
     const live = await injectTelegramUpdate(env, resolved, update);
+    typingStop.done = true;
     // Post-turn lifecycle in its own waitUntil: harvest staged checkpoint →
     // 1 min quiet (unless newer activity_epoch) → E2B pause.
     const epochAtSchedule = Number(live.activity_epoch ?? 0);
     ctx.waitUntil(runPostTurnLifecycle(env, live, epochAtSchedule));
   } catch (error) {
+    typingStop.done = true;
     const detail = error instanceof Error ? error.message : "processTelegramUpdate failed";
     console.error("processTelegramUpdate", detail);
     try {
@@ -1440,11 +1584,18 @@ export default {
       }
 
       // Official Hermes TelegramAdapter Bot API reverse proxy (token never leaves Worker).
+      // Capture final assistant text into presence ring for next-turn context.
       const proxied = await handleBotApiProxy({
         request,
         url,
         realBotToken: required(env, "TELEGRAM_BOT_TOKEN"),
         proxySecret: required(env, "WORKER_TO_HARNESS_SECRET"),
+        onOutboundText: async (identity, text) => {
+          if (!text.trim() || isPresenceStatusLine(text)) return;
+          await appendPresenceSnippets(env.FROMDONNA_ROUTING, identity.userId, [
+            { role: "assistant", text },
+          ]);
+        },
       });
       if (proxied) return proxied;
 

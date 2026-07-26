@@ -37,9 +37,12 @@ COMPOSIO_PROXY_URL = "https://fromdonna-composio-proxy.code-df4.workers.dev"
 #
 # Product API keys (EXA_API_KEY, …) belong on fromdonna-api-proxy — not here.
 # COMPOSIO_API_KEY belongs on fromdonna-composio-proxy only — not here.
+# LLM_CAPABILITY_SECRET  Shared with llm-proxy; gateway mints short-lived Bearer for presence tiny-LLM
 #
 # Vars:
 # E2B_TEMPLATE = "fromdonna-hermes"
 # HARNESS_PORT = "8788"
 # E2B_SANDBOX_DOMAIN = "e2b.dev"
 # COMPOSIO_PROXY_URL = "https://fromdonna-composio-proxy.<account>.workers.dev"
+# LLM_PROXY_URL = "https://fromdonna-llm-proxy.code-df4.workers.dev"  # presence acks
+# PRESENCE_ACK_ENABLED = "1"  # set "0" to disable edge "On it / checking email" lines
