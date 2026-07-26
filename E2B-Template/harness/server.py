@@ -1012,14 +1012,6 @@ def bootstrap(body: Bootstrap):
                 detail="composio_mcp_not_ready_after_apply",
             )
 
-    # System MEMORY pointer: connect-apps skill (idempotent; survives wipe).
-    try:
-        from product_memory import ensure_connect_apps_memory_pointer
-
-        ensure_connect_apps_memory_pointer(hermes_home=HERMES_HOME)
-    except Exception as exc:
-        print(f"product memory ensure failed: {exc}", flush=True)
-
     if proxy_to_apply is not None:
         try:
             # Start early so first user message does not pay cold connect cost,
@@ -1085,14 +1077,6 @@ async def internal_restore(
         raise
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"restore_failed: {exc}") from exc
-
-    # Re-assert product MEMORY after R2 overlay (old checkpoints may lack it).
-    try:
-        from product_memory import ensure_connect_apps_memory_pointer
-
-        ensure_connect_apps_memory_pointer(hermes_home=HERMES_HOME)
-    except Exception as exc:
-        print(f"product memory ensure after restore failed: {exc}", flush=True)
 
     return {"ok": True, "bytes": len(body)}
 

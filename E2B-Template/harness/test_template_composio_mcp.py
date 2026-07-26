@@ -135,8 +135,7 @@ def test_template_bakes_skills_and_memory_into_hermes_home():
     assert "/home/user/.hermes/skills" in template
     assert "config/hermes/memories/MEMORY.md" in template
     assert "/home/user/.hermes/memories/MEMORY.md" in template
-    # product_memory helper ships in the harness image tree.
-    assert (ROOT / "harness/product_memory.py").is_file()
+
 
 def test_memory_seed_points_at_connect_apps_skill():
     text = _MEMORY.read_text(encoding="utf-8")
@@ -148,46 +147,7 @@ def test_memory_seed_points_at_connect_apps_skill():
     assert "manage_connections" not in text.lower()
     # Keep short so it fits MEMORY budget as a single durable note.
     assert len(text) < 800
-    # Seed text must match harness re-assert entry (system-level product policy).
-    from product_memory import CONNECT_APPS_MEMORY_ENTRY
 
-    assert text.strip() == CONNECT_APPS_MEMORY_ENTRY.strip()
-
-
-def test_ensure_connect_apps_memory_pointer_is_idempotent(tmp_path):
-    """System ensure: write once, no-op when present, restore after wipe."""
-    from product_memory import (
-        CONNECT_APPS_MARKER,
-        ensure_connect_apps_memory_pointer,
-        memory_path,
-    )
-
-    hermes = tmp_path / ".hermes"
-    assert ensure_connect_apps_memory_pointer(hermes_home=hermes) is True
-    path = memory_path(hermes)
-    first = path.read_text(encoding="utf-8")
-    assert CONNECT_APPS_MARKER in first
-    assert "skill_view" in first
-
-    assert ensure_connect_apps_memory_pointer(hermes_home=hermes) is False
-    assert path.read_text(encoding="utf-8") == first
-
-    # User/agent notes without the product marker get the pointer prepended.
-    path.write_text("User prefers short answers\n", encoding="utf-8")
-    assert ensure_connect_apps_memory_pointer(hermes_home=hermes) is True
-    merged = path.read_text(encoding="utf-8")
-    assert CONNECT_APPS_MARKER in merged
-    assert "User prefers short answers" in merged
-    assert merged.index(CONNECT_APPS_MARKER) < merged.index("User prefers")
-
-
-def test_template_and_harness_wire_product_memory_ensure():
-    """Bootstrap + restore must re-assert the MEMORY pointer (system level)."""
-    server_src = (ROOT / "harness/server.py").read_text(encoding="utf-8")
-    assert "ensure_connect_apps_memory_pointer" in server_src
-    assert "product_memory" in server_src
-    # Called in both bootstrap and restore paths.
-    assert server_src.count("ensure_connect_apps_memory_pointer") >= 2
 
 def test_display_quiet_no_tool_skill_progress_spam():
     cfg = yaml.safe_load(_CONFIG.read_text(encoding="utf-8"))

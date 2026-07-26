@@ -186,8 +186,8 @@ memory:
   memory_enabled: true
   user_profile_enabled: true
   write_approval: false
-  # Post-turn memory curator (Hermes default 10). 0 = never spawn.
-  nudge_interval: 10
+  # Post-turn memory curator off (0). Skills still use creation_nudge_interval.
+  nudge_interval: 0
 
 # ── Composio MCP (official Hermes shape) ─────────────────────────────────
 # Same block Hermes documents for Composio (composio.dev/hermes):
