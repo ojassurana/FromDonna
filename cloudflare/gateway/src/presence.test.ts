@@ -1,8 +1,11 @@
 import { describe, expect, it, vi } from "vitest";
 import {
   PRESENCE_ACK_SYSTEM_PROMPT,
+  PRESENCE_PROCESS_SYSTEM_PROMPT,
   buildPresenceAckChatCompletionRequest,
   buildPresenceAckChatMessages,
+  buildPresenceProcessChatCompletionRequest,
+  canSendProcessLine,
   extractChatCompletionText,
   isPresenceStatusLine,
   parsePresenceRingJson,
@@ -10,8 +13,10 @@ import {
   pushPresenceRing,
   raceWithDeadline,
   resolvePresenceAckPreferFast,
+  resolvePresenceProcessLine,
   ruleBasedPresenceAck,
   sanitizePresenceAckLine,
+  stageFromToolName,
 } from "./presence";
 
 describe("presence rules", () => {
@@ -160,6 +165,59 @@ describe("raceWithDeadline", () => {
 describe("pickFallbackAck", () => {
   it("is deterministic for seed", () => {
     expect(pickFallbackAck(["A", "B"], "x")).toBe(pickFallbackAck(["A", "B"], "x"));
+  });
+});
+
+describe("process stages", () => {
+  it("maps tool names to human stages", () => {
+    expect(stageFromToolName("COMPOSIO_GMAIL_FETCH_EMAILS").stage).toBe("checking_email");
+    expect(stageFromToolName("web_search").line).toMatch(/Looking/i);
+  });
+
+  it("builds process completion request with runtime stage", () => {
+    const body = buildPresenceProcessChatCompletionRequest(
+      [{ role: "user", text: "check inbox" }],
+      "checking_email",
+      "Checking that email…",
+    );
+    expect(body.messages[0]?.content).toBe(PRESENCE_PROCESS_SYSTEM_PROMPT);
+    expect(body.messages[1]?.content).toContain("Runtime stage: checking_email");
+    expect(body.messages[1]?.content).toContain("check inbox");
+  });
+
+  it("resolve process line prefers rules when no llm", async () => {
+    const r = await resolvePresenceProcessLine({
+      snippets: [],
+      toolName: "gmail_list",
+      seed: "u",
+      config: { tinyLlmAck: false },
+    });
+    expect(r.source).toBe("rules");
+    expect(r.stage).toBe("checking_email");
+  });
+
+  it("enforces process budget", () => {
+    expect(
+      canSendProcessLine(
+        { process_count: 2, pre_final_count: 3, last_stage: "a", last_line_at_ms: 0 },
+        "b",
+        Date.now(),
+      ).ok,
+    ).toBe(false);
+    expect(
+      canSendProcessLine(
+        { process_count: 0, pre_final_count: 1, last_stage: "checking_email", last_line_at_ms: Date.now() },
+        "checking_email",
+        Date.now(),
+      ).ok,
+    ).toBe(false);
+    expect(
+      canSendProcessLine(
+        { process_count: 0, pre_final_count: 1, last_stage: null, last_line_at_ms: 0 },
+        "checking_email",
+        Date.now(),
+      ).ok,
+    ).toBe(true);
   });
 });
 

@@ -19,9 +19,15 @@ import {
   DEFAULT_PRESENCE_CONFIG,
   appendPresenceSnippets,
   callPresenceTinyLlm,
+  canSendProcessLine,
   isPresenceStatusLine,
   loadPresenceRing,
+  loadPresenceTurn,
+  recordPresenceProcessLine,
+  resetPresenceTurn,
   resolvePresenceAckPreferFast,
+  resolvePresenceProcessLine,
+  stageFromToolName,
   type PresenceSnippet,
 } from "./presence";
 import { normalizeTelegramUpdate, type TelegramUpdate } from "./telegram";
@@ -249,7 +255,78 @@ async function sendPresenceAck(args: {
     { role: "status", text: ack.text },
   ];
   await appendPresenceSnippets(env.FROMDONNA_ROUTING, userId, additions);
+  await resetPresenceTurn(env.FROMDONNA_ROUTING, userId);
   console.log(`presence ack source=${ack.source} user=${userId}`);
+}
+
+/**
+ * Msg 2–3: process-based human WIP from sandbox tool stages.
+ * Auth: Bearer WORKER_TO_HARNESS_SECRET (same family as harness→worker).
+ */
+async function handlePresenceStage(request: Request, env: Env): Promise<Response> {
+  const auth = request.headers.get("authorization") || "";
+  const expected = `Bearer ${required(env, "WORKER_TO_HARNESS_SECRET")}`;
+  if (auth !== expected) return new Response("Unauthorized", { status: 401 });
+  if (!presenceEnabled(env)) return json({ ok: true, skipped: "disabled" });
+
+  let body: {
+    userId?: string;
+    chatId?: string;
+    toolName?: string;
+    stage?: string;
+  };
+  try {
+    body = (await request.json()) as typeof body;
+  } catch {
+    return json({ ok: false, error: "invalid_json" }, 400);
+  }
+
+  const userId = (body.userId || "").trim();
+  const chatId = (body.chatId || "").trim();
+  if (!userId || !chatId) return json({ ok: false, error: "userId_and_chatId_required" }, 400);
+
+  const toolName = (body.toolName || "").trim();
+  const mapped = stageFromToolName(toolName || body.stage || "working");
+  const stage = (body.stage || mapped.stage).trim() || mapped.stage;
+
+  const turn = await loadPresenceTurn(env.FROMDONNA_ROUTING, userId);
+  const gate = canSendProcessLine(turn, stage, Date.now());
+  if (!gate.ok) return json({ ok: true, skipped: gate.reason });
+
+  const snippets = await loadPresenceRing(env.FROMDONNA_ROUTING, userId);
+  let capability: string | null = null;
+  try {
+    capability = await mintLlmCapability(env, userId);
+  } catch {
+    // rules-only
+  }
+
+  const line = await resolvePresenceProcessLine({
+    snippets,
+    toolName,
+    stage,
+    seed: userId,
+    config: { llmProxyBaseUrl: llmProxyBaseUrl(env), tinyLlmAck: Boolean(capability) },
+    callTinyLlm: capability
+      ? (reqBody) =>
+          callPresenceTinyLlm({
+            llmProxyBaseUrl: llmProxyBaseUrl(env),
+            capabilityToken: capability!,
+            body: reqBody,
+          })
+      : undefined,
+  });
+
+  await telegram(env, "sendMessage", {
+    chat_id: chatId,
+    text: line.text,
+  });
+  await appendPresenceSnippets(env.FROMDONNA_ROUTING, userId, [
+    { role: "status", text: line.text },
+  ]);
+  await recordPresenceProcessLine(env.FROMDONNA_ROUTING, userId, line.stage);
+  console.log(`presence process source=${line.source} stage=${line.stage} user=${userId}`);
+  return json({ ok: true, text: line.text, source: line.source, stage: line.stage });
 }
 
 /** Keep Telegram "typing…" alive while inject is in flight (bounded). */
@@ -1581,6 +1658,11 @@ export default {
       }
       if (request.method === "GET" && url.pathname === "/internal/checkpoint/status") {
         return await handleCheckpointStatus(request, env);
+      }
+
+      // Presence process stages (msg 2–3): sandbox Hermes plugin → edge light LLM.
+      if (request.method === "POST" && url.pathname === "/internal/presence/stage") {
+        return await handlePresenceStage(request, env);
       }
 
       // Official Hermes TelegramAdapter Bot API reverse proxy (token never leaves Worker).

@@ -1,9 +1,10 @@
 /**
- * Product-layer chat presence: contextual short WIP lines while Hermes works.
+ * Product-layer chat presence while Hermes works (Hermes mid-turn chat OFF).
  *
- * - Slot 1: immediate contextual ack (rules + optional tiny LLM, hard deadline)
- * - Max pre-final status messages: 2 (final from Hermes is separate → max 3 total)
- * - Human intent only; no tool/MCP/skill IDs
+ * Message budget per user turn (max 4 including Hermes final):
+ *   1. Ack — light LLM + chat context (gateway edge)
+ *   2–3. Process — light LLM + chat context + sanitized runtime stage
+ *   4. Final — Hermes full agent only
  *
  * Tiny LLM uses product llm-proxy **chat/completions** (gateway mints capability).
  * Not Hermes agent loop; not /v1/responses (proxy only exposes chat/completions).
@@ -20,8 +21,12 @@ export type PresenceConfig = {
   enabled: boolean;
   contextMessages: number;
   ackDeadlineMs: number;
+  processDeadlineMs: number;
   tinyLlmAck: boolean;
-  maxPreFinalStatus: number;
+  /** Max process lines (msg 2–3) after ack. */
+  maxProcessLines: number;
+  /** Min ms between process lines. */
+  processMinIntervalMs: number;
   fallbackPool: string[];
   model: string;
   llmProxyBaseUrl: string;
@@ -31,14 +36,16 @@ export const DEFAULT_PRESENCE_CONFIG: PresenceConfig = {
   enabled: true,
   contextMessages: 10,
   ackDeadlineMs: 400,
+  processDeadlineMs: 500,
   tinyLlmAck: true,
-  maxPreFinalStatus: 2,
+  maxProcessLines: 2,
+  processMinIntervalMs: 2500,
   fallbackPool: ["On it.", "One sec.", "Got it."],
   model: "grok-4.5",
   llmProxyBaseUrl: "https://fromdonna-llm-proxy.code-df4.workers.dev",
 };
 
-/** System instruction for the tiny presence-ack model. */
+/** System instruction for the tiny presence-ack model (msg 1). */
 export const PRESENCE_ACK_SYSTEM_PROMPT = `You write ONE short status line for Donna, a personal assistant on Telegram.
 
 Rules:
@@ -51,10 +58,61 @@ Rules:
 - If intent is unclear, reply exactly: On it.
 - Prefer concrete WIP over generic when the thread makes intent clear.`;
 
+/** System instruction for process WIP lines (msg 2–3). */
+export const PRESENCE_PROCESS_SYSTEM_PROMPT = `You write ONE short mid-work status line for Donna on Telegram.
+
+Rules:
+- Output only the status line. No quotes, no markdown.
+- Max 8 words. Trailing ellipsis (…) is OK.
+- Use the runtime stage + recent chat to say what she is doing NOW in human words.
+- Human intent only. Never name tools, APIs, MCP, Composio, skill ids, or system internals.
+- Never ask a question. Never give the final answer.
+- Do not repeat the previous status line if one is shown.
+- If stage is unclear, say: Still on it…`;
+
 export type PresenceAckResult = {
   text: string;
   source: "rules" | "tiny_llm" | "fallback";
 };
+
+export type PresenceProcessResult = {
+  text: string;
+  source: "rules" | "tiny_llm" | "fallback";
+  stage: string;
+};
+
+/** Tool name / stage id → human fallback line (also used when tiny LLM is slow). */
+export const STAGE_RULES: Array<{ re: RegExp; stage: string; line: string }> = [
+  { re: /gmail|mail|inbox|email/i, stage: "checking_email", line: "Checking that email…" },
+  { re: /calendar|schedule|meeting/i, stage: "checking_calendar", line: "Looking at your calendar…" },
+  { re: /drive|docs?|sheet|slides|file|folder|onedrive|dropbox/i, stage: "checking_files", line: "Looking through your files…" },
+  { re: /github|pull_request|repo|commit/i, stage: "checking_github", line: "Opening the repo…" },
+  { re: /linkedin/i, stage: "checking_linkedin", line: "Checking LinkedIn…" },
+  { re: /outlook|teams|sharepoint|onenote|excel/i, stage: "checking_microsoft", line: "Checking Microsoft…" },
+  { re: /web_search|web_browse|search|exa|browser/i, stage: "looking_up", line: "Looking that up…" },
+  { re: /connect|composio|manage.connection|oauth/i, stage: "connecting_app", line: "Getting the connect link…" },
+  { re: /skill_view|skill_manage|skills_list/i, stage: "loading_skill", line: "Pulling the right playbook…" },
+  { re: /terminal|bash|shell|execute/i, stage: "running_command", line: "Running that…" },
+  { re: /read_file|write_file|patch|search_files/i, stage: "working_files", line: "Working through the files…" },
+  { re: /memory/i, stage: "memory", line: "Still on it…" },
+  { re: /mcp|tool/i, stage: "using_tools", line: "Working on it…" },
+];
+
+export function stageFromToolName(toolName: string): { stage: string; line: string } {
+  const name = toolName || "tool";
+  for (const rule of STAGE_RULES) {
+    if (rule.re.test(name)) return { stage: rule.stage, line: rule.line };
+  }
+  return { stage: "working", line: "Still on it…" };
+}
+
+export function sanitizeStageId(raw: string): string {
+  return raw
+    .toLowerCase()
+    .replace(/[^a-z0-9_]+/g, "_")
+    .replace(/^_+|_+$/g, "")
+    .slice(0, 48) || "working";
+}
 
 /** Keyword / phrase rules over recent text → contextual WIP line. */
 const INTENT_RULES: Array<{ re: RegExp; line: string }> = [
@@ -346,10 +404,90 @@ export async function appendPresenceSnippets(
   return ring;
 }
 
+export function buildPresenceProcessChatMessages(
+  snippets: PresenceSnippet[],
+  stage: string,
+  stageHint: string,
+  maxContext = DEFAULT_PRESENCE_CONFIG.contextMessages,
+): Array<{ role: "system" | "user" | "assistant"; content: string }> {
+  const recent = snippets.filter((s) => s.role !== "status").slice(-maxContext);
+  const lines: string[] = [];
+  for (const s of recent) {
+    lines.push(`${s.role === "user" ? "User" : "Donna"}: ${s.text}`);
+  }
+  const lastStatus = [...snippets].reverse().find((s) => s.role === "status");
+  const userBlock =
+    `Recent chat (oldest → newest):\n${lines.join("\n") || "(empty)"}\n\n` +
+    `Runtime stage: ${stage}\n` +
+    `Stage hint: ${stageHint}\n` +
+    (lastStatus ? `Previous status line: ${lastStatus.text}\n` : "") +
+    `\nWrite the single WIP status line now (must differ from previous status if possible).`;
+  return [
+    { role: "system", content: PRESENCE_PROCESS_SYSTEM_PROMPT },
+    { role: "user", content: userBlock },
+  ];
+}
+
+export function buildPresenceProcessChatCompletionRequest(
+  snippets: PresenceSnippet[],
+  stage: string,
+  stageHint: string,
+  config: Pick<PresenceConfig, "model" | "contextMessages"> = DEFAULT_PRESENCE_CONFIG,
+): {
+  model: string;
+  temperature: number;
+  max_tokens: number;
+  stream: false;
+  messages: Array<{ role: "system" | "user" | "assistant"; content: string }>;
+} {
+  return {
+    model: config.model,
+    temperature: 0.4,
+    max_tokens: 24,
+    stream: false,
+    messages: buildPresenceProcessChatMessages(snippets, stage, stageHint, config.contextMessages),
+  };
+}
+
+export async function resolvePresenceProcessLine(args: {
+  snippets: PresenceSnippet[];
+  toolName?: string;
+  stage?: string;
+  seed: string;
+  config?: Partial<PresenceConfig>;
+  callTinyLlm?: (
+    requestBody: ReturnType<typeof buildPresenceProcessChatCompletionRequest>,
+  ) => Promise<string | null>;
+}): Promise<PresenceProcessResult> {
+  const config: PresenceConfig = { ...DEFAULT_PRESENCE_CONFIG, ...args.config };
+  const mapped = stageFromToolName(args.toolName || args.stage || "working");
+  const stage = sanitizeStageId(args.stage || mapped.stage);
+  const stageHint = mapped.line;
+
+  if (config.tinyLlmAck && args.callTinyLlm) {
+    const body = buildPresenceProcessChatCompletionRequest(args.snippets, stage, stageHint, config);
+    const raced = await raceWithDeadline(args.callTinyLlm(body), config.processDeadlineMs);
+    if (raced.ok) {
+      const cleaned = raced.value ? sanitizePresenceAckLine(raced.value) : null;
+      if (cleaned) {
+        // Avoid near-duplicate of last status.
+        const lastStatus = [...args.snippets].reverse().find((s) => s.role === "status");
+        if (!lastStatus || lastStatus.text.toLowerCase() !== cleaned.toLowerCase()) {
+          return { text: cleaned, source: "tiny_llm", stage };
+        }
+      }
+    }
+  }
+
+  return { text: stageHint, source: "rules", stage };
+}
+
 export async function callPresenceTinyLlm(args: {
   llmProxyBaseUrl: string;
   capabilityToken: string;
-  body: ReturnType<typeof buildPresenceAckChatCompletionRequest>;
+  body:
+    | ReturnType<typeof buildPresenceAckChatCompletionRequest>
+    | ReturnType<typeof buildPresenceProcessChatCompletionRequest>;
 }): Promise<string | null> {
   const base = args.llmProxyBaseUrl.replace(/\/$/, "");
   const url = `${base}/v1/chat/completions`;
@@ -368,4 +506,99 @@ export async function callPresenceTinyLlm(args: {
   }
   const json = (await response.json()) as unknown;
   return extractChatCompletionText(json);
+}
+
+// ── Turn budget (D1) ────────────────────────────────────────────────────────
+
+export type PresenceTurnState = {
+  process_count: number;
+  pre_final_count: number;
+  last_stage: string | null;
+  last_line_at_ms: number;
+};
+
+export async function resetPresenceTurn(db: D1Database, userId: string): Promise<void> {
+  try {
+    await db
+      .prepare(
+        `INSERT INTO user_presence_turn (user_id, process_count, pre_final_count, last_stage, last_line_at_ms, updated_at)
+         VALUES (?1, 0, 1, NULL, ?2, CURRENT_TIMESTAMP)
+         ON CONFLICT(user_id) DO UPDATE SET
+           process_count = 0,
+           pre_final_count = 1,
+           last_stage = NULL,
+           last_line_at_ms = excluded.last_line_at_ms,
+           updated_at = CURRENT_TIMESTAMP`,
+      )
+      .bind(userId, Date.now())
+      .run();
+  } catch (error) {
+    console.error("presence turn reset failed:", error instanceof Error ? error.message : error);
+  }
+}
+
+export async function loadPresenceTurn(db: D1Database, userId: string): Promise<PresenceTurnState> {
+  try {
+    const row = await db
+      .prepare(
+        `SELECT process_count, pre_final_count, last_stage, last_line_at_ms
+         FROM user_presence_turn WHERE user_id = ?1`,
+      )
+      .bind(userId)
+      .first<PresenceTurnState>();
+    if (row) {
+      return {
+        process_count: Number(row.process_count) || 0,
+        pre_final_count: Number(row.pre_final_count) || 0,
+        last_stage: row.last_stage ?? null,
+        last_line_at_ms: Number(row.last_line_at_ms) || 0,
+      };
+    }
+  } catch {
+    // table missing
+  }
+  return { process_count: 0, pre_final_count: 0, last_stage: null, last_line_at_ms: 0 };
+}
+
+export async function recordPresenceProcessLine(
+  db: D1Database,
+  userId: string,
+  stage: string,
+): Promise<void> {
+  try {
+    await db
+      .prepare(
+        `INSERT INTO user_presence_turn (user_id, process_count, pre_final_count, last_stage, last_line_at_ms, updated_at)
+         VALUES (?1, 1, 2, ?2, ?3, CURRENT_TIMESTAMP)
+         ON CONFLICT(user_id) DO UPDATE SET
+           process_count = user_presence_turn.process_count + 1,
+           pre_final_count = user_presence_turn.pre_final_count + 1,
+           last_stage = excluded.last_stage,
+           last_line_at_ms = excluded.last_line_at_ms,
+           updated_at = CURRENT_TIMESTAMP`,
+      )
+      .bind(userId, stage, Date.now())
+      .run();
+  } catch (error) {
+    console.error("presence process record failed:", error instanceof Error ? error.message : error);
+  }
+}
+
+/** Whether we may send another process line (msg 2–3). */
+export function canSendProcessLine(
+  turn: PresenceTurnState,
+  stage: string,
+  nowMs: number,
+  config: Pick<PresenceConfig, "maxProcessLines" | "processMinIntervalMs"> = DEFAULT_PRESENCE_CONFIG,
+): { ok: true } | { ok: false; reason: string } {
+  if (turn.process_count >= config.maxProcessLines) {
+    return { ok: false, reason: "max_process_lines" };
+  }
+  if (turn.last_stage && turn.last_stage === stage) {
+    return { ok: false, reason: "same_stage" };
+  }
+  if (turn.last_line_at_ms > 0 && nowMs - turn.last_line_at_ms < config.processMinIntervalMs) {
+    return { ok: false, reason: "min_interval" };
+  }
+  return { ok: true };
 }

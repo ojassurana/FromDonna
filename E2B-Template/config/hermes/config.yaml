@@ -27,17 +27,16 @@ display:
   # Hide "💾 Self-improvement review: …" chat notices (skill review may still run;
   # memory tool + memory nudge are off below).
   memory_notifications: off
-  # Consumer UX: no mid-turn status spam or "I'm busy" / first-time busy tips.
-  # (busy tips are only attached to busy-ack messages, so this disables both.)
+  # Hermes mid-turn chat OFF — presence msgs 1–3 are gateway light-LLM only
+  # (see documentation/gateway/presence.md). Do not re-enable without fixing
+  # content_delivered final-drop on multi-tool turns.
   busy_ack_enabled: false
   busy_steer_ack_enabled: false
   interim_assistant_messages: false
   # No "still working / heartbeat" status bubbles on long turns.
   long_running_notifications: false
-  # Explicitly re-assert quiet tool/skill progress + no reasoning on messaging.
-  # streaming:false — multi-step tool turns (Gmail via Composio) stream a short
-  # mid-turn line ("Checking…") then Hermes marks content_delivered and SUPPRESSES
-  # the real final answer. Prefer a single final send over draft previews.
+  # streaming:false — multi-step tool turns stream mid-turn drafts that can
+  # mark content_delivered and SUPPRESS the real final. Gateway owns WIP lines.
   platforms:
     telegram:
       streaming: false
@@ -89,6 +88,8 @@ platform_toolsets:
 plugins:
   enabled:
     - fromdonna_transport
+    # Mid-turn stages → gateway light-LLM presence lines (msg 2–3). Does not chat via Hermes.
+    - fromdonna_presence
 
 # Messaging gateways: hide non-consumer skills from catalog / skill_view / slash.
 # Same denylist on every channel (platform allowlist = all installed − this list).

@@ -946,6 +946,10 @@ def _apply_telegram_proxy(proxy: TelegramProxyBootstrap, *, start: bool = False)
     if chat_id:
         os.environ["TELEGRAM_HOME_CHANNEL"] = chat_id
         os.environ.setdefault("TELEGRAM_HOME_CHANNEL_NAME", "Home")
+        # Presence plugin (msg 2–3) reports stages to gateway with this chat id.
+        os.environ["FROMDONNA_CHAT_ID"] = chat_id
+    if proxy.userId:
+        os.environ["FROMDONNA_USER_ID"] = proxy.userId
 
     runtime = get_gateway_runtime(str(HERMES_HOME))
     runtime.configure_proxy(

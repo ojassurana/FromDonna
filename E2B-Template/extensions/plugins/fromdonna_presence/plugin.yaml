@@ -1,0 +1,6 @@
+name: fromdonna_presence
+version: "1.0"
+description: "Report mid-turn tool stages to FromDonna gateway for human presence lines (msg 2–3)."
+kind: standalone
+platforms:
+  - linux

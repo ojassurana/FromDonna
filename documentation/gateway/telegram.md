@@ -94,10 +94,11 @@ Concurrent first messages: only one request wins the D1 insert claim; others see
 |--------|----------|
 | Trigger | Inbound user `message` with text |
 | Content | Contextual (last ~10 snippets in D1 `user_presence_ring` + current text): rules map first, optional **tiny LLM** via llm-proxy with hard deadline (~400ms), fallback pool (“On it.” / …) |
-| Cap (v1) | One edge presence line per user message before Hermes final (progress-edit later) |
-| Hermes | Unchanged final path; template mid-turn flags stay off |
+| Cap | Msg **1** ack + up to **2** process lines + Hermes **final** (see [presence.md](./presence.md)) |
+| Msg 2–3 | Sandbox plugin `fromdonna_presence` POSTs tool stages → gateway light LLM |
+| Hermes | Final path only; template mid-turn flags stay off |
 | Disable | `PRESENCE_ACK_ENABLED=0` on gateway Worker |
-| Code | `cloudflare/gateway/src/presence.ts` |
+| Code | `cloudflare/gateway/src/presence.ts`, plugin `extensions/plugins/fromdonna_presence/` |
 
 #### Tiny LLM request (product llm-proxy)
 
