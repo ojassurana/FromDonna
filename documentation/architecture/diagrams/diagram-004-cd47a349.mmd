@@ -1,0 +1,27 @@
+flowchart TD
+    A([🚀 First DM to shared bot]) --> B[🚪 Gateway receives Update]
+    B --> C{💾 Route exists?}
+    C -->|No| D[Atomically claim provisioning row<br/>gateway + gateway_user_id]
+    C -->|Yes ready| W[Warm path]
+    C -->|Yes failed| F[Replace / recover path]
+    D --> E[Create E2B from fromdonna-hermes template]
+    E --> G[POST /bootstrap<br/>proxy TG + LLM cap + Composio]
+    G --> H{Composio mint OK?<br/>requireComposio true}
+    H -->|No| X[❌ markFailed kill sandbox]
+    H -->|Yes| I[Mark ready runtime_id]
+    I --> J[Replay original Update<br/>POST /telegram/update]
+    J --> W[Warm agent path]
+    X --> Z([User sees generic error])
+    W --> Y([✅ Private Hermes UX])
+
+    classDef start fill:#FFE66D,stroke:#333,stroke-width:2px,color:black
+    classDef action fill:#90EE90,stroke:#333,stroke-width:2px,color:darkgreen
+    classDef decision fill:#FFD700,stroke:#333,stroke-width:2px,color:black
+    classDef err fill:#FFB6C1,stroke:#DC143C,stroke-width:2px,color:black
+    classDef ok fill:#87CEEB,stroke:#333,stroke-width:2px,color:darkblue
+
+    class A start
+    class B,D,E,G,I,J,W action
+    class C,H decision
+    class X,Z err
+    class Y ok

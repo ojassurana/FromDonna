@@ -1,0 +1,28 @@
+graph TB
+    Agent[🤖 Hermes tools view]
+
+    subgraph Buckets["Connector buckets"]
+        N[Nango custom tools]
+        C[CLI in E2B shell]
+        M[MCP doors e.g. Composio]
+        A[HTTP API proxy e.g. Exa]
+    end
+
+    Door[🚪 Worker capability door<br/>user + connector + tool + args]
+
+    Agent --> N
+    Agent --> C
+    Agent --> M
+    Agent --> A
+    N --> Door
+    M --> Door
+    A --> Door
+    C -.->|keys only if needed via stub/proxy| Door
+
+    classDef agent fill:#90EE90,stroke:#333,stroke-width:2px,color:darkgreen
+    classDef b fill:#87CEEB,stroke:#333,stroke-width:2px,color:darkblue
+    classDef d fill:#FFE66D,stroke:#333,stroke-width:2px,color:black
+
+    class Agent agent
+    class N,C,M,A b
+    class Door d

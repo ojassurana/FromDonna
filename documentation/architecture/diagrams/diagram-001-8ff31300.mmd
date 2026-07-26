@@ -1,0 +1,43 @@
+graph TB
+    User([👤 End user])
+    Founder([👤 Founder / ops])
+
+    subgraph Boundary["Donna product boundary"]
+        Donna[🤖 Donna platform<br/>CF Workers + E2B Hermes]
+    end
+
+    TG[💬 Telegram Bot API]
+    E2B[☁️ E2B sandbox fleet]
+    XAI[🧠 xAI / Grok]
+    Codex[🧠 OpenAI Codex path]
+    Composio[🔐 Composio OAuth + MCP]
+    Exa[🔎 Exa search API]
+    R2ext[📦 User files R2]
+    D1ext[(💾 Routing D1)]
+    Market[🌐 fromdonna.com waitlist]
+    Apply[📝 apply.fromdonna.com]
+
+    User -->|DM shared bot| TG
+    TG <-->|webhook + Bot API| Donna
+    Donna -->|create/resume/kill| E2B
+    Donna -->|capability LLM| XAI
+    Donna -->|capability LLM| Codex
+    Donna -->|session mint / MCP door| Composio
+    Donna -->|API proxy| Exa
+    Donna --> R2ext
+    Donna --> D1ext
+    Founder -->|ops dashboard / wrangler| Donna
+    User -.->|marketing| Market
+    User -.->|recruit challenge| Apply
+
+    classDef user fill:#FFE66D,stroke:#333,stroke-width:2px,color:black
+    classDef core fill:#90EE90,stroke:#333,stroke-width:2px,color:darkgreen
+    classDef external fill:#87CEEB,stroke:#333,stroke-width:2px,color:darkblue
+    classDef data fill:#E6E6FA,stroke:#333,stroke-width:2px,color:darkblue
+    classDef side fill:#FFDAB9,stroke:#333,stroke-width:2px,color:black
+
+    class User,Founder user
+    class Donna core
+    class TG,E2B,XAI,Codex,Composio,Exa external
+    class R2ext,D1ext data
+    class Market,Apply side

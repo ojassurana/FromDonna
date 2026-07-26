@@ -1,0 +1,14 @@
+stateDiagram-v2
+    [*] --> Provisioning: first message claim
+    Provisioning --> Ready: bootstrap + Composio OK
+    Provisioning --> Failed: mint/bootstrap fail
+    Ready --> Running: message inject
+    Running --> Ready: turn complete
+    Ready --> Paused: idle policy
+    Paused --> Running: resume + health + inject
+    Paused --> Gone: E2B expire/delete
+    Gone --> Provisioning: auto-replace + replay Update
+    Failed --> Provisioning: clear rows + retry
+    Ready --> Wiped: ops wipe user data
+    Paused --> Wiped: ops wipe
+    Wiped --> [*]

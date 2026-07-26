@@ -1,0 +1,63 @@
+graph TB
+    subgraph Clients["Client layer"]
+        TGClient[💬 Telegram client]
+    end
+
+    subgraph CF["☁️ Cloudflare account"]
+        GW[🚪 fromdonna-gateway<br/>webhook · route · E2B · Bot API proxy]
+        LLM[🧠 fromdonna-llm-proxy<br/>OpenAI-compat door]
+        API[🔌 fromdonna-api-proxy<br/>Exa etc.]
+        COMP[🔐 fromdonna-composio-proxy<br/>MCP door]
+        DASH[📊 fromdonna-ops-dashboard]
+        D1[(💾 D1 fromdonna-routing)]
+        R2[📦 R2 fromdonna-user-state]
+    end
+
+    subgraph E2BBox["⚙️ E2B sandbox per user"]
+        Harness[🔧 Harness HTTP<br/>/health /bootstrap /telegram/update]
+        GR[📱 GatewayRunner + TelegramAdapter]
+        Hermes[🤖 Hermes agent brain]
+        Home[💾 ~/.hermes<br/>skills · memory · state.db]
+        Tools[🛠️ Tools / CLI / MCP client]
+    end
+
+    subgraph Upstream["External upstreams"]
+        TGapi[Telegram Bot API]
+        Providers[Grok / Codex / …]
+        CompUp[Composio cloud]
+        ExaUp[Exa API]
+    end
+
+    TGClient <--> TGapi
+    TGapi -->|webhook| GW
+    GW -->|raw Update POST| Harness
+    Harness --> GR
+    GR --> Hermes
+    Hermes --> Home
+    Hermes --> Tools
+    GR -->|Bot API via proxy token| GW
+    GW -->|real token| TGapi
+
+    Tools -->|model + capability| LLM
+    LLM --> Providers
+    Tools -->|MCP Bearer| COMP
+    COMP --> CompUp
+    Tools -->|STUB key + base_url| API
+    API --> ExaUp
+
+    GW --> D1
+    GW --> R2
+    GW --> E2BBox
+    GW --> DASH
+
+    classDef edge fill:#87CEEB,stroke:#333,stroke-width:2px,color:darkblue
+    classDef compute fill:#90EE90,stroke:#333,stroke-width:2px,color:darkgreen
+    classDef data fill:#E6E6FA,stroke:#333,stroke-width:2px,color:darkblue
+    classDef ext fill:#FFDAB9,stroke:#333,stroke-width:2px,color:black
+    classDef client fill:#FFE66D,stroke:#333,stroke-width:2px,color:black
+
+    class GW,LLM,API,COMP,DASH edge
+    class Harness,GR,Hermes,Home,Tools compute
+    class D1,R2 data
+    class TGapi,Providers,CompUp,ExaUp ext
+    class TGClient client

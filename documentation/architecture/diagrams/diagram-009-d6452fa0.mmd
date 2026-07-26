@@ -1,0 +1,10 @@
+flowchart LR
+    Env[🌍 Environment R2/Worker] -->|tools only| Agent[🤖 Hermes]
+    Mem[🧠 Memory ~/.hermes] --> Agent
+    Prompt[📝 Prompts/SOUL] --> Agent
+    Agent -->|never auto-inject raw env docs| Prompt
+
+    classDef ok fill:#90EE90,stroke:#333,stroke-width:2px,color:darkgreen
+    classDef data fill:#E6E6FA,stroke:#333,stroke-width:2px,color:darkblue
+    class Agent ok
+    class Env,Mem,Prompt data

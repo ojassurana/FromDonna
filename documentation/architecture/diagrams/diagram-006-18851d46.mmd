@@ -1,0 +1,49 @@
+graph TB
+    subgraph CF["☁️ Cloudflare"]
+        subgraph Workers["Workers"]
+            GW[fromdonna-gateway]
+            LLM[fromdonna-llm-proxy]
+            API[fromdonna-api-proxy]
+            COMP[fromdonna-composio-proxy]
+            DASH[fromdonna-ops-dashboard]
+        end
+        D1[(D1 fromdonna-routing)]
+        R2[R2 fromdonna-user-state]
+        SBIND[Service binding COMPOSIO_PROXY]
+    end
+
+    subgraph E2BCloud["☁️ E2B"]
+        TPL[Template image<br/>fromdonna-hermes / -dev]
+        U1[Sandbox user A paused/running]
+        U2[Sandbox user B]
+    end
+
+    subgraph Providers["External"]
+        TG[Telegram]
+        XAI[xAI]
+        CMP[Composio]
+    end
+
+    GW --> D1
+    GW --> R2
+    GW --> SBIND
+    SBIND --> COMP
+    GW --> TPL
+    TPL --> U1
+    TPL --> U2
+    GW <--> TG
+    U1 --> LLM
+    U2 --> LLM
+    LLM --> XAI
+    U1 --> COMP
+    COMP --> CMP
+
+    classDef w fill:#87CEEB,stroke:#333,stroke-width:2px,color:darkblue
+    classDef d fill:#E6E6FA,stroke:#333,stroke-width:2px,color:darkblue
+    classDef c fill:#90EE90,stroke:#333,stroke-width:2px,color:darkgreen
+    classDef e fill:#FFDAB9,stroke:#333,stroke-width:2px,color:black
+
+    class GW,LLM,API,COMP,DASH,SBIND w
+    class D1,R2 d
+    class TPL,U1,U2 c
+    class TG,XAI,CMP e

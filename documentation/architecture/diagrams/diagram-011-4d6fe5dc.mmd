@@ -1,0 +1,36 @@
+graph TB
+    subgraph Public["🌐 Public internet"]
+        User[User Telegram]
+    end
+
+    subgraph EdgeTZ["🛡️ Edge trust zone - CF Workers"]
+        GW[Gateway]
+        Secrets[Vendor secrets + bot token]
+    end
+
+    subgraph UserTZ["⚙️ User trust zone - E2B"]
+        Brain[Hermes + user files]
+        Caps[Short-lived capabilities]
+    end
+
+    subgraph Vendor["External vendors"]
+        V[TG / LLM / Composio / Exa]
+    end
+
+    User --> GW
+    GW --> Secrets
+    GW -->|proxy token + caps only| Brain
+    Brain --> Caps
+    Caps --> GW
+    Secrets --> V
+    Brain -->|no long-lived vendor keys| V
+
+    classDef pub fill:#FFE66D,stroke:#333,stroke-width:2px,color:black
+    classDef edge fill:#87CEEB,stroke:#333,stroke-width:2px,color:darkblue
+    classDef user fill:#90EE90,stroke:#333,stroke-width:2px,color:darkgreen
+    classDef vend fill:#FFDAB9,stroke:#333,stroke-width:2px,color:black
+
+    class User pub
+    class GW,Secrets edge
+    class Brain,Caps user
+    class V vend

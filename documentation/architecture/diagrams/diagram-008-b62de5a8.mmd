@@ -1,0 +1,16 @@
+erDiagram
+    USER_AGENTS ||--o| USER_COMPOSIO : user_id
+    USER_AGENTS {
+        text user_id PK
+        text gateway
+        text gateway_user_id
+        text runtime_id
+        text status
+        text created_at
+    }
+    USER_COMPOSIO {
+        text user_id PK
+        text composio_session_id
+        text composio_mcp_url
+        text toolkits_json
+    }

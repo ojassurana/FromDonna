@@ -1,0 +1,34 @@
+sequenceDiagram
+    participant U as 👤 User
+    participant TG as 💬 Telegram
+    participant GW as 🚪 Gateway Worker
+    participant SB as ⚙️ Sandbox harness
+    participant AD as 📱 TelegramAdapter
+    participant H as 🤖 Hermes
+    participant LLM as 🧠 llm-proxy
+
+    U->>TG: Send message
+    TG->>GW: Webhook Update
+    GW->>GW: Lookup D1 user_agents
+    opt Sandbox paused
+        GW->>SB: Resume E2B + wait /health
+    end
+    opt Edge early typing
+        GW->>TG: sendChatAction typing (real token)
+    end
+    opt Cold / needs bootstrap
+        GW->>SB: POST /bootstrap proxy token + capabilities
+        SB->>AD: Start GatewayRunner
+    end
+    GW->>SB: POST /telegram/update raw Update
+    Note over GW: Inject returns after schedule<br/>does not await full agent turn
+    SB->>AD: handle_message fire-and-forget
+    AD->>TG: sendChatAction via GW Bot API proxy
+    AD->>H: Run agent turn
+    H->>LLM: Chat Completions + tools + capability
+    LLM-->>H: assistant / tool_calls
+    H->>H: Execute tools locally / MCP / CLI
+    H-->>AD: Final reply text/media
+    AD->>GW: sendMessage bot{fd1.proxy…}
+    GW->>TG: sendMessage real bot token
+    TG->>U: Reply
