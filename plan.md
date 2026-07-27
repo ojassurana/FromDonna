@@ -19,6 +19,8 @@ User should never sit in dead air. Chat feels alive with short Donna WIP lines, 
 
 Hermes must **not** emit its own mid-turn chat (busy-ack, interim assistant, tool progress, TG streaming drafts). Those can mark `content_delivered` and **swallow the real final**.
 
+**Also removed (2026-07-27):** FromDonna **thinking-dots** (`. → .. → ...` bubble via `fromdonna_ux` / adapter). Not Hermes config — it was a parallel Bot API animate path. Fully deleted from the template; do not reintroduce. Presence WIP is **gateway msgs 1–3 only** + typing indicator.
+
 ### Template config (already set — keep this)
 
 `E2B-Template/config/hermes/config.yaml`:
@@ -44,10 +46,11 @@ Do **not** re-enable Hermes interim/streaming for presence without a separate `c
 
 ### 1) Ack (implemented on gateway)
 
-- **When:** User text arrives (parallel with inject).
-- **Context:** Current message + last ~10 ring snippets (D1 `user_presence_ring`).
-- **Model:** Tiny call to product llm-proxy `POST /v1/chat/completions` (not full Hermes). Hard deadline ~400ms.
-- **Fallback:** Keyword rules → pool (“On it.” / “One sec.” / “Got it.”).
+- **When:** User text arrives; **bounded await before inject** so WIP lands before final.
+- **Context:** Latest user message primary; weak older ring only.
+- **Model:** Tiny call via **`LLM_PROXY` service binding** → llm-proxy `POST /v1/chat/completions` (not public workers.dev — CF 1042). Hard deadline ~1.2s.
+- **Fallback:** Single bland `Working on that…` — **never** `One sec.` / `On it.` / `Got it.`
+- **No scenario regex catalog** (Ojas hard rule).
 - **Code:** `cloudflare/gateway/src/presence.ts` (deployed).
 
 ### 2–3) Process-based human lines (to build)

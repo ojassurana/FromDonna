@@ -68,6 +68,7 @@ Optional vars: `LLM_PROXY_URL` (default prod llm-proxy), `PRESENCE_ACK_ENABLED` 
 | `FROMDONNA_ROUTING` | D1 `fromdonna-routing` |
 | `USER_STATE` | R2 `fromdonna-user-state` (runtime checkpoints) |
 | `COMPOSIO_PROXY` | Service binding → `fromdonna-composio-proxy` (mint/connect; avoids CF **1042** on Worker→Worker `workers.dev` fetch) |
+| `LLM_PROXY` | Service binding → `fromdonna-llm-proxy` (**required** for presence tiny-LLM; public workers.dev fetch = CF **1042**) |
 
 ---
 
@@ -77,11 +78,11 @@ From the user side: **DM the bot → get a private Hermes**. No setup, no “pic
 
 1. User texts `@fromdonna_bot`
 2. Worker **early `sendChatAction(typing)`** with the real bot token (best-effort, in parallel with D1) so the user sees typing during resume/inject
-3. Worker **presence ack** (best-effort, parallel): short **contextual** WIP line via real bot token — not always “On it.” (see [Presence acks](#presence-acks-edge--not-hermes))
+3. Worker **presence ack** (bounded await before inject): short **LLM-first** WIP line via real bot token when structural gate is ON — never `One sec.` / thinking-dots (see [Presence acks](#presence-acks-edge--not-hermes))
 4. Worker looks up their `(gateway, gateway_user_id)` identity in D1
 5. **No row / failed** → create E2B runtime, `/health`, `/bootstrap` (incl. Composio mint when configured), **R2 restore if any**, mark `ready` only if provision policy passes (Composio **hard-require** on provision — see [../tooling/composio.md](../tooling/composio.md))
 6. **Ready** → connect/resume → **warm path** (if harness health already shows `gateway_running` + proxy ready): skip per-message `/bootstrap` and skip blocking pre-inject checkpoint pull; else full soft re-bootstrap. Then inject **raw Telegram Update** into **official Hermes Telegram gateway** in the sandbox
-7. Hermes stays **quiet mid-turn** (template: no busy_ack / interim / tool_progress / TG streaming) and sends the **final** answer via **Worker Bot API proxy**
+7. Hermes stays **quiet mid-turn** (template: no busy_ack / interim / tool_progress / TG streaming; **no FromDonna thinking-dots**) and sends the **final** answer via **Worker Bot API proxy**
 8. After the agent session finishes → sandbox **stages** a checkpoint; Worker **pulls** it to R2 (Architecture B)
 
 Concurrent first messages: only one request wins the D1 insert claim; others see `provisioning` and are asked to retry shortly. Failed provisions self-heal on the next message. Dead/broken runtimes use `replaceRuntime` (new box + restore + kill old).
@@ -96,11 +97,12 @@ Full detail: [presence.md](./presence.md).
 |--------|----------|
 | Trigger | Inbound user `message` with text |
 | **Hybrid gate** | Structural skip hi/thanks/echo/short; ON for real asks; optional micro yes/no — **no app scenarios** |
-| Content | **LLM-first** latest-msg ack (~650ms); banned One sec/On it; bland fallback `Working on that…` only |
+| Content | **LLM-first** latest-msg ack (~1.2s) via **`LLM_PROXY` binding**; banned One sec/On it; bland fallback `Working on that…` only |
 | Cap | Msg **1** ack (if gate ON) + up to **2** process lines (LLM from live tool signal) + Hermes **final** |
 | Msg 2–3 | Plugin posts tool start → gateway tiny LLM (no hardcoded stage slogans) |
 | Hermes | Final path only; template mid-turn flags stay off |
-| Disable | `PRESENCE_ACK_ENABLED=0` on gateway Worker |
+| **Thinking-dots** | **Removed** — no `.`/`..`/`...` bubble in template (2026-07-27) |
+| Disable presence | `PRESENCE_ACK_ENABLED=0` on gateway Worker |
 | Code | `cloudflare/gateway/src/presence.ts`, plugin `extensions/plugins/fromdonna_presence/` |
 
 #### Tiny LLM request (product llm-proxy)
@@ -125,9 +127,9 @@ User DMs @fromdonna_bot
                               → warm: skip bootstrap + defer checkpoint
                               → cold: wait /health → soft re-bootstrap
   (Worker may already have sent sendChatAction typing at webhook)
-  (Worker presence: hybrid gate → optional contextual WIP via Bot API)
+  (Worker presence: structural gate → optional LLM WIP via Bot API; await before inject)
   → POST /telegram/update  (Bearer + x-llm-capability + presence identity headers)
-  → Official Hermes TelegramAdapter.process_update  (mid-turn chat quiet)
+  → Official Hermes TelegramAdapter.process_update  (mid-turn chat quiet; no thinking-dots)
   → Outbound Telegram final via Worker /telegram-bot-api/* proxy
   → (async) stage checkpoint → Worker harvest → R2
 ```

@@ -34,6 +34,7 @@ Baked from `config/hermes/config.yaml` (re-read after template rebuild):
 | `skills.creation_nudge_interval` | `10` | Post-turn **skill** curator still runs (~every 10 turns) |
 | `display.memory_notifications` | `off` | Quiet UX — no 💾 review chat spam |
 | `display.streaming` / TG | `false` | Single final reply (avoids mid-turn draft swallowing finals) |
+| FromDonna thinking-dots | **Removed** | No `.`/`..`/`...` bubble (`fromdonna_ux` deleted 2026-07-27) |
 | `web.backend` | `exa` | Via api-proxy stub key |
 
 **SOUL** is persona-only (`You are Donna.…`). **MEMORY** seed is a short Composio connect-apps pointer (not a runbook). Connect procedure lives in skill `extensions/skills/productivity/connect-apps/`. There is **no** harness `product_memory` re-assert anymore (removed). Detail: [../hermes/identity-and-memory.md](../hermes/identity-and-memory.md).
