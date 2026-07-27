@@ -68,6 +68,9 @@ describe("sanitize + status detect", () => {
   it("detects status lines", () => {
     expect(isPresenceStatusLine("Checking that email…")).toBe(true);
     expect(isPresenceStatusLine("On it.")).toBe(true);
+    expect(isPresenceStatusLine("...")).toBe(true);
+    expect(isPresenceStatusLine(".")).toBe(true);
+    expect(isPresenceStatusLine("All set…")).toBe(false);
     expect(isPresenceStatusLine("Here is your full report with details")).toBe(false);
   });
 });
@@ -192,8 +195,23 @@ describe("process stages", () => {
       seed: "u",
       config: { tinyLlmAck: false },
     });
+    expect("skipped" in r).toBe(false);
+    if ("skipped" in r) return;
     expect(r.source).toBe("rules");
     expect(r.stage).toBe("checking_email");
+  });
+
+  it("skips duplicate process text matching prior status", async () => {
+    const r = await resolvePresenceProcessLine({
+      snippets: [{ role: "status", text: "Checking that email…" }],
+      toolName: "gmail_list",
+      seed: "u",
+      config: { tinyLlmAck: false },
+    });
+    // stage hint duplicates ack → alt "Still on it…"
+    expect("skipped" in r).toBe(false);
+    if ("skipped" in r) return;
+    expect(r.text).toMatch(/Still on it/i);
   });
 
   it("enforces process budget", () => {
@@ -211,11 +229,28 @@ describe("process stages", () => {
         Date.now(),
       ).ok,
     ).toBe(false);
+    // last_line_at_ms=0 means ack-only turn — process allowed immediately
     expect(
       canSendProcessLine(
         { process_count: 0, pre_final_count: 1, last_stage: null, last_line_at_ms: 0 },
         "checking_email",
         Date.now(),
+      ).ok,
+    ).toBe(true);
+    // min_interval only after a real process line
+    const now = Date.now();
+    expect(
+      canSendProcessLine(
+        { process_count: 1, pre_final_count: 1, last_stage: "checking_email", last_line_at_ms: now },
+        "looking_up",
+        now + 100,
+      ).ok,
+    ).toBe(false);
+    expect(
+      canSendProcessLine(
+        { process_count: 1, pre_final_count: 1, last_stage: "checking_email", last_line_at_ms: now },
+        "looking_up",
+        now + 2600,
       ).ok,
     ).toBe(true);
   });

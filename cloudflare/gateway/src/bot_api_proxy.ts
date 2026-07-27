@@ -280,15 +280,18 @@ export async function handleBotApiProxy(args: {
   }
 
   // After successful sendMessage, remember assistant text for contextual acks.
-  if (
-    onOutboundText &&
-    upstream.ok &&
-    lower === "sendmessage" &&
-    payload.kind === "json" &&
-    payload.json &&
-    typeof payload.json.text === "string"
-  ) {
-    const text = payload.json.text.trim();
+  if (onOutboundText && upstream.ok && lower === "sendmessage") {
+    let text = "";
+    if (payload.kind === "json" && payload.json && typeof payload.json.text === "string") {
+      text = payload.json.text.trim();
+    } else if (payload.kind === "form" && payload.form) {
+      const formText = formGet(payload.form, "text");
+      if (formText) text = String(formText).trim();
+      if (!text) {
+        const caption = formGet(payload.form, "caption");
+        if (caption) text = String(caption).trim();
+      }
+    }
     if (text) {
       try {
         await onOutboundText(identity, text);

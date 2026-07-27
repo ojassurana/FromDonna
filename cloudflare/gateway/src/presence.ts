@@ -136,14 +136,34 @@ export function normalizeSnippetText(text: string, maxLen = 280): string {
   return text.replace(/\s+/g, " ").trim().slice(0, maxLen);
 }
 
+/** Known product WIP lines (do not treat arbitrary short “All set…” finals as status). */
 export function isPresenceStatusLine(text: string): boolean {
   const t = text.trim();
   if (!t) return false;
-  // Trailing WIP ellipsis or known fallbacks / rule lines.
-  if (/…$|\.\.\.$/.test(t) && t.length <= 80) return true;
+  // Thinking-dots frames (FromDonna UX) must never land in the assistant ring.
+  if (/^\.{1,3}$/.test(t)) return true;
   const lower = t.toLowerCase();
-  if (["on it.", "one sec.", "got it.", "on it", "one sec", "got it"].includes(lower)) return true;
+  if (["on it.", "one sec.", "got it.", "on it", "one sec", "got it", "still on it…", "still on it..."].includes(lower)) {
+    return true;
+  }
+  for (const rule of STAGE_RULES) {
+    if (rule.line.toLowerCase() === lower) return true;
+  }
+  for (const rule of INTENT_RULES) {
+    if (rule.line.toLowerCase() === lower) return true;
+  }
   return false;
+}
+
+export function isGenericPresenceLine(text: string): boolean {
+  const lower = text.trim().toLowerCase();
+  return ["on it.", "one sec.", "got it.", "on it", "one sec", "got it", "still on it…", "still on it...", "working on it…", "working on it..."].includes(
+    lower,
+  );
+}
+
+export function samePresenceText(a: string, b: string): boolean {
+  return a.trim().toLowerCase() === b.trim().toLowerCase();
 }
 
 export function pushPresenceRing(
@@ -336,8 +356,13 @@ export async function resolvePresenceAckPreferFast(args: {
     const raced = await raceWithDeadline(llmPromise, config.ackDeadlineMs);
     if (raced.ok) {
       const cleaned = raced.value ? sanitizePresenceAckLine(raced.value) : null;
-      // Prefer LLM when it beats deadline; else rules/fallback.
-      if (cleaned) return { text: cleaned, source: "tiny_llm" };
+      if (cleaned) {
+        // Prefer concrete rules over a generic LLM line when rules already know intent.
+        if (rule && isGenericPresenceLine(cleaned) && !isGenericPresenceLine(rule)) {
+          return { text: rule, source: "rules" };
+        }
+        return { text: cleaned, source: "tiny_llm" };
+      }
     }
   }
 
@@ -396,10 +421,70 @@ export async function appendPresenceSnippets(
   additions: PresenceSnippet[],
   max = DEFAULT_PRESENCE_CONFIG.contextMessages,
 ): Promise<PresenceSnippet[]> {
-  let ring = await loadPresenceRing(db, userId);
-  for (const a of additions) {
-    ring = pushPresenceRing(ring, a, max);
+  // Compare-and-swap on messages_json so concurrent ack/process/final don't clobber.
+  for (let attempt = 0; attempt < 6; attempt++) {
+    let priorJson = "[]";
+    try {
+      const row = await db
+        .prepare(`SELECT messages_json FROM user_presence_ring WHERE user_id = ?1`)
+        .bind(userId)
+        .first<{ messages_json: string }>();
+      if (row?.messages_json) priorJson = row.messages_json;
+    } catch {
+      // table may not exist
+    }
+    let ring = parsePresenceRingJson(priorJson);
+    for (const a of additions) {
+      ring = pushPresenceRing(ring, a, max);
+    }
+    const nextJson = JSON.stringify(ring.slice(-max));
+    try {
+      if (priorJson === "[]") {
+        // Insert-or-update: only win insert when missing; else CAS update.
+        const inserted = await db
+          .prepare(
+            `INSERT INTO user_presence_ring (user_id, messages_json, updated_at)
+             VALUES (?1, ?2, CURRENT_TIMESTAMP)
+             ON CONFLICT(user_id) DO NOTHING`,
+          )
+          .bind(userId, nextJson)
+          .run();
+        const changes = Number((inserted as { meta?: { changes?: number } })?.meta?.changes ?? 0);
+        if (changes > 0) return ring;
+        // Row existed — fall through to CAS update with re-read next loop.
+        const cas = await db
+          .prepare(
+            `UPDATE user_presence_ring
+             SET messages_json = ?2, updated_at = CURRENT_TIMESTAMP
+             WHERE user_id = ?1 AND messages_json = ?3`,
+          )
+          .bind(userId, nextJson, priorJson)
+          .run();
+        const casChanges = Number((cas as { meta?: { changes?: number } })?.meta?.changes ?? 0);
+        if (casChanges > 0) return ring;
+      } else {
+        const cas = await db
+          .prepare(
+            `UPDATE user_presence_ring
+             SET messages_json = ?2, updated_at = CURRENT_TIMESTAMP
+             WHERE user_id = ?1 AND messages_json = ?3`,
+          )
+          .bind(userId, nextJson, priorJson)
+          .run();
+        const casChanges = Number((cas as { meta?: { changes?: number } })?.meta?.changes ?? 0);
+        if (casChanges > 0) return ring;
+      }
+    } catch (error) {
+      console.error(
+        "presence ring append failed:",
+        error instanceof Error ? error.message : error,
+      );
+      return ring;
+    }
   }
+  // Last resort write (still better than dropping).
+  let ring = await loadPresenceRing(db, userId);
+  for (const a of additions) ring = pushPresenceRing(ring, a, max);
   await savePresenceRing(db, userId, ring, max);
   return ring;
 }
@@ -458,28 +543,33 @@ export async function resolvePresenceProcessLine(args: {
   callTinyLlm?: (
     requestBody: ReturnType<typeof buildPresenceProcessChatCompletionRequest>,
   ) => Promise<string | null>;
-}): Promise<PresenceProcessResult> {
+}): Promise<PresenceProcessResult | { skipped: true; reason: string; stage: string }> {
   const config: PresenceConfig = { ...DEFAULT_PRESENCE_CONFIG, ...args.config };
   const mapped = stageFromToolName(args.toolName || args.stage || "working");
   const stage = sanitizeStageId(args.stage || mapped.stage);
   const stageHint = mapped.line;
+  const lastStatus = [...args.snippets].reverse().find((s) => s.role === "status");
 
   if (config.tinyLlmAck && args.callTinyLlm) {
     const body = buildPresenceProcessChatCompletionRequest(args.snippets, stage, stageHint, config);
     const raced = await raceWithDeadline(args.callTinyLlm(body), config.processDeadlineMs);
     if (raced.ok) {
       const cleaned = raced.value ? sanitizePresenceAckLine(raced.value) : null;
-      if (cleaned) {
-        // Avoid near-duplicate of last status.
-        const lastStatus = [...args.snippets].reverse().find((s) => s.role === "status");
-        if (!lastStatus || lastStatus.text.toLowerCase() !== cleaned.toLowerCase()) {
-          return { text: cleaned, source: "tiny_llm", stage };
-        }
+      if (cleaned && (!lastStatus || !samePresenceText(lastStatus.text, cleaned))) {
+        return { text: cleaned, source: "tiny_llm", stage };
       }
     }
   }
 
-  return { text: stageHint, source: "rules", stage };
+  // Rules path must also avoid duplicate of ack / prior status.
+  if (!lastStatus || !samePresenceText(lastStatus.text, stageHint)) {
+    return { text: stageHint, source: "rules", stage };
+  }
+  const alt = "Still on it…";
+  if (!samePresenceText(lastStatus.text, alt)) {
+    return { text: alt, source: "fallback", stage };
+  }
+  return { skipped: true, reason: "duplicate_status", stage };
 }
 
 export async function callPresenceTinyLlm(args: {
@@ -509,32 +599,42 @@ export async function callPresenceTinyLlm(args: {
 }
 
 // ── Turn budget (D1) ────────────────────────────────────────────────────────
+// pre_final_count is reused as turn_epoch (bumped on each ack / turn open).
 
 export type PresenceTurnState = {
   process_count: number;
+  /** Turn epoch (bumped on reset). Stages claim against this so late ack reset can't steal budget. */
   pre_final_count: number;
   last_stage: string | null;
   last_line_at_ms: number;
 };
 
-export async function resetPresenceTurn(db: D1Database, userId: string): Promise<void> {
+/**
+ * Open a new presence turn (msg 1 / new user text).
+ * - process_count = 0
+ * - last_line_at_ms = 0  (min_interval is BETWEEN process lines only — never after ack)
+ * - last_stage = null
+ * - pre_final_count (epoch) += 1
+ */
+export async function resetPresenceTurn(db: D1Database, userId: string): Promise<PresenceTurnState> {
   try {
     await db
       .prepare(
         `INSERT INTO user_presence_turn (user_id, process_count, pre_final_count, last_stage, last_line_at_ms, updated_at)
-         VALUES (?1, 0, 1, NULL, ?2, CURRENT_TIMESTAMP)
+         VALUES (?1, 0, 1, NULL, 0, CURRENT_TIMESTAMP)
          ON CONFLICT(user_id) DO UPDATE SET
            process_count = 0,
-           pre_final_count = 1,
+           pre_final_count = user_presence_turn.pre_final_count + 1,
            last_stage = NULL,
-           last_line_at_ms = excluded.last_line_at_ms,
+           last_line_at_ms = 0,
            updated_at = CURRENT_TIMESTAMP`,
       )
-      .bind(userId, Date.now())
+      .bind(userId)
       .run();
   } catch (error) {
     console.error("presence turn reset failed:", error instanceof Error ? error.message : error);
   }
+  return loadPresenceTurn(db, userId);
 }
 
 export async function loadPresenceTurn(db: D1Database, userId: string): Promise<PresenceTurnState> {
@@ -560,43 +660,107 @@ export async function loadPresenceTurn(db: D1Database, userId: string): Promise<
   return { process_count: 0, pre_final_count: 0, last_stage: null, last_line_at_ms: 0 };
 }
 
+/**
+ * Atomically reserve a process-line slot for this turn epoch + stage.
+ * Returns ok:false if budget/interval/same_stage/epoch mismatch (TOCTOU-safe).
+ */
+export async function claimPresenceProcessSlot(
+  db: D1Database,
+  userId: string,
+  stage: string,
+  turnEpoch: number,
+  nowMs: number = Date.now(),
+  config: Pick<PresenceConfig, "maxProcessLines" | "processMinIntervalMs"> = DEFAULT_PRESENCE_CONFIG,
+): Promise<{ ok: true } | { ok: false; reason: string }> {
+  const stageId = sanitizeStageId(stage);
+  const max = config.maxProcessLines;
+  const minInterval = config.processMinIntervalMs;
+  try {
+    // Ensure row exists (epoch 0) so UPDATE can match.
+    await db
+      .prepare(
+        `INSERT INTO user_presence_turn (user_id, process_count, pre_final_count, last_stage, last_line_at_ms, updated_at)
+         VALUES (?1, 0, 0, NULL, 0, CURRENT_TIMESTAMP)
+         ON CONFLICT(user_id) DO NOTHING`,
+      )
+      .bind(userId)
+      .run();
+
+    const result = await db
+      .prepare(
+        `UPDATE user_presence_turn
+         SET process_count = process_count + 1,
+             last_stage = ?2,
+             last_line_at_ms = ?3,
+             updated_at = CURRENT_TIMESTAMP
+         WHERE user_id = ?1
+           AND pre_final_count = ?4
+           AND process_count < ?5
+           AND (last_stage IS NULL OR last_stage != ?2)
+           AND (last_line_at_ms = 0 OR (?3 - last_line_at_ms) >= ?6)`,
+      )
+      .bind(userId, stageId, nowMs, turnEpoch, max, minInterval)
+      .run();
+    const changes = Number((result as { meta?: { changes?: number } })?.meta?.changes ?? 0);
+    if (changes > 0) return { ok: true };
+
+    const turn = await loadPresenceTurn(db, userId);
+    if (turn.pre_final_count !== turnEpoch) return { ok: false, reason: "stale_turn" };
+    if (turn.process_count >= max) return { ok: false, reason: "max_process_lines" };
+    if (turn.last_stage && turn.last_stage === stageId) return { ok: false, reason: "same_stage" };
+    if (turn.last_line_at_ms > 0 && nowMs - turn.last_line_at_ms < minInterval) {
+      return { ok: false, reason: "min_interval" };
+    }
+    return { ok: false, reason: "claim_lost" };
+  } catch (error) {
+    console.error("presence process claim failed:", error instanceof Error ? error.message : error);
+    return { ok: false, reason: "claim_error" };
+  }
+}
+
+/** @deprecated Prefer claimPresenceProcessSlot (atomic). Kept for tests/callers. */
 export async function recordPresenceProcessLine(
   db: D1Database,
   userId: string,
   stage: string,
 ): Promise<void> {
+  const turn = await loadPresenceTurn(db, userId);
+  await claimPresenceProcessSlot(db, userId, stage, turn.pre_final_count);
+}
+
+/** Block further process lines after Hermes final (msg 4) lands. */
+export async function markPresenceTurnFinal(db: D1Database, userId: string): Promise<void> {
   try {
     await db
       .prepare(
-        `INSERT INTO user_presence_turn (user_id, process_count, pre_final_count, last_stage, last_line_at_ms, updated_at)
-         VALUES (?1, 1, 2, ?2, ?3, CURRENT_TIMESTAMP)
-         ON CONFLICT(user_id) DO UPDATE SET
-           process_count = user_presence_turn.process_count + 1,
-           pre_final_count = user_presence_turn.pre_final_count + 1,
-           last_stage = excluded.last_stage,
-           last_line_at_ms = excluded.last_line_at_ms,
-           updated_at = CURRENT_TIMESTAMP`,
+        `UPDATE user_presence_turn
+         SET process_count = 999,
+             last_line_at_ms = ?2,
+             updated_at = CURRENT_TIMESTAMP
+         WHERE user_id = ?1`,
       )
-      .bind(userId, stage, Date.now())
+      .bind(userId, Date.now())
       .run();
   } catch (error) {
-    console.error("presence process record failed:", error instanceof Error ? error.message : error);
+    console.error("presence turn final mark failed:", error instanceof Error ? error.message : error);
   }
 }
 
-/** Whether we may send another process line (msg 2–3). */
+/** Whether we may send another process line (msg 2–3). Pure check (tests). */
 export function canSendProcessLine(
   turn: PresenceTurnState,
   stage: string,
   nowMs: number,
   config: Pick<PresenceConfig, "maxProcessLines" | "processMinIntervalMs"> = DEFAULT_PRESENCE_CONFIG,
 ): { ok: true } | { ok: false; reason: string } {
+  const stageId = sanitizeStageId(stage);
   if (turn.process_count >= config.maxProcessLines) {
     return { ok: false, reason: "max_process_lines" };
   }
-  if (turn.last_stage && turn.last_stage === stage) {
+  if (turn.last_stage && turn.last_stage === stageId) {
     return { ok: false, reason: "same_stage" };
   }
+  // last_line_at_ms=0 means “no process line yet this turn” (ack must not stamp it).
   if (turn.last_line_at_ms > 0 && nowMs - turn.last_line_at_ms < config.processMinIntervalMs) {
     return { ok: false, reason: "min_interval" };
   }

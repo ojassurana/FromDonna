@@ -798,6 +798,79 @@ def _composio_mcp_server_entry(*, url: str) -> dict:
     }
 
 
+def _ensure_presence_product_config() -> None:
+    """Re-assert mid-turn OFF + fromdonna_presence after checkpoint restore.
+
+    Checkpoint overlays agent-home config.yaml. Re-bootstrap used to only
+    merge Composio MCP — that left interim/busy_ack/plugins drifted and
+    silently killed msg 2–3 / re-enabled Hermes mid-turn chat.
+    """
+    HERMES_HOME.mkdir(parents=True, exist_ok=True)
+    config_path = HERMES_HOME / "config.yaml"
+    try:
+        import yaml  # type: ignore
+
+        config: dict = {}
+        if config_path.is_file():
+            loaded = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+            if isinstance(loaded, dict):
+                config = loaded
+
+        display = config.get("display")
+        if not isinstance(display, dict):
+            display = {}
+        display["tool_progress"] = False
+        display["busy_ack_enabled"] = False
+        display["busy_steer_ack_enabled"] = False
+        display["interim_assistant_messages"] = False
+        display["long_running_notifications"] = False
+        display["streaming"] = False
+        platforms = display.get("platforms")
+        if not isinstance(platforms, dict):
+            platforms = {}
+        tg = platforms.get("telegram")
+        if not isinstance(tg, dict):
+            tg = {}
+        tg.update(
+            {
+                "streaming": False,
+                "tool_progress": False,
+                "show_reasoning": False,
+                "interim_assistant_messages": False,
+                "long_running_notifications": False,
+            }
+        )
+        platforms["telegram"] = tg
+        display["platforms"] = platforms
+        config["display"] = display
+
+        streaming = config.get("streaming")
+        if not isinstance(streaming, dict):
+            streaming = {}
+        streaming["enabled"] = False
+        config["streaming"] = streaming
+
+        plugins = config.get("plugins")
+        if not isinstance(plugins, dict):
+            plugins = {}
+        enabled = plugins.get("enabled")
+        if not isinstance(enabled, list):
+            enabled = []
+        # Preserve order; ensure required plugins present.
+        for name in ("fromdonna_transport", "fromdonna_presence"):
+            if name not in enabled:
+                enabled.append(name)
+        plugins["enabled"] = enabled
+        config["plugins"] = plugins
+
+        config_path.write_text(
+            yaml.safe_dump(config, default_flow_style=False, sort_keys=False),
+            encoding="utf-8",
+        )
+    except Exception as exc:
+        print(f"presence product config ensure failed: {exc}", flush=True)
+
+
 def _ensure_composio_mcp_config(*, url: str) -> None:
     """Idempotently write ``mcp_servers.composio`` in official Hermes shape."""
     HERMES_HOME.mkdir(parents=True, exist_ok=True)
@@ -837,20 +910,15 @@ def _ensure_composio_mcp_config(*, url: str) -> None:
 
         snippet = (
             "# Auto-written by FromDonna harness (official Hermes Composio MCP shape)\n"
-            "mcp_servers:\n"
-            "  composio:\n"
-            f"    url: {_json.dumps(url)}\n"
-            "    headers:\n"
-            '      Authorization: "Bearer ${FROMDONNA_COMPOSIO_MCP_TOKEN}"\n'
-            "    connect_timeout: 60\n"
-            "    timeout: 180\n"
-            "    skip_preflight: true\n"
+            + _json.dumps({"mcp_servers": {"composio": entry}}, indent=2)
+            + "\n"
         )
-        sidecar = HERMES_HOME / "fromdonna-composio-mcp.yaml"
-        sidecar.write_text(snippet, encoding="utf-8")
-        if not config_path.is_file():
-            config_path.write_text(snippet, encoding="utf-8")
-        print(f"composio mcp config merge failed (sidecar written): {exc}", flush=True)
+        (HERMES_HOME / "fromdonna_composio_mcp.snippet.yaml").write_text(
+            snippet, encoding="utf-8"
+        )
+        raise RuntimeError(f"composio mcp config write failed: {exc}") from exc
+    # Always re-assert presence product policy after any config write.
+    _ensure_presence_product_config()
 
 
 def _reload_mcp_if_gateway_running() -> None:
@@ -997,6 +1065,8 @@ def bootstrap(body: Bootstrap):
         secret=secret,
         api_proxy_url=api_proxy_url,
     )
+    # Checkpoint restore can wipe mid-turn OFF / plugins.enabled — re-assert always.
+    _ensure_presence_product_config()
 
     composio_applied = False
     if body.composioMcp is not None:
@@ -1332,6 +1402,8 @@ def telegram_update(
     body: TelegramUpdateEnvelope,
     authorization: str | None = Header(default=None),
     x_llm_capability: str | None = Header(default=None),
+    x_fromdonna_user_id: str | None = Header(default=None),
+    x_fromdonna_chat_id: str | None = Header(default=None),
 ):
     """Inject one raw Telegram Update into the official Hermes Telegram gateway."""
     if not _authorized(authorization):
@@ -1341,9 +1413,19 @@ def telegram_update(
     with _state_lock:
         if not _telegram_proxy:
             raise HTTPException(status_code=503, detail="telegram_proxy_not_configured")
+        proxy_snap = dict(_telegram_proxy) if _telegram_proxy else {}
 
     os.environ["HERMES_HOME"] = str(HERMES_HOME)
     os.environ["FROMDONNA_LLM_CAPABILITY"] = x_llm_capability.strip()
+
+    # Warm inject skips /bootstrap — refresh presence identity every inject.
+    uid = (x_fromdonna_user_id or "").strip() or str(proxy_snap.get("userId") or "").strip()
+    cid = (x_fromdonna_chat_id or "").strip() or str(proxy_snap.get("chatId") or "").strip()
+    if uid:
+        os.environ["FROMDONNA_USER_ID"] = uid
+    if cid:
+        os.environ["FROMDONNA_CHAT_ID"] = cid
+        os.environ.setdefault("TELEGRAM_HOME_CHANNEL", cid)
 
     with _serialized_turns():
         try:

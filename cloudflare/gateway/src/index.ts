@@ -19,14 +19,15 @@ import {
   DEFAULT_PRESENCE_CONFIG,
   appendPresenceSnippets,
   callPresenceTinyLlm,
-  canSendProcessLine,
+  claimPresenceProcessSlot,
   isPresenceStatusLine,
   loadPresenceRing,
   loadPresenceTurn,
-  recordPresenceProcessLine,
+  markPresenceTurnFinal,
   resetPresenceTurn,
   resolvePresenceAckPreferFast,
   resolvePresenceProcessLine,
+  sanitizeStageId,
   stageFromToolName,
   type PresenceSnippet,
 } from "./presence";
@@ -185,11 +186,18 @@ async function telegramJson(
   if (!response.ok) {
     throw new Error(`Telegram ${method} failed with HTTP ${response.status}${detail ? `: ${detail.slice(0, 200)}` : ""}`);
   }
+  let parsed: unknown = null;
   try {
-    return detail ? JSON.parse(detail) : null;
+    parsed = detail ? JSON.parse(detail) : null;
   } catch {
     return null;
   }
+  // Bot API can return HTTP 200 with { ok: false, description: "..." }.
+  if (parsed && typeof parsed === "object" && (parsed as { ok?: unknown }).ok === false) {
+    const desc = String((parsed as { description?: unknown }).description || "ok=false");
+    throw new Error(`Telegram ${method} rejected: ${desc.slice(0, 200)}`);
+  }
+  return parsed;
 }
 
 function presenceEnabled(env: Env): boolean {
@@ -215,6 +223,10 @@ async function sendPresenceAck(args: {
   if (!presenceEnabled(env)) return;
   const text = currentUserText.trim();
   if (!text) return;
+
+  // Open turn first so process stages that arrive mid-ack claim the new epoch
+  // (and min_interval is not blocked by a stamped ack timestamp).
+  await resetPresenceTurn(env.FROMDONNA_ROUTING, userId);
 
   const snippets = await loadPresenceRing(env.FROMDONNA_ROUTING, userId);
   let capability: string | null = null;
@@ -255,13 +267,12 @@ async function sendPresenceAck(args: {
     { role: "status", text: ack.text },
   ];
   await appendPresenceSnippets(env.FROMDONNA_ROUTING, userId, additions);
-  await resetPresenceTurn(env.FROMDONNA_ROUTING, userId);
   console.log(`presence ack source=${ack.source} user=${userId}`);
 }
 
 /**
  * Msg 2–3: process-based human WIP from sandbox tool stages.
- * Auth: Bearer WORKER_TO_HARNESS_SECRET (same family as harness→worker).
+ * Auth: Bearer WORKER_TO_HARNESS_SECRET + body userId/chatId must match D1 route.
  */
 async function handlePresenceStage(request: Request, env: Env): Promise<Response> {
   const auth = request.headers.get("authorization") || "";
@@ -285,13 +296,23 @@ async function handlePresenceStage(request: Request, env: Env): Promise<Response
   const chatId = (body.chatId || "").trim();
   if (!userId || !chatId) return json({ ok: false, error: "userId_and_chatId_required" }, 400);
 
+  // Multi-tenant: chat must match the routed conversation for this user.
+  const route = await lookupByUserId(env, userId);
+  if (!route || route.status !== "ready") {
+    return json({ ok: false, error: "user_not_ready" }, 403);
+  }
+  if (String(route.gateway_conversation_id) !== String(chatId)) {
+    return json({ ok: false, error: "chat_mismatch" }, 403);
+  }
+
   const toolName = (body.toolName || "").trim();
   const mapped = stageFromToolName(toolName || body.stage || "working");
-  const stage = (body.stage || mapped.stage).trim() || mapped.stage;
+  const stage = sanitizeStageId(body.stage || mapped.stage);
 
   const turn = await loadPresenceTurn(env.FROMDONNA_ROUTING, userId);
-  const gate = canSendProcessLine(turn, stage, Date.now());
-  if (!gate.ok) return json({ ok: true, skipped: gate.reason });
+  const epoch = turn.pre_final_count;
+  // Fast pure gate (still re-checked atomically on claim after resolve).
+  // claim is the source of truth.
 
   const snippets = await loadPresenceRing(env.FROMDONNA_ROUTING, userId);
   let capability: string | null = null;
@@ -317,14 +338,34 @@ async function handlePresenceStage(request: Request, env: Env): Promise<Response
       : undefined,
   });
 
-  await telegram(env, "sendMessage", {
-    chat_id: chatId,
-    text: line.text,
-  });
+  if ("skipped" in line) {
+    return json({ ok: true, skipped: line.reason, stage: line.stage });
+  }
+
+  const claim = await claimPresenceProcessSlot(
+    env.FROMDONNA_ROUTING,
+    userId,
+    line.stage,
+    epoch,
+  );
+  if (!claim.ok) return json({ ok: true, skipped: claim.reason });
+
+  try {
+    await telegram(env, "sendMessage", {
+      chat_id: chatId,
+      text: line.text,
+    });
+  } catch (error) {
+    console.error(
+      "presence process send failed:",
+      error instanceof Error ? error.message : error,
+    );
+    return json({ ok: false, error: "send_failed" }, 502);
+  }
+
   await appendPresenceSnippets(env.FROMDONNA_ROUTING, userId, [
     { role: "status", text: line.text },
   ]);
-  await recordPresenceProcessLine(env.FROMDONNA_ROUTING, userId, line.stage);
   console.log(`presence process source=${line.source} stage=${line.stage} user=${userId}`);
   return json({ ok: true, text: line.text, source: line.source, stage: line.stage });
 }
@@ -1350,6 +1391,9 @@ async function postTelegramUpdate(env: Env, row: UserAgentRow, update: TelegramU
       "content-type": "application/json",
       authorization: `Bearer ${required(env, "WORKER_TO_HARNESS_SECRET")}`,
       "x-llm-capability": capability,
+      // Warm inject skips /bootstrap — keep presence plugin chat/user env fresh.
+      "x-fromdonna-user-id": row.user_id,
+      "x-fromdonna-chat-id": row.gateway_conversation_id,
     },
     body: JSON.stringify({ update }),
   });
@@ -1543,6 +1587,7 @@ async function processTelegramUpdate(
 
   // Contextual presence ack (slot 1) — parallel with routing/inject, not Hermes.
   // Hermes template keeps mid-turn outputs off; final answer still comes from sandbox.
+  // Any agent-triggering inbound opens a presence turn (text gets ack; others reset budget only).
   if (event.type === "message" && event.message.text?.trim()) {
     const userText = event.message.text.trim();
     ctx.waitUntil(
@@ -1557,6 +1602,12 @@ async function processTelegramUpdate(
           error instanceof Error ? error.message : error,
         );
       }),
+    );
+  } else if (event.type === "message" || event.type === "callback_query") {
+    // Non-text turns still need a fresh process budget so stale max_process_lines
+    // from a prior text turn does not block stages.
+    ctx.waitUntil(
+      resetPresenceTurn(env.FROMDONNA_ROUTING, userId).catch(() => {}),
     );
   }
 
@@ -1677,6 +1728,8 @@ export default {
           await appendPresenceSnippets(env.FROMDONNA_ROUTING, identity.userId, [
             { role: "assistant", text },
           ]);
+          // Hermes final landed — block late process WIP under this turn.
+          await markPresenceTurnFinal(env.FROMDONNA_ROUTING, identity.userId);
         },
       });
       if (proxied) return proxied;
