@@ -293,8 +293,9 @@ async function sendPresenceAck(args: {
 }
 
 /**
- * Msg 2–3: process-based human WIP from sandbox tool stages.
- * Claim-first + never send after Hermes final (no post-final "Still working…").
+ * Msg 2–3: process WIP from sandbox tool stages.
+ * Claim → short contextual LLM → ONE send (no bland-first flash).
+ * Never send after Hermes final.
  * Auth: Bearer WORKER_TO_HARNESS_SECRET + body userId/chatId must match D1 route.
  */
 async function handlePresenceStage(request: Request, env: Env): Promise<Response> {
@@ -343,7 +344,7 @@ async function handlePresenceStage(request: Request, env: Env): Promise<Response
     return json({ ok: true, skipped: "final_already", stage });
   }
 
-  // CLAIM FIRST — reserve budget before any network/LLM.
+  // Reserve slot first so budget is real, then write ONE contextual line.
   const claim = await claimPresenceProcessSlot(
     env.FROMDONNA_ROUTING,
     userId,
@@ -357,16 +358,12 @@ async function handlePresenceStage(request: Request, env: Env): Promise<Response
     return json({ ok: true, skipped: claim.reason, stage });
   }
 
-  // Re-check final AFTER claim (fast tools often finish while stage is in flight).
   const turnAfterClaim = await loadPresenceTurn(env.FROMDONNA_ROUTING, userId);
   if (isPresenceTurnFinalized(turnAfterClaim) || turnAfterClaim.pre_final_count !== epoch) {
-    console.log(
-      `presence process skipped reason=final_race stage=${stage} user=${userId} epoch=${epoch}`,
-    );
+    console.log(`presence process skipped reason=final_race stage=${stage} user=${userId}`);
     return json({ ok: true, skipped: "final_race", stage });
   }
 
-  // If Hermes final already landed in the ring, do not emit a late WIP bubble.
   const snippets = await loadPresenceRing(env.FROMDONNA_ROUTING, userId);
   const lastNonStatus = [...snippets].reverse().find((s) => s.role !== "status");
   if (lastNonStatus?.role === "assistant") {
@@ -377,21 +374,60 @@ async function handlePresenceStage(request: Request, env: Env): Promise<Response
   const latestUserText = [...snippets].reverse().find((s) => s.role === "user")?.text;
   const lastStatus = [...snippets].reverse().find((s) => s.role === "status");
 
-  // Immediate human bubble. Prefer non-duplicate bland line.
-  let text = PRESENCE_PROCESS_FALLBACK;
-  let source: "tiny_llm" | "fallback" = "fallback";
-  if (lastStatus && samePresenceText(lastStatus.text, text)) {
-    text = "Hang tight…";
-    if (lastStatus && samePresenceText(lastStatus.text, text)) {
-      text = "Almost there…";
-    }
+  let capability: string | null = null;
+  try {
+    capability = await mintLlmCapability(env, userId);
+  } catch {
+    // fallback path
   }
 
-  // Final check immediately before Telegram send (tightest window).
+  // ONE contextual line from light LLM (short deadline). No bland-first flash.
+  const line = await resolvePresenceProcessLine({
+    snippets,
+    toolName,
+    stage,
+    seed: userId,
+    latestUserText,
+    config: {
+      llmProxyBaseUrl: llmProxyBaseUrl(env),
+      tinyLlmAck: Boolean(capability),
+      processDeadlineMs: 450,
+    },
+    callTinyLlm: capability ? presenceLlmCall(env, capability) : undefined,
+  });
+
+  if ("skipped" in line) {
+    console.log(`presence process skipped reason=${line.reason} stage=${stage} user=${userId}`);
+    return json({ ok: true, skipped: line.reason, stage });
+  }
+
+  const text = line.text;
+  const source = line.source;
+
+  // If LLM missed and ack was already specific, skip vague Still working…
+  if (
+    source === "fallback" &&
+    lastStatus &&
+    !samePresenceText(lastStatus.text, PRESENCE_PROCESS_FALLBACK) &&
+    !samePresenceText(lastStatus.text, "Working on that…")
+  ) {
+    console.log(
+      `presence process skipped reason=ack_already_specific stage=${stage} user=${userId}`,
+    );
+    return json({ ok: true, skipped: "ack_already_specific", stage });
+  }
+
+  // Never land after Hermes final.
   const turnBeforeSend = await loadPresenceTurn(env.FROMDONNA_ROUTING, userId);
   if (isPresenceTurnFinalized(turnBeforeSend) || turnBeforeSend.pre_final_count !== epoch) {
     console.log(`presence process skipped reason=final_before_send stage=${stage} user=${userId}`);
     return json({ ok: true, skipped: "final_before_send", stage });
+  }
+  const ringBeforeSend = await loadPresenceRing(env.FROMDONNA_ROUTING, userId);
+  const lastBefore = [...ringBeforeSend].reverse().find((s) => s.role !== "status");
+  if (lastBefore?.role === "assistant") {
+    console.log(`presence process skipped reason=assistant_before_send stage=${stage} user=${userId}`);
+    return json({ ok: true, skipped: "assistant_before_send", stage });
   }
 
   let messageId: number | null = null;
@@ -410,60 +446,11 @@ async function handlePresenceStage(request: Request, env: Env): Promise<Response
     return json({ ok: false, error: "send_failed", stage }, 502);
   }
 
-  // Short LLM polish via edit — only if final still not out.
-  let capability: string | null = null;
-  try {
-    capability = await mintLlmCapability(env, userId);
-  } catch {
-    // fallback-only
-  }
-
-  if (capability && messageId != null) {
-    const turnForPolish = await loadPresenceTurn(env.FROMDONNA_ROUTING, userId);
-    if (!isPresenceTurnFinalized(turnForPolish) && turnForPolish.pre_final_count === epoch) {
-      const polished = await resolvePresenceProcessLine({
-        snippets: [...snippets, { role: "status", text }],
-        toolName,
-        stage,
-        seed: userId,
-        latestUserText,
-        config: {
-          llmProxyBaseUrl: llmProxyBaseUrl(env),
-          tinyLlmAck: true,
-          processDeadlineMs: DEFAULT_PRESENCE_CONFIG.processDeadlineMs,
-        },
-        callTinyLlm: presenceLlmCall(env, capability),
-      });
-      if (!("skipped" in polished) && polished.source === "tiny_llm" && polished.text) {
-        const next = polished.text;
-        if (!samePresenceText(next, text)) {
-          const turnForEdit = await loadPresenceTurn(env.FROMDONNA_ROUTING, userId);
-          if (!isPresenceTurnFinalized(turnForEdit) && turnForEdit.pre_final_count === epoch) {
-            try {
-              await telegramJson(env, "editMessageText", {
-                chat_id: chatId,
-                message_id: messageId,
-                text: next,
-              });
-              text = next;
-              source = "tiny_llm";
-            } catch (error) {
-              console.warn(
-                "presence process edit failed:",
-                error instanceof Error ? error.message : error,
-              );
-            }
-          }
-        }
-      }
-    }
-  }
-
   await appendPresenceSnippets(env.FROMDONNA_ROUTING, userId, [
     { role: "status", text },
   ]);
   console.log(
-    `presence process source=${source} stage=${stage} tool=${toolName || "-"} user=${userId} mid=${messageId ?? "-"}`,
+    `presence process source=${source} stage=${stage} tool=${toolName || "-"} user=${userId} mid=${messageId ?? "-"} text=${text.slice(0, 80)}`,
   );
   return json({ ok: true, text, source, stage, messageId });
 }
