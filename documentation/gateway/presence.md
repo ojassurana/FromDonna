@@ -54,22 +54,19 @@ No app/intent product lists. On skip: reset turn + ring user text; no WIP bubble
 
 ### Msg 1
 1. Race tiny LLM (`PRESENCE_ACK_SYSTEM_PROMPT`, latest-first user block)  
-2. Reject banned fillers: `One sec.` / `On it.` / `Got it.`  
+2. Reject banned fillers: `One sec.` / `On it.` / `Got it.` / vague process fillers  
 3. Strip `GATE_*` test tokens from model output  
-4. Else single bland fallback: **`Working on that…`** (never hashed One sec pool)
+4. Else **soft contextual** line from the user's own words (`Checking <topic>…`) via `softContextualPresenceLine`  
+5. Last resort bland: **`Working on that…`** (should be rare)
 
-### Msg 2–3 (claim-first — 2026-07-27)
+### Msg 2–3 (claim + contextual only)
 
-**Problem fixed:** Old path ran process LLM (~900ms) *then* claimed a D1 slot. Hermes final often hit Bot API proxy first → `markPresenceTurnFinal` (`process_count=999`) → claim lost → user only saw ack → final.
-
-**Shipped path:**
-
-1. Plugin `fromdonna_presence` on `pre_tool_call` POSTs `{ userId, chatId, toolName }` → `/internal/presence/stage`  
-2. Gateway auth + route/chat match  
-3. **`claimPresenceProcessSlot` immediately** (epoch + stage + budget)  
-4. **Send bland process line ASAP** (`Still working…` / rare alternates if duplicate) via real bot token  
-5. Short process LLM (~280ms) **polishes via `editMessageText`** when better  
-6. Tool name is **internal stage id only** (dedup/budget) — never user slogans  
+1. Plugin posts `{ userId, chatId, toolName }` on `pre_tool_call`  
+2. Gateway **claims** process slot immediately  
+3. Light LLM (~550ms) writes a **specific** mid-work line; if LLM misses → soft contextual from user words  
+4. **Never** send pure `Still working…` / `Working on that…` as process when we have better copy  
+5. Abort send if Hermes final already landed (`process_count>=900` or assistant in ring)  
+6. Tool name is internal stage id only — never user slogans  
 
 If Hermes never calls tools → no fake process lines (correct).
 
