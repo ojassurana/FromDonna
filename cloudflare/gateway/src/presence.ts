@@ -37,8 +37,8 @@ export const DEFAULT_PRESENCE_CONFIG: PresenceConfig = {
   contextMessages: 10,
   /** LLM-first ack — allow enough time for edge proxy + small model. */
   ackDeadlineMs: 1200,
-  /** Short — claim then one contextual LLM line before send. */
-  processDeadlineMs: 450,
+  /** Fast contextual process line; skip send if LLM misses (no vague bubble). */
+  processDeadlineMs: 550,
   tinyLlmAck: true,
   maxProcessLines: 2,
   processMinIntervalMs: 1800,

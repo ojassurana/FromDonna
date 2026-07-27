@@ -391,7 +391,7 @@ async function handlePresenceStage(request: Request, env: Env): Promise<Response
     config: {
       llmProxyBaseUrl: llmProxyBaseUrl(env),
       tinyLlmAck: Boolean(capability),
-      processDeadlineMs: 450,
+      processDeadlineMs: DEFAULT_PRESENCE_CONFIG.processDeadlineMs,
     },
     callTinyLlm: capability ? presenceLlmCall(env, capability) : undefined,
   });
@@ -401,20 +401,19 @@ async function handlePresenceStage(request: Request, env: Env): Promise<Response
     return json({ ok: true, skipped: line.reason, stage });
   }
 
+  // Only user-visible process when light LLM produced a contextual line.
+  // Never ship vague Still working… fallback as a bubble.
+  if (line.source !== "tiny_llm") {
+    console.log(
+      `presence process skipped reason=no_contextual_llm stage=${stage} user=${userId}`,
+    );
+    return json({ ok: true, skipped: "no_contextual_llm", stage });
+  }
   const text = line.text;
   const source = line.source;
-
-  // If LLM missed and ack was already specific, skip vague Still working…
-  if (
-    source === "fallback" &&
-    lastStatus &&
-    !samePresenceText(lastStatus.text, PRESENCE_PROCESS_FALLBACK) &&
-    !samePresenceText(lastStatus.text, "Working on that…")
-  ) {
-    console.log(
-      `presence process skipped reason=ack_already_specific stage=${stage} user=${userId}`,
-    );
-    return json({ ok: true, skipped: "ack_already_specific", stage });
+  if (lastStatus && samePresenceText(lastStatus.text, text)) {
+    console.log(`presence process skipped reason=duplicate_ack stage=${stage} user=${userId}`);
+    return json({ ok: true, skipped: "duplicate_ack", stage });
   }
 
   // Never land after Hermes final.
