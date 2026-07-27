@@ -61,8 +61,7 @@ export const PRESENCE_BANNED_FILLER = [
   "looking that up...",
   "on that follow-up…",
   "on that follow-up...",
-  "working on that…",
-  "working on that...",
+  // Vague process lines the light LLM must not emit (fallback path handles separately).
   "still working…",
   "still working...",
   "checking that…",
