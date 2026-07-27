@@ -31,10 +31,13 @@ CHAT_PLATFORMS = [
 NOISY_STATUS_MESSAGES = [
     "🗜️ Preflight compression check before sending...",
     "🗜️ Compacting context — summarizing earlier conversation so I can continue...",
+    "📦 Pre-API compression: ~99,194 tokens near the context/output limit. Compacting before the next model call.",
+    "Pre-API compression: near the context/output limit",
     "⚠️  Session compressed 12 times — accuracy may degrade. Consider /new to start fresh.",
     "⚠ Compression summary failed: upstream error. Inserted a fallback context marker.",
     "⏱️ Rate limited. Waiting 30.0s (attempt 2/3)...",
     "⏳ Retrying in 4.2s (attempt 1/3)...",
+    "⚠️ Iteration budget exhausted (50/50) — asking model to summarise",
 ]
 
 
@@ -52,6 +55,16 @@ def test_telegram_status_suppresses_auxiliary_and_retry_noise():
 
     for message in noisy_messages:
         assert _prepare_gateway_status_message(Platform.TELEGRAM, "warn", message) is None
+
+
+def test_telegram_status_suppresses_pre_api_compression_notice():
+    """FromDonna product: the Pre-API packing bubble must never hit Telegram."""
+    msg = (
+        "📦 Pre-API compression: ~99,194 tokens near the context/output limit. "
+        "Compacting before the next model call."
+    )
+    assert _prepare_gateway_status_message(Platform.TELEGRAM, "lifecycle", msg) is None
+    assert _prepare_gateway_status_message(Platform.TELEGRAM, "warn", msg) is None
 
 
 def test_programmatic_surfaces_keep_raw_status():

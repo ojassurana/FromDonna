@@ -27,6 +27,92 @@ import os
 from agent.codex_responses_adapter import _summarize_user_message_for_log
 
 
+def _schedule_post_turn_silent_compact(agent, messages: list) -> None:
+    """Best-effort background compact after a successful final reply.
+
+    Goal: next user turn starts with a slim context so pre-API compression
+    (and its stall) is rare. Never blocks the current response delivery.
+    Never emits Telegram lifecycle status (compress path is log-only for product).
+    """
+    import threading
+
+    if not messages or len(messages) < 6:
+        return
+    if getattr(agent, "_post_turn_compact_lock", None) is None:
+        agent._post_turn_compact_lock = threading.Lock()
+    lock = agent._post_turn_compact_lock
+    if lock.locked():
+        return
+
+    compressor = getattr(agent, "context_compressor", None)
+    if compressor is None:
+        return
+
+    ctx = int(getattr(compressor, "context_length", 0) or 0)
+    tokens = int(getattr(compressor, "last_prompt_tokens", 0) or 0)
+    if tokens <= 0:
+        # Rough char estimate if the last API call didn't report prompt tokens.
+        try:
+            blob = " ".join(str(m.get("content") or "") for m in messages if isinstance(m, dict))
+            tokens = max(1, len(blob) // 4)
+        except Exception:
+            return
+
+    # Soft floor: compact when we are past ~45% of the window (or the real
+    # should_compress threshold, whichever fires). Lower than mid-turn default
+    # so free time between messages does the work.
+    soft = int(ctx * 0.45) if ctx > 0 else 0
+    should = False
+    try:
+        should = bool(compressor.should_compress(tokens))
+    except Exception:
+        should = False
+    if not should and soft and tokens < soft:
+        return
+    if not should and not soft:
+        return
+
+    snap = list(messages)
+    system_message = getattr(agent, "_cached_system_prompt", None) or ""
+    approx = tokens
+    session_id = getattr(agent, "session_id", None)
+
+    def _run() -> None:
+        from agent.conversation_loop import logger as _log
+
+        if not lock.acquire(blocking=False):
+            return
+        try:
+            # Bail if session already rotated / another agent owns the chat.
+            if session_id and getattr(agent, "session_id", None) not in (None, session_id):
+                return
+            _log.info(
+                "post-turn silent compact: session=%s tokens~%s soft=%s",
+                session_id or "none",
+                f"{approx:,}",
+                f"{soft:,}" if soft else "n/a",
+            )
+            agent._compress_context(
+                snap,
+                system_message if isinstance(system_message, str) else "",
+                approx_tokens=approx,
+                task_id="post_turn_silent",
+            )
+        except Exception:
+            _log.debug("post-turn silent compact failed", exc_info=True)
+        finally:
+            try:
+                lock.release()
+            except Exception:
+                pass
+
+    threading.Thread(
+        target=_run,
+        name="hermes-post-turn-silent-compact",
+        daemon=True,
+    ).start()
+
+
 def finalize_turn(
     agent,
     *,
@@ -503,6 +589,15 @@ def finalize_turn(
             )
         except Exception:
             pass  # Background review is best-effort
+
+    # FromDonna / messaging product: after a successful final, quietly shrink
+    # context in the background so the *next* user message is not blocked on
+    # pre-API compaction. Never emits user-facing status (filter + no emit).
+    if final_response and not interrupted and not failed and agent.compression_enabled:
+        try:
+            _schedule_post_turn_silent_compact(agent, list(messages))
+        except Exception:
+            logger.debug("post-turn silent compact schedule failed", exc_info=True)
 
     # Note: Memory provider on_session_end() + shutdown_all() are NOT
     # called here — run_conversation() is called once per user message in

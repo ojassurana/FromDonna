@@ -182,6 +182,21 @@ platforms:
 
 agent: {}
 
+# Context compression (long-lived PA chats). Product rules:
+# - Never show compaction plumbing on Telegram (gateway noise filter + no Pre-API emit).
+# - Prefer silent post-turn compact (turn_finalizer) so the *next* message is fast.
+# - Mid-turn pre-API compact remains a safety net at a higher threshold.
+compression:
+  enabled: true
+  # Rarer mid-turn stalls; post-turn silent path uses ~45% soft floor.
+  threshold: 0.70
+  target_ratio: 0.22
+  protect_last_n: 24
+  # Rolling product DMs — don't pin early turns forever.
+  protect_first_n: 0
+  # One durable session id (no rotate/rename chatter).
+  in_place: true
+
 # Built-in MEMORY/USER tool off for product. Post-turn skill self-improvement
 # still uses skills.creation_nudge_interval (can delay next message while running).
 memory:

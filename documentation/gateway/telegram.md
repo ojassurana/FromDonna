@@ -91,7 +91,7 @@ Concurrent first messages: only one request wins the D1 insert claim; others see
 
 **Why:** Hermes product config keeps mid-turn chat outputs **off** so multi-tool turns do not mark `content_delivered` and swallow the final. Users still need immediate presence on real work. The **gateway** sends short WIP lines with the real bot token; Hermes only owns the final answer.
 
-Full detail: [presence.md](./presence.md).
+Full detail: [presence.md](./presence.md). Compaction (no packing bubbles / post-turn silent compact): [compaction.md](./compaction.md).
 
 | Piece | Behavior |
 |--------|----------|
