@@ -88,14 +88,17 @@ Concurrent first messages: only one request wins the D1 insert claim; others see
 
 ### Presence acks (edge — not Hermes)
 
-**Why:** Hermes product config keeps mid-turn chat outputs **off** so multi-tool turns do not mark `content_delivered` and swallow the final. Users still need immediate presence. The **gateway** sends short WIP lines with the real bot token; Hermes only owns the final answer.
+**Why:** Hermes product config keeps mid-turn chat outputs **off** so multi-tool turns do not mark `content_delivered` and swallow the final. Users still need immediate presence on real work. The **gateway** sends short WIP lines with the real bot token; Hermes only owns the final answer.
+
+Full detail: [presence.md](./presence.md).
 
 | Piece | Behavior |
 |--------|----------|
 | Trigger | Inbound user `message` with text |
-| Content | Contextual (last ~10 snippets in D1 `user_presence_ring` + current text): rules map first, optional **tiny LLM** via llm-proxy with hard deadline (~400ms), fallback pool (“On it.” / …) |
-| Cap | Msg **1** ack + up to **2** process lines + Hermes **final** (see [presence.md](./presence.md)) |
-| Msg 2–3 | Sandbox plugin `fromdonna_presence` POSTs tool stages → gateway light LLM |
+| **Hybrid gate** | Skip hi/thanks/echo/short acks; force ON for email/calendar/…; ambiguous → optional micro yes/no LLM |
+| Content | **Latest message** intent rules + optional **tiny LLM** (~380ms) via llm-proxy; concrete copy (e.g. Opening Gmail…); fallback pool |
+| Cap | Msg **1** ack (if gate ON) + up to **2** process lines + Hermes **final** |
+| Msg 2–3 | Plugin `fromdonna_presence` POSTs tool stages → gateway light LLM |
 | Hermes | Final path only; template mid-turn flags stay off |
 | Disable | `PRESENCE_ACK_ENABLED=0` on gateway Worker |
 | Code | `cloudflare/gateway/src/presence.ts`, plugin `extensions/plugins/fromdonna_presence/` |
@@ -104,36 +107,7 @@ Concurrent first messages: only one request wins the D1 insert claim; others see
 
 Product proxy exposes **`POST /v1/chat/completions`** only (not OpenAI `/v1/responses`). Gateway mints a short-lived capability with `LLM_CAPABILITY_SECRET` (same family as sandbox turns).
 
-**HTTP**
-
-```http
-POST https://fromdonna-llm-proxy.code-df4.workers.dev/v1/chat/completions
-Authorization: Bearer <gateway-minted-capability>
-Content-Type: application/json
-```
-
-**JSON body** (built by `buildPresenceAckChatCompletionRequest`):
-
-```json
-{
-  "model": "grok-4.5",
-  "temperature": 0.4,
-  "max_tokens": 24,
-  "stream": false,
-  "messages": [
-    {
-      "role": "system",
-      "content": "<PRESENCE_ACK_SYSTEM_PROMPT — one WIP Donna line, ≤8 words, human intent only, no tools>"
-    },
-    {
-      "role": "user",
-      "content": "Recent chat (oldest → newest):\nUser: …\nDonna: …\nUser: <current>\n\nWrite the single WIP status line now."
-    }
-  ]
-}
-```
-
-System prompt constant: `PRESENCE_ACK_SYSTEM_PROMPT` in `presence.ts`. Status lines are stripped from the “last N” context; user + assistant finals are kept.
+**JSON body** (built by `buildPresenceAckChatCompletionRequest`) uses **latest-first** user template + `PRESENCE_ACK_SYSTEM_PROMPT` (concrete WIP, ≤6 words). Weak older context is optional and must not overfit.
 
 ---
 
@@ -151,8 +125,8 @@ User DMs @fromdonna_bot
                               → warm: skip bootstrap + defer checkpoint
                               → cold: wait /health → soft re-bootstrap
   (Worker may already have sent sendChatAction typing at webhook)
-  (Worker presence ack in parallel — contextual WIP via Bot API)
-  → POST /telegram/update  (Bearer + x-llm-capability)
+  (Worker presence: hybrid gate → optional contextual WIP via Bot API)
+  → POST /telegram/update  (Bearer + x-llm-capability + presence identity headers)
   → Official Hermes TelegramAdapter.process_update  (mid-turn chat quiet)
   → Outbound Telegram final via Worker /telegram-bot-api/* proxy
   → (async) stage checkpoint → Worker harvest → R2

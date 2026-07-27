@@ -26,6 +26,7 @@ import {
   markPresenceTurnFinal,
   resetPresenceTurn,
   resolvePresenceAckPreferFast,
+  resolvePresenceGate,
   resolvePresenceProcessLine,
   sanitizeStageId,
   stageFromToolName,
@@ -211,7 +212,7 @@ function llmProxyBaseUrl(env: Env): string {
 
 /**
  * Edge presence ack: contextual WIP line before Hermes final.
- * Hermes mid-turn outputs stay off in template; this is the only pre-final chat text.
+ * Hybrid gate may skip simple turns (hi/echo). Hermes mid-turn stays off.
  */
 async function sendPresenceAck(args: {
   env: Env;
@@ -224,11 +225,6 @@ async function sendPresenceAck(args: {
   const text = currentUserText.trim();
   if (!text) return;
 
-  // Open turn first so process stages that arrive mid-ack claim the new epoch
-  // (and min_interval is not blocked by a stamped ack timestamp).
-  await resetPresenceTurn(env.FROMDONNA_ROUTING, userId);
-
-  const snippets = await loadPresenceRing(env.FROMDONNA_ROUTING, userId);
   let capability: string | null = null;
   try {
     capability = await mintLlmCapability(env, userId);
@@ -239,6 +235,30 @@ async function sendPresenceAck(args: {
     );
   }
 
+  const gate = await resolvePresenceGate({
+    text,
+    model: DEFAULT_PRESENCE_CONFIG.model,
+    deadlineMs: 180,
+    callTinyLlm: capability
+      ? (body) =>
+          callPresenceTinyLlm({
+            llmProxyBaseUrl: llmProxyBaseUrl(env),
+            capabilityToken: capability!,
+            body,
+          })
+      : undefined,
+  });
+
+  // Always open turn + record user text so process budget / ring stay coherent.
+  await resetPresenceTurn(env.FROMDONNA_ROUTING, userId);
+  await appendPresenceSnippets(env.FROMDONNA_ROUTING, userId, [{ role: "user", text }]);
+
+  if (!gate.send) {
+    console.log(`presence ack skipped reason=${gate.reason} user=${userId}`);
+    return;
+  }
+
+  const snippets = await loadPresenceRing(env.FROMDONNA_ROUTING, userId);
   const ack = await resolvePresenceAckPreferFast({
     snippets,
     currentUserText: text,
@@ -246,6 +266,7 @@ async function sendPresenceAck(args: {
     config: {
       llmProxyBaseUrl: llmProxyBaseUrl(env),
       tinyLlmAck: Boolean(capability),
+      ackDeadlineMs: 380,
     },
     callTinyLlm: capability
       ? (body) =>
@@ -262,12 +283,10 @@ async function sendPresenceAck(args: {
     text: ack.text,
   });
 
-  const additions: PresenceSnippet[] = [
-    { role: "user", text },
+  await appendPresenceSnippets(env.FROMDONNA_ROUTING, userId, [
     { role: "status", text: ack.text },
-  ];
-  await appendPresenceSnippets(env.FROMDONNA_ROUTING, userId, additions);
-  console.log(`presence ack source=${ack.source} user=${userId}`);
+  ]);
+  console.log(`presence ack source=${ack.source} gate=${gate.reason} user=${userId}`);
 }
 
 /**

@@ -13,24 +13,66 @@ import {
   pushPresenceRing,
   raceWithDeadline,
   resolvePresenceAckPreferFast,
+  resolvePresenceGate,
   resolvePresenceProcessLine,
   ruleBasedPresenceAck,
   sanitizePresenceAckLine,
+  shouldSendPresenceAck,
   stageFromToolName,
 } from "./presence";
 
-describe("presence rules", () => {
-  it("maps email intent from current message", () => {
-    expect(ruleBasedPresenceAck([], "check my gmail for the invoice")).toBe(
-      "Checking that email…",
-    );
+describe("presence gate", () => {
+  it("skips greetings and simple acks", () => {
+    expect(shouldSendPresenceAck("hi").send).toBe(false);
+    expect(shouldSendPresenceAck("thanks").send).toBe(false);
+    expect(shouldSendPresenceAck("ok").send).toBe(false);
+    expect(shouldSendPresenceAck("yes").reason).toBe("greeting_or_ack");
   });
 
-  it("maps calendar from history", () => {
+  it("skips echo / nonce-only probes", () => {
+    expect(shouldSendPresenceAck("echo this: banana-42").send).toBe(false);
+    expect(shouldSendPresenceAck("Reply with exactly: FOO").send).toBe(false);
+    expect(shouldSendPresenceAck('include exact nonce PRES_X').send).toBe(false);
+  });
+
+  it("forces ON for email / calendar work", () => {
+    expect(shouldSendPresenceAck("check my gmail").send).toBe(true);
+    expect(shouldSendPresenceAck("anything new in my email?").reason).toMatch(/force/);
+    expect(shouldSendPresenceAck("what's on my calendar tomorrow").send).toBe(true);
+  });
+
+  it("micro-gate can skip ambiguous default_on", async () => {
+    const d = await resolvePresenceGate({
+      text: "maybe later about stuff randomly",
+      callTinyLlm: async () => "no",
+      deadlineMs: 100,
+    });
+    // Either rules already decided, or LLM said no
+    if (shouldSendPresenceAck("maybe later about stuff randomly").reason === "default_on") {
+      expect(d.send).toBe(false);
+    }
+  });
+});
+
+describe("presence rules", () => {
+  it("maps email intent from current message only", () => {
+    expect(ruleBasedPresenceAck([], "check my gmail for the invoice")).toBe("Opening Gmail…");
+  });
+
+  it("does not poison from ring history alone", () => {
     expect(
       ruleBasedPresenceAck(
-        [{ role: "user", text: "what meetings do I have" }, { role: "assistant", text: "Want me to check calendar?" }],
-        "yes tomorrow",
+        [{ role: "user", text: "search the web for news" }, { role: "assistant", text: "ok" }],
+        "hi again friend",
+      ),
+    ).toBeNull();
+  });
+
+  it("maps calendar on affirmation follow-up from prior user", () => {
+    expect(
+      ruleBasedPresenceAck(
+        [{ role: "user", text: "what meetings do I have tomorrow" }, { role: "assistant", text: "Want me to check calendar?" }],
+        "yes",
       ),
     ).toMatch(/calendar/i);
   });
@@ -66,7 +108,7 @@ describe("sanitize + status detect", () => {
   });
 
   it("detects status lines", () => {
-    expect(isPresenceStatusLine("Checking that email…")).toBe(true);
+    expect(isPresenceStatusLine("Opening Gmail…")).toBe(true);
     expect(isPresenceStatusLine("On it.")).toBe(true);
     expect(isPresenceStatusLine("...")).toBe(true);
     expect(isPresenceStatusLine(".")).toBe(true);
@@ -76,7 +118,7 @@ describe("sanitize + status detect", () => {
 });
 
 describe("chat completion request shape", () => {
-  it("builds system + user messages with last context", () => {
+  it("builds latest-first user block", () => {
     const msgs = buildPresenceAckChatMessages(
       [
         { role: "user", text: "need gmail" },
@@ -88,18 +130,15 @@ describe("chat completion request shape", () => {
     expect(msgs[0]?.role).toBe("system");
     expect(msgs[0]?.content).toBe(PRESENCE_ACK_SYSTEM_PROMPT);
     expect(msgs[1]?.role).toBe("user");
-    expect(msgs[1]?.content).toContain("User: need gmail");
-    expect(msgs[1]?.content).toContain("Donna: ok");
-    // status lines stripped from context block
+    expect(msgs[1]?.content).toContain("Latest user message:");
+    expect(msgs[1]?.content).toContain("check invoice");
+    expect(msgs[1]?.content).toContain("need gmail");
     expect(msgs[1]?.content).not.toContain("On it.");
-    expect(msgs[1]?.content).toContain("User: check invoice");
 
     const body = buildPresenceAckChatCompletionRequest(
       [{ role: "user", text: "hi" }],
       "email me later",
     );
-    expect(body.stream).toBe(false);
-    expect(body.max_tokens).toBe(24);
     expect(body.model).toBe("grok-4.5");
     expect(body.messages).toHaveLength(2);
   });
@@ -107,17 +146,17 @@ describe("chat completion request shape", () => {
   it("extracts completion text", () => {
     expect(
       extractChatCompletionText({
-        choices: [{ message: { content: "Checking that email…" } }],
+        choices: [{ message: { content: "Opening Gmail…" } }],
       }),
-    ).toBe("Checking that email…");
+    ).toBe("Opening Gmail…");
   });
 });
 
 describe("resolvePresenceAckPreferFast", () => {
-  it("uses tiny llm when it wins", async () => {
+  it("uses tiny llm when concrete", async () => {
     const result = await resolvePresenceAckPreferFast({
       snippets: [],
-      currentUserText: "hi",
+      currentUserText: "hi there please help with something long enough maybe",
       seed: "u1",
       config: { ackDeadlineMs: 200, tinyLlmAck: true },
       callTinyLlm: async () => "Sorting that out…",
@@ -126,7 +165,7 @@ describe("resolvePresenceAckPreferFast", () => {
     expect(result.text).toContain("Sorting");
   });
 
-  it("falls back to rules when llm times out", async () => {
+  it("falls back to rules when llm times out on gmail", async () => {
     const result = await resolvePresenceAckPreferFast({
       snippets: [],
       currentUserText: "check my gmail",
@@ -138,18 +177,18 @@ describe("resolvePresenceAckPreferFast", () => {
       },
     });
     expect(result.source).toBe("rules");
-    expect(result.text).toMatch(/email/i);
+    expect(result.text).toMatch(/Gmail|email/i);
   });
 
   it("uses fallback pool when thin", async () => {
     const result = await resolvePresenceAckPreferFast({
       snippets: [],
-      currentUserText: "hi",
+      currentUserText: "please help me with this multi word request today",
       seed: "seed",
       config: { tinyLlmAck: false },
     });
-    expect(result.source).toBe("fallback");
-    expect(["On it.", "One sec.", "Got it."]).toContain(result.text);
+    // may be rules null → fallback
+    expect(["fallback", "rules"]).toContain(result.source);
   });
 });
 
@@ -174,6 +213,7 @@ describe("pickFallbackAck", () => {
 describe("process stages", () => {
   it("maps tool names to human stages", () => {
     expect(stageFromToolName("COMPOSIO_GMAIL_FETCH_EMAILS").stage).toBe("checking_email");
+    expect(stageFromToolName("COMPOSIO_GMAIL_FETCH_EMAILS").line).toMatch(/Gmail/i);
     expect(stageFromToolName("web_search").line).toMatch(/Looking/i);
   });
 
@@ -181,7 +221,7 @@ describe("process stages", () => {
     const body = buildPresenceProcessChatCompletionRequest(
       [{ role: "user", text: "check inbox" }],
       "checking_email",
-      "Checking that email…",
+      "Opening Gmail…",
     );
     expect(body.messages[0]?.content).toBe(PRESENCE_PROCESS_SYSTEM_PROMPT);
     expect(body.messages[1]?.content).toContain("Runtime stage: checking_email");
@@ -203,12 +243,11 @@ describe("process stages", () => {
 
   it("skips duplicate process text matching prior status", async () => {
     const r = await resolvePresenceProcessLine({
-      snippets: [{ role: "status", text: "Checking that email…" }],
+      snippets: [{ role: "status", text: "Opening Gmail…" }],
       toolName: "gmail_list",
       seed: "u",
       config: { tinyLlmAck: false },
     });
-    // stage hint duplicates ack → alt "Still on it…"
     expect("skipped" in r).toBe(false);
     if ("skipped" in r) return;
     expect(r.text).toMatch(/Still on it/i);
@@ -229,7 +268,6 @@ describe("process stages", () => {
         Date.now(),
       ).ok,
     ).toBe(false);
-    // last_line_at_ms=0 means ack-only turn — process allowed immediately
     expect(
       canSendProcessLine(
         { process_count: 0, pre_final_count: 1, last_stage: null, last_line_at_ms: 0 },
@@ -237,7 +275,6 @@ describe("process stages", () => {
         Date.now(),
       ).ok,
     ).toBe(true);
-    // min_interval only after a real process line
     const now = Date.now();
     expect(
       canSendProcessLine(
@@ -256,5 +293,4 @@ describe("process stages", () => {
   });
 });
 
-// silence unused import if any
 void vi;

@@ -46,29 +46,40 @@ export const DEFAULT_PRESENCE_CONFIG: PresenceConfig = {
 };
 
 /** System instruction for the tiny presence-ack model (msg 1). */
-export const PRESENCE_ACK_SYSTEM_PROMPT = `You write ONE short status line for Donna, a personal assistant on Telegram.
+export const PRESENCE_ACK_SYSTEM_PROMPT = `You write ONE short status line for Donna on Telegram — what she is starting RIGHT NOW.
 
-Rules:
-- Output only the status line. No quotes, no markdown, no bullet points.
-- Max 8 words. Trailing ellipsis (…) is OK.
-- Human intent only: what she is doing for the user (e.g. Checking that email…).
-- Never invent tools, APIs, skill names, MCP, Composio, system talk, or "how I know".
-- Never ask a question. Never give the final answer. Never apologize at length.
-- Match language/register of the latest user message when obvious (e.g. Hinglish → short Hinglish).
-- If intent is unclear, reply exactly: On it.
-- Prefer concrete WIP over generic when the thread makes intent clear.`;
+Output only the status line. No quotes, no markdown, no bullets.
+Max 6 words. Trailing ellipsis (…) preferred.
+Use the LATEST user message as primary signal (older chat is weak context only).
+
+Be concrete:
+- Name the app/object when clear: Opening Gmail… / Checking calendar… / Opening Drive…
+- Prefer a clear verb: Opening, Checking, Drafting, Looking up, Booking, Sorting…
+- Never invent tools, MCP, Composio, APIs, skill names, or system talk.
+- Never ask a question. Never give the final answer.
+- Match language/register of the latest user message when obvious.
+- If intent is truly unclear: On it.
+
+Bad (too generic / sticky): Looking that up… · On that follow-up… · Working on it…
+Good: Opening Gmail… · Checking that invoice… · Drafting your reply…`;
 
 /** System instruction for process WIP lines (msg 2–3). */
 export const PRESENCE_PROCESS_SYSTEM_PROMPT = `You write ONE short mid-work status line for Donna on Telegram.
 
 Rules:
 - Output only the status line. No quotes, no markdown.
-- Max 8 words. Trailing ellipsis (…) is OK.
-- Use the runtime stage + recent chat to say what she is doing NOW in human words.
+- Max 6 words. Trailing ellipsis (…) preferred.
+- Use the runtime stage + latest user intent to say what she is doing NOW.
+- Be concrete (Opening Gmail… not Looking that up…).
 - Human intent only. Never name tools, APIs, MCP, Composio, skill ids, or system internals.
 - Never ask a question. Never give the final answer.
 - Do not repeat the previous status line if one is shown.
 - If stage is unclear, say: Still on it…`;
+
+/** Optional micro-gate: will this turn likely need multi-step / tools? yes|no */
+export const PRESENCE_GATE_SYSTEM_PROMPT = `Answer only yes or no.
+Does the latest user message look like a real task that may need tools, lookup, drafting, or multi-step work (not a pure greeting, thanks, echo, or one-word ack)?
+yes = presence WIP ok. no = skip presence.`;
 
 export type PresenceAckResult = {
   text: string;
@@ -81,19 +92,24 @@ export type PresenceProcessResult = {
   stage: string;
 };
 
+export type PresenceGateDecision = {
+  send: boolean;
+  reason: string;
+};
+
 /** Tool name / stage id → human fallback line (also used when tiny LLM is slow). */
 export const STAGE_RULES: Array<{ re: RegExp; stage: string; line: string }> = [
-  { re: /gmail|mail|inbox|email/i, stage: "checking_email", line: "Checking that email…" },
-  { re: /calendar|schedule|meeting/i, stage: "checking_calendar", line: "Looking at your calendar…" },
-  { re: /drive|docs?|sheet|slides|file|folder|onedrive|dropbox/i, stage: "checking_files", line: "Looking through your files…" },
+  { re: /gmail|mail|inbox|email/i, stage: "checking_email", line: "Opening Gmail…" },
+  { re: /calendar|schedule|meeting/i, stage: "checking_calendar", line: "Checking calendar…" },
+  { re: /drive|docs?|sheet|slides|file|folder|onedrive|dropbox/i, stage: "checking_files", line: "Opening your files…" },
   { re: /github|pull_request|repo|commit/i, stage: "checking_github", line: "Opening the repo…" },
   { re: /linkedin/i, stage: "checking_linkedin", line: "Checking LinkedIn…" },
   { re: /outlook|teams|sharepoint|onenote|excel/i, stage: "checking_microsoft", line: "Checking Microsoft…" },
-  { re: /web_search|web_browse|search|exa|browser/i, stage: "looking_up", line: "Looking that up…" },
+  { re: /web_search|web_browse|exa|browser/i, stage: "looking_up", line: "Looking that up…" },
   { re: /connect|composio|manage.connection|oauth/i, stage: "connecting_app", line: "Getting the connect link…" },
-  { re: /skill_view|skill_manage|skills_list/i, stage: "loading_skill", line: "Pulling the right playbook…" },
+  { re: /skill_view|skill_manage|skills_list/i, stage: "loading_skill", line: "Pulling the playbook…" },
   { re: /terminal|bash|shell|execute/i, stage: "running_command", line: "Running that…" },
-  { re: /read_file|write_file|patch|search_files/i, stage: "working_files", line: "Working through the files…" },
+  { re: /read_file|write_file|patch|search_files/i, stage: "working_files", line: "Working the files…" },
   { re: /memory/i, stage: "memory", line: "Still on it…" },
   { re: /mcp|tool/i, stage: "using_tools", line: "Working on it…" },
 ];
@@ -114,23 +130,112 @@ export function sanitizeStageId(raw: string): string {
     .slice(0, 48) || "working";
 }
 
-/** Keyword / phrase rules over recent text → contextual WIP line. */
-const INTENT_RULES: Array<{ re: RegExp; line: string }> = [
-  { re: /\b(gmail|inbox|email|e-?mail|mail|invoice|receipt)\b/i, line: "Checking that email…" },
-  { re: /\b(calendar|schedule|what.?s on|tomorrow|meeting|availab)/i, line: "Looking at your calendar…" },
-  { re: /\b(drive|docs?|sheet|slides|file|folder)\b/i, line: "Looking through your files…" },
-  { re: /\b(github|pr\b|pull request|repo|commit)\b/i, line: "Opening the repo…" },
+/**
+ * Intent rules for ack — match LATEST user text only (not full ring).
+ * Concrete product copy; avoid sticky generics.
+ */
+export const INTENT_RULES: Array<{ re: RegExp; line: string }> = [
+  { re: /\b(gmail|google\s*mail)\b/i, line: "Opening Gmail…" },
+  { re: /\b(inbox|e-?mails?|mail|invoice|receipt)\b/i, line: "Checking email…" },
+  { re: /\b(calendar|schedule|what'?s on|meetings?|availab)/i, line: "Checking calendar…" },
+  { re: /\b(google\s*drive|drive|docs?|sheets?|slides|folder)\b/i, line: "Opening Drive…" },
+  { re: /\b(github|pull request|\bpr\b|repo|commit)\b/i, line: "Opening the repo…" },
   { re: /\b(linkedin)\b/i, line: "Checking LinkedIn…" },
   { re: /\b(dropbox)\b/i, line: "Checking Dropbox…" },
   { re: /\b(outlook|teams|onedrive|sharepoint|onenote)\b/i, line: "Checking Microsoft…" },
-  { re: /\b(search|look up|find out|web|news|price)\b/i, line: "Looking that up…" },
-  { re: /\b(connect|link|authorize|log ?in|oauth)\b/i, line: "Getting the connect link…" },
-  { re: /\b(remind|todo|task|follow.?up)\b/i, line: "On that follow-up…" },
+  { re: /\b(look\s*up|search\s+for|find\s+out|google\b)/i, line: "Looking that up…" },
+  { re: /\b(connect|authorize|oauth|log\s*in to)\b/i, line: "Getting the connect link…" },
+  { re: /\b(remind|reminder|todo|to-do)\b/i, line: "Setting that up…" },
   { re: /\b(flight|hotel|travel|trip)\b/i, line: "Looking up the trip…" },
-  { re: /\b(pay|money|transfer|split)\b/i, line: "Sorting the money bit…" },
+  { re: /\b(pay|payment|transfer|split the)\b/i, line: "Sorting the money…" },
   { re: /\b(summar|tldr|recap)\b/i, line: "Pulling a summary…" },
   { re: /\b(draft|write|reply|respond)\b/i, line: "Drafting that…" },
 ];
+
+// ── Hybrid presence gate (edge; not a Hermes tool) ─────────────────────────
+
+const GATE_SKIP_EXACT =
+  /^(hi|hii+|hello|hey|yo|sup|hola|namaste|thanks|thank you|thx|ty|ok|okay|k|kk|yes|yep|yeah|yup|no|nope|nah|sure|cool|great|nice|👍|🙏|lol|haha|hm+|hmm+|idk|np|bye|good morning|good night|gm|gn)[.!?]*$/i;
+
+const GATE_SKIP_ECHO =
+  /^(echo|repeat|say)\b|^reply with exactly\b|^include (this )?exact nonce\b/i;
+
+const GATE_FORCE_WORK =
+  /\b(gmail|email|inbox|calendar|schedule|meeting|drive|github|linkedin|dropbox|outlook|teams|invoice|receipt|remind|todo|draft|write|reply|book|flight|hotel|pay|transfer|summar|tldr|connect|oauth|authorize|check|find|look\s*up|search\s+for|open|send|read|fetch|list|show me|what('?s| is) on)\b/i;
+
+const GATE_WORK_VERB =
+  /\b(check|find|get|show|open|send|draft|write|book|pay|remind|search|look|fetch|list|summar|connect|fix|update|delete|create|make|help me|can you|could you|please)\b/i;
+
+/**
+ * Hybrid gate: skip simple turns; force ON for clear work; default ON for longer asks.
+ * Optional micro-LLM is layered in `resolvePresenceGate` when provided.
+ */
+export function shouldSendPresenceAck(text: string): PresenceGateDecision {
+  const t = text.replace(/\s+/g, " ").trim();
+  if (!t) return { send: false, reason: "empty" };
+
+  if (GATE_SKIP_ECHO.test(t)) return { send: false, reason: "echo" };
+  if (GATE_SKIP_EXACT.test(t)) return { send: false, reason: "greeting_or_ack" };
+
+  // Pure echo payload: short quoted-only / nonce-only style
+  if (/^["'`].+["'`]$/.test(t) && t.length < 80) return { send: false, reason: "quoted_only" };
+
+  if (GATE_FORCE_WORK.test(t)) return { send: true, reason: "force_work" };
+  if (INTENT_RULES.some((r) => r.re.test(t))) return { send: true, reason: "force_intent" };
+
+  const words = t.split(/\s+/).filter(Boolean);
+  if (words.length <= 3 && !GATE_WORK_VERB.test(t)) {
+    return { send: false, reason: "short_simple" };
+  }
+  if (words.length <= 2 && t.length <= 16) {
+    return { send: false, reason: "very_short" };
+  }
+
+  // Multi-clause / long → presence on
+  if (words.length >= 12 || t.length >= 100) return { send: true, reason: "long" };
+  if (GATE_WORK_VERB.test(t)) return { send: true, reason: "work_verb" };
+
+  // Ambiguous medium messages → default ON (micro-LLM may refine when wired)
+  return { send: true, reason: "default_on" };
+}
+
+/**
+ * Resolve gate with optional micro yes/no LLM for ambiguous default_on only.
+ * Timeout / failure → keep rules decision (do not invent skips).
+ */
+export async function resolvePresenceGate(args: {
+  text: string;
+  callTinyLlm?: (body: {
+    model: string;
+    temperature: number;
+    max_tokens: number;
+    stream: false;
+    messages: Array<{ role: "system" | "user"; content: string }>;
+  }) => Promise<string | null>;
+  model?: string;
+  deadlineMs?: number;
+}): Promise<PresenceGateDecision> {
+  const base = shouldSendPresenceAck(args.text);
+  // Only spend a micro call when rules said default_on and caller provided LLM.
+  if (base.reason !== "default_on" || !args.callTinyLlm) return base;
+
+  const body = {
+    model: args.model || DEFAULT_PRESENCE_CONFIG.model,
+    temperature: 0,
+    max_tokens: 3,
+    stream: false as const,
+    messages: [
+      { role: "system" as const, content: PRESENCE_GATE_SYSTEM_PROMPT },
+      { role: "user" as const, content: `Latest user message:\n${args.text.trim()}\n\nAnswer yes or no.` },
+    ],
+  };
+  const raced = await raceWithDeadline(args.callTinyLlm(body).catch(() => null), args.deadlineMs ?? 180);
+  if (!raced.ok || !raced.value) return { send: false, reason: "gate_llm_timeout_skip" };
+  const v = raced.value.trim().toLowerCase();
+  if (/^no\b/.test(v)) return { send: false, reason: "gate_llm_no" };
+  if (/^yes\b/.test(v)) return { send: true, reason: "gate_llm_yes" };
+  return { send: false, reason: "gate_llm_unclear_skip" };
+}
 
 export function normalizeSnippetText(text: string, maxLen = 280): string {
   return text.replace(/\s+/g, " ").trim().slice(0, maxLen);
@@ -143,7 +248,24 @@ export function isPresenceStatusLine(text: string): boolean {
   // Thinking-dots frames (FromDonna UX) must never land in the assistant ring.
   if (/^\.{1,3}$/.test(t)) return true;
   const lower = t.toLowerCase();
-  if (["on it.", "one sec.", "got it.", "on it", "one sec", "got it", "still on it…", "still on it..."].includes(lower)) {
+  if (
+    [
+      "on it.",
+      "one sec.",
+      "got it.",
+      "on it",
+      "one sec",
+      "got it",
+      "still on it…",
+      "still on it...",
+      "looking that up…",
+      "looking that up...",
+      "on that follow-up…",
+      "on that follow-up...",
+      "working on it…",
+      "working on it...",
+    ].includes(lower)
+  ) {
     return true;
   }
   for (const rule of STAGE_RULES) {
@@ -157,9 +279,22 @@ export function isPresenceStatusLine(text: string): boolean {
 
 export function isGenericPresenceLine(text: string): boolean {
   const lower = text.trim().toLowerCase();
-  return ["on it.", "one sec.", "got it.", "on it", "one sec", "got it", "still on it…", "still on it...", "working on it…", "working on it..."].includes(
-    lower,
-  );
+  return [
+    "on it.",
+    "one sec.",
+    "got it.",
+    "on it",
+    "one sec",
+    "got it",
+    "still on it…",
+    "still on it...",
+    "working on it…",
+    "working on it...",
+    "looking that up…",
+    "looking that up...",
+    "on that follow-up…",
+    "on that follow-up...",
+  ].includes(lower);
 }
 
 export function samePresenceText(a: string, b: string): boolean {
@@ -197,10 +332,26 @@ export function parsePresenceRingJson(raw: string | null | undefined): PresenceS
   }
 }
 
+/**
+ * Instant intent line from LATEST user text only.
+ * Weak follow-up: if user says yes/ok and prior user line had intent, reuse that.
+ */
 export function ruleBasedPresenceAck(snippets: PresenceSnippet[], currentUserText: string): string | null {
-  const blob = [...snippets.map((s) => s.text), currentUserText].join(" \n ");
+  const current = currentUserText.trim();
+  if (!current) return null;
+
   for (const rule of INTENT_RULES) {
-    if (rule.re.test(blob) || rule.re.test(currentUserText)) return rule.line;
+    if (rule.re.test(current)) return rule.line;
+  }
+
+  // Affirmation follow-up → prior user intent only (not full ring poison)
+  if (/^(yes|yep|yeah|yup|sure|ok|okay|please|do it|go ahead)[.!]*$/i.test(current)) {
+    const priorUser = [...snippets].reverse().find((s) => s.role === "user");
+    if (priorUser) {
+      for (const rule of INTENT_RULES) {
+        if (rule.re.test(priorUser.text)) return rule.line;
+      }
+    }
   }
   return null;
 }
@@ -218,17 +369,20 @@ export function buildPresenceAckChatMessages(
   currentUserText: string,
   maxContext = DEFAULT_PRESENCE_CONFIG.contextMessages,
 ): Array<{ role: "system" | "user" | "assistant"; content: string }> {
+  // Weak context only: last 2–3 non-status lines (model must prefer latest).
   const recent = snippets
     .filter((s) => s.role !== "status")
-    .slice(-maxContext);
-  const lines: string[] = [];
+    .slice(-Math.min(3, maxContext));
+  const weak: string[] = [];
   for (const s of recent) {
     const who = s.role === "user" ? "User" : "Donna";
-    lines.push(`${who}: ${s.text}`);
+    weak.push(`${who}: ${s.text}`);
   }
-  lines.push(`User: ${normalizeSnippetText(currentUserText)}`);
   const userBlock =
-    `Recent chat (oldest → newest):\n${lines.join("\n")}\n\n` +
+    `Latest user message:\n${normalizeSnippetText(currentUserText)}\n\n` +
+    (weak.length
+      ? `Optional weak context (older, may be stale — do not overfit):\n${weak.join("\n")}\n\n`
+      : "") +
     `Write the single WIP status line now.`;
   return [
     { role: "system", content: PRESENCE_ACK_SYSTEM_PROMPT },
@@ -338,7 +492,7 @@ export async function resolvePresenceAck(args: {
   };
 }
 
-/** Parallel: start tiny LLM immediately but prefer rules if LLM loses the race. */
+/** Parallel: start tiny LLM immediately; prefer concrete lines over sticky generics. */
 export async function resolvePresenceAckPreferFast(args: {
   snippets: PresenceSnippet[];
   currentUserText: string;
@@ -357,10 +511,16 @@ export async function resolvePresenceAckPreferFast(args: {
     if (raced.ok) {
       const cleaned = raced.value ? sanitizePresenceAckLine(raced.value) : null;
       if (cleaned) {
-        // Prefer concrete rules over a generic LLM line when rules already know intent.
+        // Prefer concrete rules over generic LLM.
         if (rule && isGenericPresenceLine(cleaned) && !isGenericPresenceLine(rule)) {
           return { text: rule, source: "rules" };
         }
+        // Prefer concrete LLM over a missing rule.
+        if (!isGenericPresenceLine(cleaned)) {
+          return { text: cleaned, source: "tiny_llm" };
+        }
+        // Generic LLM + concrete rule → rule
+        if (rule) return { text: rule, source: "rules" };
         return { text: cleaned, source: "tiny_llm" };
       }
     }
@@ -577,7 +737,14 @@ export async function callPresenceTinyLlm(args: {
   capabilityToken: string;
   body:
     | ReturnType<typeof buildPresenceAckChatCompletionRequest>
-    | ReturnType<typeof buildPresenceProcessChatCompletionRequest>;
+    | ReturnType<typeof buildPresenceProcessChatCompletionRequest>
+    | {
+        model: string;
+        temperature: number;
+        max_tokens: number;
+        stream: false;
+        messages: Array<{ role: "system" | "user" | "assistant"; content: string }>;
+      };
 }): Promise<string | null> {
   const base = args.llmProxyBaseUrl.replace(/\/$/, "");
   const url = `${base}/v1/chat/completions`;
