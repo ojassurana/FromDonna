@@ -149,7 +149,8 @@ export const INTENT_RULES: Array<{ re: RegExp; line: string }> = [
   { re: /\b(flight|hotel|travel|trip)\b/i, line: "Looking up the trip…" },
   { re: /\b(pay|payment|transfer|split the)\b/i, line: "Sorting the money…" },
   { re: /\b(summar|tldr|recap)\b/i, line: "Pulling a summary…" },
-  { re: /\b(draft|write|reply|respond)\b/i, line: "Drafting that…" },
+  { re: /\b(draft|write me|write a|write an|respond to)\b/i, line: "Drafting that…" },
+  { re: /\breply to\b/i, line: "Drafting that…" },
 ];
 
 // ── Hybrid presence gate (edge; not a Hermes tool) ─────────────────────────
@@ -161,7 +162,7 @@ const GATE_SKIP_ECHO =
   /^(echo|repeat|say)\b|^reply with exactly\b|^include (this )?exact nonce\b/i;
 
 const GATE_FORCE_WORK =
-  /\b(gmail|email|inbox|calendar|schedule|meeting|drive|github|linkedin|dropbox|outlook|teams|invoice|receipt|remind|todo|draft|write|reply|book|flight|hotel|pay|transfer|summar|tldr|connect|oauth|authorize|check|find|look\s*up|search\s+for|open|send|read|fetch|list|show me|what('?s| is) on)\b/i;
+  /\b(gmail|email|inbox|calendar|schedule|meeting|drive|github|linkedin|dropbox|outlook|teams|invoice|receipt|remind|todo|draft|write me|write a|book|flight|hotel|pay|transfer|summar|tldr|connect|oauth|authorize|check|find|look\s*up|search\s+for|open|send|read|fetch|list|show me|what('?s| is) on)\b/i;
 
 const GATE_WORK_VERB =
   /\b(check|find|get|show|open|send|draft|write|book|pay|remind|search|look|fetch|list|summar|connect|fix|update|delete|create|make|help me|can you|could you|please)\b/i;
