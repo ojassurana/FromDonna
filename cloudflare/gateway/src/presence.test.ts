@@ -129,7 +129,7 @@ describe("chat completion request shape", () => {
     expect(msgs[1]?.content).not.toContain("Working on that…");
 
     const body = buildPresenceAckChatCompletionRequest([], "email me later");
-    expect(body.model).toBe("grok-4.5");
+    expect(body.model).toBe("grok-4.20-0309-non-reasoning");
     expect(body.messages).toHaveLength(2);
   });
 

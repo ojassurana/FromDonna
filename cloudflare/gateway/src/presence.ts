@@ -35,15 +35,16 @@ export type PresenceConfig = {
 export const DEFAULT_PRESENCE_CONFIG: PresenceConfig = {
   enabled: true,
   contextMessages: 10,
-  /** LLM-first ack; allow a bit more time so we rarely hit bland fallback. */
-  ackDeadlineMs: 650,
-  processDeadlineMs: 650,
+  /** LLM-first ack — allow enough time for edge proxy + small model. */
+  ackDeadlineMs: 1200,
+  processDeadlineMs: 900,
   tinyLlmAck: true,
   maxProcessLines: 2,
   processMinIntervalMs: 2500,
   /** Single bland line only — never scenario copy. Not One sec / On it. */
   fallbackPool: ["Working on that…"],
-  model: "grok-4.5",
+  /** Prefer fast non-reasoning when available via product proxy. */
+  model: "grok-4.20-0309-non-reasoning",
   llmProxyBaseUrl: "https://fromdonna-llm-proxy.code-df4.workers.dev",
 };
 
@@ -685,7 +686,11 @@ export async function callPresenceTinyLlm(args: {
     return null;
   }
   const json = (await response.json()) as unknown;
-  return extractChatCompletionText(json);
+  const text = extractChatCompletionText(json);
+  if (!text) {
+    console.error("presence tiny llm empty content");
+  }
+  return text;
 }
 
 // ── Turn budget (D1) ────────────────────────────────────────────────────────

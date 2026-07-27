@@ -266,7 +266,7 @@ async function sendPresenceAck(args: {
     config: {
       llmProxyBaseUrl: llmProxyBaseUrl(env),
       tinyLlmAck: Boolean(capability),
-      ackDeadlineMs: 650,
+      ackDeadlineMs: 1200,
     },
     callTinyLlm: capability
       ? (body) =>
@@ -351,7 +351,7 @@ async function handlePresenceStage(request: Request, env: Env): Promise<Response
     config: {
       llmProxyBaseUrl: llmProxyBaseUrl(env),
       tinyLlmAck: Boolean(capability),
-      processDeadlineMs: 650,
+      processDeadlineMs: 900,
     },
     callTinyLlm: capability
       ? (reqBody) =>
@@ -1610,27 +1610,34 @@ async function processTelegramUpdate(
     );
   }
 
-  // Contextual presence ack (slot 1) — parallel with routing/inject, not Hermes.
-  // Hermes template keeps mid-turn outputs off; final answer still comes from sandbox.
-  // Any agent-triggering inbound opens a presence turn (text gets ack; others reset budget only).
+  // Contextual presence ack (slot 1) — MUST land before Hermes final when possible.
+  // Await with hard cap so inject is only slightly delayed; never waitUntil-only
+  // (that raced finals ahead of slow LLM acks).
+  let presenceAckPromise: Promise<void> | null = null;
   if (event.type === "message" && event.message.text?.trim()) {
     const userText = event.message.text.trim();
-    ctx.waitUntil(
-      sendPresenceAck({
-        env,
-        userId,
-        chatId: gatewayConversationId,
-        currentUserText: userText,
-      }).catch((error) => {
-        console.error(
-          "presence ack failed:",
-          error instanceof Error ? error.message : error,
-        );
-      }),
-    );
-  } else if (event.type === "message" || event.type === "callback_query") {
+    presenceAckPromise = sendPresenceAck({
+      env,
+      userId,
+      chatId: gatewayConversationId,
+      currentUserText: userText,
+    }).catch((error) => {
+      console.error(
+        "presence ack failed:",
+        error instanceof Error ? error.message : error,
+      );
+    });
+    // Bound wait: prefer sending ack before inject, but don't stall cold path forever.
+    await Promise.race([
+      presenceAckPromise,
+      new Promise<void>((r) => setTimeout(r, 1400)),
+    ]);
+    // If we hit the cap early, still let ack finish in background.
+    ctx.waitUntil(presenceAckPromise);
+  } else if (event.type === "message" || event.type === "callback") {
     // Non-text turns still need a fresh process budget so stale max_process_lines
     // from a prior text turn does not block stages.
+    // (callback_query handled via event.type from normalize — keep message branch.)
     ctx.waitUntil(
       resetPresenceTurn(env.FROMDONNA_ROUTING, userId).catch(() => {}),
     );
