@@ -20,16 +20,17 @@ from typing import Any, Optional
 # Temporary status bubble while the agent turn is in flight.
 # Frames stay the product-requested ". → .. → ..." cycle.
 DOTS_FRAMES: tuple[str, ...] = (".", "..", "...")
-# Snappy loop (~0.96s full cycle). Telegram soft-limits ~1 edit/s per chat
-# for sustained traffic; short bursts of ~3 edits/s are fine for a few seconds.
-DOTS_INTERVAL_SECONDS: float = 0.32
+# Snappy first phase: full cycle ~0.45s when API is local; real feel is
+# interval-only because the adapter pipelines sleep || edit (not sleep+edit).
+# Telegram allows short bursts faster than 1 edit/s; we back off on flood.
+DOTS_INTERVAL_SECONDS: float = 0.15
 # After DOTS_SLOW_AFTER_SECONDS of animating, drop to this interval so long
 # agent turns do not burn Bot API quota / trip flood control.
-DOTS_SLOW_INTERVAL_SECONDS: float = 0.85
-DOTS_SLOW_AFTER_SECONDS: float = 10.0
+DOTS_SLOW_INTERVAL_SECONDS: float = 0.40
+DOTS_SLOW_AFTER_SECONDS: float = 20.0
 # Stop issuing edits after this many seconds; leave a static "..." until the
 # real reply clears the bubble. Caps worst-case API cost per turn.
-DOTS_MAX_ANIMATE_SECONDS: float = 60.0
+DOTS_MAX_ANIMATE_SECONDS: float = 90.0
 THINKING_DOTS_METADATA_KEY = "fromdonna_thinking_dots"
 THINKING_DOTS_STATUS_KEY = "fromdonna_thinking_dots"
 

@@ -8773,24 +8773,38 @@ class TelegramAdapter(BasePlatformAdapter):
             idx = next_idx
             started = _time.monotonic()
             mid = message_id
+            # Pipeline: sleep on wall-clock interval in parallel with the previous
+            # Bot API edit. Waiting for edit RTT *then* sleeping made dots feel
+            # ~2× slower (Worker proxy hop). One in-flight edit max.
+            inflight: Optional[asyncio.Task] = None
+
+            async def _post_frame(frame_text: str, current_mid: Optional[int]) -> Optional[int]:
+                new_mid = await self._fromdonna_post_thinking_frame(
+                    mode=mode,
+                    chat_key=chat_key,
+                    frame=frame_text,
+                    draft_id=draft_id,
+                    message_id=current_mid,
+                    dots_meta=dots_meta,
+                )
+                state["last_text"] = frame_text
+                if new_mid is not None:
+                    state["message_id"] = str(new_mid)
+                return new_mid
+
             while not stop_event.is_set():
                 elapsed = _time.monotonic() - started
                 interval = dots_edit_interval(elapsed)
                 if interval is None:
+                    if inflight is not None and not inflight.done():
+                        try:
+                            await inflight
+                        except Exception:
+                            pass
                     final = DOTS_FRAMES[-1] if DOTS_FRAMES else "..."
                     if state.get("last_text") != final and self._bot:
                         try:
-                            mid = await self._fromdonna_post_thinking_frame(
-                                mode=mode,
-                                chat_key=chat_key,
-                                frame=final,
-                                draft_id=draft_id,
-                                message_id=mid,
-                                dots_meta=dots_meta,
-                            )
-                            state["last_text"] = final
-                            if mid is not None:
-                                state["message_id"] = str(mid)
+                            mid = await _post_frame(final, mid)
                         except Exception:
                             pass
                     try:
@@ -8800,54 +8814,65 @@ class TelegramAdapter(BasePlatformAdapter):
                     return
                 try:
                     await asyncio.wait_for(stop_event.wait(), timeout=interval)
+                    if inflight is not None and not inflight.done():
+                        inflight.cancel()
                     return
                 except asyncio.TimeoutError:
                     pass
                 if stop_event.is_set() or not self._bot:
                     return
+                # If prior edit still in flight (slow proxy), wait briefly —
+                # keeps cadence time-based instead of stacking lag or busy-spin.
+                if inflight is not None and not inflight.done():
+                    try:
+                        await asyncio.wait_for(stop_event.wait(), timeout=0.05)
+                        inflight.cancel()
+                        return
+                    except asyncio.TimeoutError:
+                        continue
+                if inflight is not None:
+                    try:
+                        mid = await inflight
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as e:
+                        err_l = str(e).lower()
+                        if "message is not modified" in err_l:
+                            pass
+                        elif "message to edit not found" in err_l or "message can't be edited" in err_l:
+                            return
+                        elif (
+                            getattr(e, "retry_after", None) is not None
+                            or "retry after" in err_l
+                            or "flood" in err_l
+                            or "too many requests" in err_l
+                        ):
+                            delay = dots_retry_after_seconds(e, default=max(interval * 2, 0.5))
+                            try:
+                                await asyncio.wait_for(stop_event.wait(), timeout=delay)
+                                return
+                            except asyncio.TimeoutError:
+                                inflight = None
+                                continue
+                        else:
+                            logger.debug(
+                                "[%s] thinking-dots edit failed (stopping): %s",
+                                getattr(self, "name", "telegram"),
+                                e,
+                            )
+                            return
+                    inflight = None
                 frame, idx = next_dots_frame(idx)
                 state["frame_index"] = idx
                 if frame == state.get("last_text"):
                     continue
-                try:
-                    mid = await self._fromdonna_post_thinking_frame(
-                        mode=mode,
-                        chat_key=chat_key,
-                        frame=frame,
-                        draft_id=draft_id,
-                        message_id=mid,
-                        dots_meta=dots_meta,
-                    )
-                    state["last_text"] = frame
-                    if mid is not None:
-                        state["message_id"] = str(mid)
-                except asyncio.CancelledError:
-                    raise
-                except Exception as e:
-                    err_l = str(e).lower()
-                    if "message is not modified" in err_l:
-                        state["last_text"] = frame
-                        continue
-                    if "message to edit not found" in err_l or "message can't be edited" in err_l:
-                        return
-                    if (
-                        getattr(e, "retry_after", None) is not None
-                        or "retry after" in err_l
-                        or "flood" in err_l
-                        or "too many requests" in err_l
-                    ):
-                        delay = dots_retry_after_seconds(e, default=interval * 2)
-                        try:
-                            await asyncio.wait_for(stop_event.wait(), timeout=delay)
-                            return
-                        except asyncio.TimeoutError:
-                            continue
-                    logger.debug(
-                        "[%s] thinking-dots edit failed (stopping): %s",
-                        getattr(self, "name", "telegram"),
-                        e,
-                    )
-                    return
+                # Capture mid for closure; fire edit without blocking sleep loop.
+                mid_snapshot = mid
+
+                async def _run(ft: str = frame, m: Optional[int] = mid_snapshot) -> Optional[int]:
+                    return await _post_frame(ft, m)
+
+                inflight = asyncio.create_task(_run())
 
         state["task"] = asyncio.create_task(_animate())
 
