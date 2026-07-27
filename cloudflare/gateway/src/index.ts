@@ -17,6 +17,7 @@ import {
 import { ensureUserComposio, getLastComposioMintError, mintComposioMcpAccess } from "./composio";
 import {
   DEFAULT_PRESENCE_CONFIG,
+  PRESENCE_PROCESS_FALLBACK,
   appendPresenceSnippets,
   callPresenceTinyLlm,
   claimPresenceProcessSlot,
@@ -28,6 +29,7 @@ import {
   resolvePresenceAckPreferFast,
   resolvePresenceGate,
   resolvePresenceProcessLine,
+  samePresenceText,
   sanitizeStageId,
   stageFromToolName,
   type PresenceSnippet,
@@ -291,13 +293,17 @@ async function sendPresenceAck(args: {
 
 /**
  * Msg 2–3: process-based human WIP from sandbox tool stages.
+ * Claim-first: reserve slot + send fallback ASAP, then short LLM polish via edit.
  * Auth: Bearer WORKER_TO_HARNESS_SECRET + body userId/chatId must match D1 route.
  */
 async function handlePresenceStage(request: Request, env: Env): Promise<Response> {
   const auth = request.headers.get("authorization") || "";
   const expected = `Bearer ${required(env, "WORKER_TO_HARNESS_SECRET")}`;
   if (auth !== expected) return new Response("Unauthorized", { status: 401 });
-  if (!presenceEnabled(env)) return json({ ok: true, skipped: "disabled" });
+  if (!presenceEnabled(env)) {
+    console.log("presence process skipped reason=disabled");
+    return json({ ok: true, skipped: "disabled" });
+  }
 
   let body: {
     userId?: string;
@@ -318,9 +324,11 @@ async function handlePresenceStage(request: Request, env: Env): Promise<Response
   // Multi-tenant: chat must match the routed conversation for this user.
   const route = await lookupByUserId(env, userId);
   if (!route || route.status !== "ready") {
+    console.log(`presence process skipped reason=user_not_ready user=${userId}`);
     return json({ ok: false, error: "user_not_ready" }, 403);
   }
   if (String(route.gateway_conversation_id) !== String(chatId)) {
+    console.log(`presence process skipped reason=chat_mismatch user=${userId}`);
     return json({ ok: false, error: "chat_mismatch" }, 403);
   }
 
@@ -330,62 +338,115 @@ async function handlePresenceStage(request: Request, env: Env): Promise<Response
 
   const turn = await loadPresenceTurn(env.FROMDONNA_ROUTING, userId);
   const epoch = turn.pre_final_count;
-  // Fast pure gate (still re-checked atomically on claim after resolve).
-  // claim is the source of truth.
 
-  const snippets = await loadPresenceRing(env.FROMDONNA_ROUTING, userId);
-  const latestUserText = [...snippets].reverse().find((s) => s.role === "user")?.text;
-  let capability: string | null = null;
-  try {
-    capability = await mintLlmCapability(env, userId);
-  } catch {
-    // fallback-only process line
-  }
-
-  const line = await resolvePresenceProcessLine({
-    snippets,
-    toolName,
-    stage,
-    seed: userId,
-    latestUserText,
-    config: {
-      llmProxyBaseUrl: llmProxyBaseUrl(env),
-      tinyLlmAck: Boolean(capability),
-      processDeadlineMs: 900,
-    },
-    callTinyLlm: capability ? presenceLlmCall(env, capability) : undefined,
-  });
-
-  if ("skipped" in line) {
-    return json({ ok: true, skipped: line.reason, stage: line.stage });
-  }
-
+  // CLAIM FIRST — beat markPresenceTurnFinal / lose less often to fast tools.
   const claim = await claimPresenceProcessSlot(
     env.FROMDONNA_ROUTING,
     userId,
-    line.stage,
+    stage,
     epoch,
   );
-  if (!claim.ok) return json({ ok: true, skipped: claim.reason });
+  if (!claim.ok) {
+    console.log(
+      `presence process skipped reason=${claim.reason} stage=${stage} user=${userId} epoch=${epoch}`,
+    );
+    return json({ ok: true, skipped: claim.reason, stage });
+  }
 
+  const snippets = await loadPresenceRing(env.FROMDONNA_ROUTING, userId);
+  const latestUserText = [...snippets].reverse().find((s) => s.role === "user")?.text;
+  const lastStatus = [...snippets].reverse().find((s) => s.role === "status");
+
+  // Immediate human bubble (slot already reserved). Prefer non-duplicate bland line.
+  let text = PRESENCE_PROCESS_FALLBACK;
+  let source: "tiny_llm" | "fallback" = "fallback";
+  if (lastStatus && samePresenceText(lastStatus.text, text)) {
+    // Still send something after claim so the user sees mid-work progress.
+    text = "Hang tight…";
+    if (lastStatus && samePresenceText(lastStatus.text, text)) {
+      text = "Almost there…";
+    }
+  }
+
+  let messageId: number | null = null;
   try {
-    await telegram(env, "sendMessage", {
+    const sent = (await telegramJson(env, "sendMessage", {
       chat_id: chatId,
-      text: line.text,
-    });
+      text,
+    })) as { result?: { message_id?: number } } | null;
+    const mid = sent?.result?.message_id;
+    messageId = typeof mid === "number" ? mid : null;
   } catch (error) {
     console.error(
       "presence process send failed:",
       error instanceof Error ? error.message : error,
     );
-    return json({ ok: false, error: "send_failed" }, 502);
+    // Slot already consumed — log loudly; next stage may still try.
+    return json({ ok: false, error: "send_failed", stage }, 502);
+  }
+
+  // Short LLM polish (does not delay first bubble). Edit in place when better.
+  let capability: string | null = null;
+  try {
+    capability = await mintLlmCapability(env, userId);
+  } catch {
+    // fallback-only
+  }
+
+  if (capability) {
+    const polished = await resolvePresenceProcessLine({
+      snippets: [...snippets, { role: "status", text }],
+      toolName,
+      stage,
+      seed: userId,
+      latestUserText,
+      config: {
+        llmProxyBaseUrl: llmProxyBaseUrl(env),
+        tinyLlmAck: true,
+        processDeadlineMs: DEFAULT_PRESENCE_CONFIG.processDeadlineMs,
+      },
+      callTinyLlm: presenceLlmCall(env, capability),
+    });
+    if (!("skipped" in polished) && polished.source === "tiny_llm" && polished.text) {
+      const next = polished.text;
+      if (!samePresenceText(next, text)) {
+        if (messageId != null) {
+          try {
+            await telegramJson(env, "editMessageText", {
+              chat_id: chatId,
+              message_id: messageId,
+              text: next,
+            });
+            text = next;
+            source = "tiny_llm";
+          } catch (error) {
+            // Edit is best-effort; keep the fallback bubble.
+            console.warn(
+              "presence process edit failed:",
+              error instanceof Error ? error.message : error,
+            );
+          }
+        } else {
+          // No message_id — send a second polish only if clearly better (rare).
+          try {
+            await telegram(env, "sendMessage", { chat_id: chatId, text: next });
+            text = next;
+            source = "tiny_llm";
+          } catch {
+            // keep fallback
+          }
+        }
+      }
+    }
   }
 
   await appendPresenceSnippets(env.FROMDONNA_ROUTING, userId, [
-    { role: "status", text: line.text },
+    { role: "status", text },
   ]);
-  console.log(`presence process source=${line.source} stage=${line.stage} user=${userId}`);
-  return json({ ok: true, text: line.text, source: line.source, stage: line.stage });
+  console.log(
+    `presence process source=${source} stage=${stage} tool=${toolName || "-"} user=${userId} mid=${messageId ?? "-"}`,
+  );
+  return json({ ok: true, text, source, stage, messageId });
 }
 
 /** Keep Telegram "typing…" alive while inject is in flight (bounded). */
@@ -1409,9 +1470,10 @@ async function postTelegramUpdate(env: Env, row: UserAgentRow, update: TelegramU
       "content-type": "application/json",
       authorization: `Bearer ${required(env, "WORKER_TO_HARNESS_SECRET")}`,
       "x-llm-capability": capability,
-      // Warm inject skips /bootstrap — keep presence plugin chat/user env fresh.
+      // Warm inject skips /bootstrap — keep presence plugin env fresh every turn.
       "x-fromdonna-user-id": row.user_id,
       "x-fromdonna-chat-id": row.gateway_conversation_id,
+      "x-fromdonna-worker-url": workerPublicUrl(env),
     },
     body: JSON.stringify({ update }),
   });

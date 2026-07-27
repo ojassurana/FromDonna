@@ -37,10 +37,11 @@ export const DEFAULT_PRESENCE_CONFIG: PresenceConfig = {
   contextMessages: 10,
   /** LLM-first ack — allow enough time for edge proxy + small model. */
   ackDeadlineMs: 1200,
-  processDeadlineMs: 900,
+  /** Short — claim-first path sends fallback immediately; LLM only polishes. */
+  processDeadlineMs: 280,
   tinyLlmAck: true,
   maxProcessLines: 2,
-  processMinIntervalMs: 2500,
+  processMinIntervalMs: 1800,
   /** Single bland line only — never scenario copy. Not One sec / On it. */
   fallbackPool: ["Working on that…"],
   /** Prefer fast non-reasoning when available via product proxy. */
@@ -85,18 +86,20 @@ If truly unclear, still prefer a concrete guess from the words they used (topic/
 Never output: One sec. · On it. · Got it. · Looking that up… · On that follow-up… · Working on that…`
 
 /** System instruction for process WIP lines (msg 2–3). General; driven by live tool activity + user ask. */
-export const PRESENCE_PROCESS_SYSTEM_PROMPT = `You write ONE short mid-work status line for Donna on Telegram.
+export const PRESENCE_PROCESS_SYSTEM_PROMPT = `You write ONE short mid-work status line for Donna on Telegram — like a warm personal assistant who is mid-task.
 
-The agent just started a tool/action while handling the user's request.
-Output only the status line. No quotes, no markdown.
-Max 6 words. Trailing ellipsis (…) preferred.
+The agent just started real work while handling the user's request.
+Output only the status line. No quotes, no markdown, no bullets.
+Max 8 words. Trailing ellipsis (…) preferred.
+Sound human and helpful (natural progressive verbs: Pulling, Checking, Reading, Sorting, Drafting…).
 Use ONLY the latest user message + the fact work is in progress.
-Be concrete about THIS request. Do not invent unrelated topics from weak context.
+Be concrete about THIS request (name the thing they asked about when clear).
+Do not invent unrelated topics from weak context.
 Never name tools, APIs, MCP, Composio, skill ids, function names, or system internals.
 Never include GATE_ tokens, nonces, or ids.
 Never ask a question. Never give the final answer.
 Do not repeat the previous status line if one is shown.
-NEVER output: One sec. · On it. · Got it.
+NEVER output: One sec. · On it. · Got it. · Looking that up…
 If unclear: Still working…`;
 
 /** Optional micro-gate: structural only, not product scenarios. */

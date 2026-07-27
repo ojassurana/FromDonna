@@ -1404,6 +1404,7 @@ def telegram_update(
     x_llm_capability: str | None = Header(default=None),
     x_fromdonna_user_id: str | None = Header(default=None),
     x_fromdonna_chat_id: str | None = Header(default=None),
+    x_fromdonna_worker_url: str | None = Header(default=None),
 ):
     """Inject one raw Telegram Update into the official Hermes Telegram gateway."""
     if not _authorized(authorization):
@@ -1426,6 +1427,30 @@ def telegram_update(
     if cid:
         os.environ["FROMDONNA_CHAT_ID"] = cid
         os.environ.setdefault("TELEGRAM_HOME_CHANNEL", cid)
+
+    # Worker URL for presence stage POSTs (create-time env may miss warm uvicorn).
+    wurl = (x_fromdonna_worker_url or "").strip().rstrip("/")
+    if not wurl:
+        base = (os.environ.get("FROMDONNA_TELEGRAM_BASE_URL") or "").strip().rstrip("/")
+        # base looks like https://host/telegram-bot-api → strip path
+        if base.endswith("/telegram-bot-api"):
+            wurl = base[: -len("/telegram-bot-api")]
+        elif "://" in base:
+            # best-effort origin
+            try:
+                from urllib.parse import urlsplit
+
+                parts = urlsplit(base)
+                if parts.scheme and parts.netloc:
+                    wurl = f"{parts.scheme}://{parts.netloc}"
+            except Exception:
+                wurl = ""
+    if wurl:
+        os.environ["FROMDONNA_WORKER_URL"] = wurl
+    # Secret must exist for stage auth (bootstrap sets it; re-assert if present in create env).
+    if not (os.environ.get("WORKER_TO_HARNESS_SECRET") or "").strip():
+        # Presence stages need this Bearer — leave a breadcrumb without adding logging deps.
+        print("telegram_update: WORKER_TO_HARNESS_SECRET missing — presence stages will skip", flush=True)
 
     with _serialized_turns():
         try:

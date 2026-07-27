@@ -15,7 +15,7 @@ See also: [telegram.md](./telegram.md) § Presence.
 | # | Kind | Owner | Trigger | Copy source |
 |---|------|--------|---------|-------------|
 | **1** | Ack | Gateway | User text + **structural gate ON** | Tiny LLM via **`LLM_PROXY` binding** (~1.2s deadline) |
-| **2** | Process | Gateway | First tool stage from sandbox | Tiny LLM + latest user + live signal |
+| **2** | Process | Gateway | First tool stage from sandbox | Claim-first fallback + short LLM polish |
 | **3** | Process | Gateway | Later different stage | Same |
 | **4** | Final | **Hermes** | Agent turn complete | Full agent + tools |
 
@@ -31,7 +31,7 @@ What the user should **not** see mid-turn:
 What they **may** see:
 
 - Telegram typing indicator  
-- Gateway msg 1–3 WIP (LLM-written)  
+- Gateway msg 1–3 WIP (LLM-written or bland process fallback)  
 - Hermes final only as the real answer  
 
 ---
@@ -58,13 +58,29 @@ No app/intent product lists. On skip: reset turn + ring user text; no WIP bubble
 3. Strip `GATE_*` test tokens from model output  
 4. Else single bland fallback: **`Working on that…`** (never hashed One sec pool)
 
-### Msg 2–3
-1. Plugin posts `{ userId, chatId, toolName }` on `pre_tool_call`  
-2. Gateway uses tool name only as **internal stage id** (dedup/budget) — not user slogans  
-3. Tiny LLM writes human line from **latest user ask + “tool activity started”**  
-4. Fallback: **`Still working…`** if LLM misses  
+### Msg 2–3 (claim-first — 2026-07-27)
+
+**Problem fixed:** Old path ran process LLM (~900ms) *then* claimed a D1 slot. Hermes final often hit Bot API proxy first → `markPresenceTurnFinal` (`process_count=999`) → claim lost → user only saw ack → final.
+
+**Shipped path:**
+
+1. Plugin `fromdonna_presence` on `pre_tool_call` POSTs `{ userId, chatId, toolName }` → `/internal/presence/stage`  
+2. Gateway auth + route/chat match  
+3. **`claimPresenceProcessSlot` immediately** (epoch + stage + budget)  
+4. **Send bland process line ASAP** (`Still working…` / rare alternates if duplicate) via real bot token  
+5. Short process LLM (~280ms) **polishes via `editMessageText`** when better  
+6. Tool name is **internal stage id only** (dedup/budget) — never user slogans  
 
 If Hermes never calls tools → no fake process lines (correct).
+
+Env for plugin (refreshed every inject):
+
+| Env | Source |
+|-----|--------|
+| `FROMDONNA_WORKER_URL` | Inject header `x-fromdonna-worker-url` or telegram base origin |
+| `WORKER_TO_HARNESS_SECRET` | Bootstrap / create |
+| `FROMDONNA_USER_ID` | Inject header |
+| `FROMDONNA_CHAT_ID` | Inject header |
 
 ### Critical: `LLM_PROXY` service binding
 
@@ -81,6 +97,10 @@ service = "fromdonna-llm-proxy"
 ### Ack order
 
 Gateway **awaits** bounded `sendPresenceAck` (~1.4s race) **before** sandbox inject so the final cannot beat the WIP line; leftover continues in `waitUntil`.
+
+### Final lock
+
+Hermes final via Bot API proxy → `markPresenceTurnFinal` blocks late process claims. Claim-first means the process bubble usually already landed.
 
 ---
 
@@ -117,6 +137,7 @@ Commit: `0047fef` + template rebuild `fromdonna-hermes`. Optional stock **👀/�
 | Webhook + stage + ack order | `cloudflare/gateway/src/index.ts` |
 | `LLM_PROXY` binding | `cloudflare/gateway/wrangler.toml` |
 | Stage plugin | `E2B-Template/extensions/plugins/fromdonna_presence/` |
+| Inject env refresh | `E2B-Template/harness/server.py` `/telegram/update` |
 | ~~Thinking-dots~~ | **Removed** |
 
 ---
@@ -129,5 +150,7 @@ cd cloudflare/gateway && npm test && npx wrangler deploy
 cd ../../E2B-Template && bash scripts/deploy-template.sh --prod --skip-install
 ```
 
-Constants: `PRESENCE_ACK_SYSTEM_PROMPT`, `PRESENCE_PROCESS_SYSTEM_PROMPT`, `PRESENCE_ACK_FALLBACK`.  
+Tail skips: `wrangler tail fromdonna-gateway` → `presence process source=` or `presence process skipped reason=`.
+
+Constants: `PRESENCE_ACK_SYSTEM_PROMPT`, `PRESENCE_PROCESS_SYSTEM_PROMPT`, `PRESENCE_ACK_FALLBACK`, `PRESENCE_PROCESS_FALLBACK`.  
 Re-read `presence.ts` for exact prompt text (docs can lag).

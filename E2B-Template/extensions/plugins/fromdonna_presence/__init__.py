@@ -23,11 +23,12 @@ from typing import Any
 logger = logging.getLogger("fromdonna.presence")
 
 # Same-tool de-dupe only (gateway owns cross-tool budget / interval).
-_SAME_TOOL_MIN_S = 1.5
+_SAME_TOOL_MIN_S = 1.2
 _last_fire_mono = 0.0
 _last_tool = ""
 _lock = threading.Lock()
 _missing_env_warned = False
+_post_fail_count = 0
 
 
 def _env(name: str) -> str:
@@ -35,22 +36,25 @@ def _env(name: str) -> str:
 
 
 def _report_stage(tool_name: str) -> None:
-    global _last_fire_mono, _last_tool, _missing_env_warned
+    global _last_fire_mono, _last_tool, _missing_env_warned, _post_fail_count
 
     worker = _env("FROMDONNA_WORKER_URL")
     secret = _env("WORKER_TO_HARNESS_SECRET")
     user_id = _env("FROMDONNA_USER_ID")
     chat_id = _env("FROMDONNA_CHAT_ID") or _env("FROMDONNA_GATEWAY_CHAT_ID")
     if not worker or not secret or not user_id or not chat_id:
-        if not _missing_env_warned:
+        # Log every miss for first few, then throttle — ops need to see this.
+        if not _missing_env_warned or (_post_fail_count < 5):
             _missing_env_warned = True
+            _post_fail_count += 1
             logger.warning(
                 "fromdonna_presence: stage skipped — missing env "
-                "(worker=%s secret=%s user=%s chat=%s)",
+                "(worker=%s secret=%s user=%s chat=%s) tool=%s",
                 bool(worker),
                 bool(secret),
                 bool(user_id),
                 bool(chat_id),
+                tool_name,
             )
         return
 
@@ -73,6 +77,7 @@ def _report_stage(tool_name: str) -> None:
     ).encode("utf-8")
 
     def _post() -> None:
+        global _post_fail_count
         req = urllib.request.Request(
             url,
             data=payload,
@@ -80,13 +85,24 @@ def _report_stage(tool_name: str) -> None:
             headers={
                 "content-type": "application/json",
                 "authorization": f"Bearer {secret}",
+                "user-agent": "fromdonna-presence/1.0",
             },
         )
         try:
-            with urllib.request.urlopen(req, timeout=3.0) as resp:
-                resp.read()
+            with urllib.request.urlopen(req, timeout=4.0) as resp:
+                body = resp.read()
+                if resp.status >= 400:
+                    logger.warning(
+                        "presence stage post HTTP %s tool=%s body=%s",
+                        resp.status,
+                        tool_name,
+                        body[:200],
+                    )
+                else:
+                    logger.info("presence stage ok tool=%s", tool_name)
         except Exception as exc:
-            logger.warning("presence stage post failed: %s", exc)
+            _post_fail_count += 1
+            logger.warning("presence stage post failed tool=%s: %s", tool_name, exc)
 
     threading.Thread(target=_post, name="fromdonna-presence-stage", daemon=True).start()
 
