@@ -22,6 +22,7 @@ import {
   callPresenceTinyLlm,
   claimPresenceProcessSlot,
   isPresenceStatusLine,
+  isPresenceTurnFinalized,
   loadPresenceRing,
   loadPresenceTurn,
   markPresenceTurnFinal,
@@ -293,7 +294,7 @@ async function sendPresenceAck(args: {
 
 /**
  * Msg 2–3: process-based human WIP from sandbox tool stages.
- * Claim-first: reserve slot + send fallback ASAP, then short LLM polish via edit.
+ * Claim-first + never send after Hermes final (no post-final "Still working…").
  * Auth: Bearer WORKER_TO_HARNESS_SECRET + body userId/chatId must match D1 route.
  */
 async function handlePresenceStage(request: Request, env: Env): Promise<Response> {
@@ -321,7 +322,6 @@ async function handlePresenceStage(request: Request, env: Env): Promise<Response
   const chatId = (body.chatId || "").trim();
   if (!userId || !chatId) return json({ ok: false, error: "userId_and_chatId_required" }, 400);
 
-  // Multi-tenant: chat must match the routed conversation for this user.
   const route = await lookupByUserId(env, userId);
   if (!route || route.status !== "ready") {
     console.log(`presence process skipped reason=user_not_ready user=${userId}`);
@@ -338,8 +338,12 @@ async function handlePresenceStage(request: Request, env: Env): Promise<Response
 
   const turn = await loadPresenceTurn(env.FROMDONNA_ROUTING, userId);
   const epoch = turn.pre_final_count;
+  if (isPresenceTurnFinalized(turn)) {
+    console.log(`presence process skipped reason=final_already stage=${stage} user=${userId}`);
+    return json({ ok: true, skipped: "final_already", stage });
+  }
 
-  // CLAIM FIRST — beat markPresenceTurnFinal / lose less often to fast tools.
+  // CLAIM FIRST — reserve budget before any network/LLM.
   const claim = await claimPresenceProcessSlot(
     env.FROMDONNA_ROUTING,
     userId,
@@ -353,19 +357,41 @@ async function handlePresenceStage(request: Request, env: Env): Promise<Response
     return json({ ok: true, skipped: claim.reason, stage });
   }
 
+  // Re-check final AFTER claim (fast tools often finish while stage is in flight).
+  const turnAfterClaim = await loadPresenceTurn(env.FROMDONNA_ROUTING, userId);
+  if (isPresenceTurnFinalized(turnAfterClaim) || turnAfterClaim.pre_final_count !== epoch) {
+    console.log(
+      `presence process skipped reason=final_race stage=${stage} user=${userId} epoch=${epoch}`,
+    );
+    return json({ ok: true, skipped: "final_race", stage });
+  }
+
+  // If Hermes final already landed in the ring, do not emit a late WIP bubble.
   const snippets = await loadPresenceRing(env.FROMDONNA_ROUTING, userId);
+  const lastNonStatus = [...snippets].reverse().find((s) => s.role !== "status");
+  if (lastNonStatus?.role === "assistant") {
+    console.log(`presence process skipped reason=assistant_already stage=${stage} user=${userId}`);
+    return json({ ok: true, skipped: "assistant_already", stage });
+  }
+
   const latestUserText = [...snippets].reverse().find((s) => s.role === "user")?.text;
   const lastStatus = [...snippets].reverse().find((s) => s.role === "status");
 
-  // Immediate human bubble (slot already reserved). Prefer non-duplicate bland line.
+  // Immediate human bubble. Prefer non-duplicate bland line.
   let text = PRESENCE_PROCESS_FALLBACK;
   let source: "tiny_llm" | "fallback" = "fallback";
   if (lastStatus && samePresenceText(lastStatus.text, text)) {
-    // Still send something after claim so the user sees mid-work progress.
     text = "Hang tight…";
     if (lastStatus && samePresenceText(lastStatus.text, text)) {
       text = "Almost there…";
     }
+  }
+
+  // Final check immediately before Telegram send (tightest window).
+  const turnBeforeSend = await loadPresenceTurn(env.FROMDONNA_ROUTING, userId);
+  if (isPresenceTurnFinalized(turnBeforeSend) || turnBeforeSend.pre_final_count !== epoch) {
+    console.log(`presence process skipped reason=final_before_send stage=${stage} user=${userId}`);
+    return json({ ok: true, skipped: "final_before_send", stage });
   }
 
   let messageId: number | null = null;
@@ -381,11 +407,10 @@ async function handlePresenceStage(request: Request, env: Env): Promise<Response
       "presence process send failed:",
       error instanceof Error ? error.message : error,
     );
-    // Slot already consumed — log loudly; next stage may still try.
     return json({ ok: false, error: "send_failed", stage }, 502);
   }
 
-  // Short LLM polish (does not delay first bubble). Edit in place when better.
+  // Short LLM polish via edit — only if final still not out.
   let capability: string | null = null;
   try {
     capability = await mintLlmCapability(env, userId);
@@ -393,47 +418,41 @@ async function handlePresenceStage(request: Request, env: Env): Promise<Response
     // fallback-only
   }
 
-  if (capability) {
-    const polished = await resolvePresenceProcessLine({
-      snippets: [...snippets, { role: "status", text }],
-      toolName,
-      stage,
-      seed: userId,
-      latestUserText,
-      config: {
-        llmProxyBaseUrl: llmProxyBaseUrl(env),
-        tinyLlmAck: true,
-        processDeadlineMs: DEFAULT_PRESENCE_CONFIG.processDeadlineMs,
-      },
-      callTinyLlm: presenceLlmCall(env, capability),
-    });
-    if (!("skipped" in polished) && polished.source === "tiny_llm" && polished.text) {
-      const next = polished.text;
-      if (!samePresenceText(next, text)) {
-        if (messageId != null) {
-          try {
-            await telegramJson(env, "editMessageText", {
-              chat_id: chatId,
-              message_id: messageId,
-              text: next,
-            });
-            text = next;
-            source = "tiny_llm";
-          } catch (error) {
-            // Edit is best-effort; keep the fallback bubble.
-            console.warn(
-              "presence process edit failed:",
-              error instanceof Error ? error.message : error,
-            );
-          }
-        } else {
-          // No message_id — send a second polish only if clearly better (rare).
-          try {
-            await telegram(env, "sendMessage", { chat_id: chatId, text: next });
-            text = next;
-            source = "tiny_llm";
-          } catch {
-            // keep fallback
+  if (capability && messageId != null) {
+    const turnForPolish = await loadPresenceTurn(env.FROMDONNA_ROUTING, userId);
+    if (!isPresenceTurnFinalized(turnForPolish) && turnForPolish.pre_final_count === epoch) {
+      const polished = await resolvePresenceProcessLine({
+        snippets: [...snippets, { role: "status", text }],
+        toolName,
+        stage,
+        seed: userId,
+        latestUserText,
+        config: {
+          llmProxyBaseUrl: llmProxyBaseUrl(env),
+          tinyLlmAck: true,
+          processDeadlineMs: DEFAULT_PRESENCE_CONFIG.processDeadlineMs,
+        },
+        callTinyLlm: presenceLlmCall(env, capability),
+      });
+      if (!("skipped" in polished) && polished.source === "tiny_llm" && polished.text) {
+        const next = polished.text;
+        if (!samePresenceText(next, text)) {
+          const turnForEdit = await loadPresenceTurn(env.FROMDONNA_ROUTING, userId);
+          if (!isPresenceTurnFinalized(turnForEdit) && turnForEdit.pre_final_count === epoch) {
+            try {
+              await telegramJson(env, "editMessageText", {
+                chat_id: chatId,
+                message_id: messageId,
+                text: next,
+              });
+              text = next;
+              source = "tiny_llm";
+            } catch (error) {
+              console.warn(
+                "presence process edit failed:",
+                error instanceof Error ? error.message : error,
+              );
+            }
           }
         }
       }

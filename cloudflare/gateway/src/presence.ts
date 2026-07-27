@@ -856,6 +856,11 @@ export async function markPresenceTurnFinal(db: D1Database, userId: string): Pro
   }
 }
 
+/** Final landed this turn (markPresenceTurnFinal stamps process_count = 999). */
+export function isPresenceTurnFinalized(turn: PresenceTurnState): boolean {
+  return turn.process_count >= 900;
+}
+
 /** Whether we may send another process line (msg 2–3). Pure check (tests). */
 export function canSendProcessLine(
   turn: PresenceTurnState,
