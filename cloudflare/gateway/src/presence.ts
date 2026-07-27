@@ -90,8 +90,10 @@ export const PRESENCE_PROCESS_SYSTEM_PROMPT = `You write ONE short mid-work stat
 The agent just started a tool/action while handling the user's request.
 Output only the status line. No quotes, no markdown.
 Max 6 words. Trailing ellipsis (…) preferred.
-Combine the latest user ask with the fact that work is in progress — be concrete about what she is doing NOW.
+Use ONLY the latest user message + the fact work is in progress.
+Be concrete about THIS request. Do not invent unrelated topics from weak context.
 Never name tools, APIs, MCP, Composio, skill ids, function names, or system internals.
+Never include GATE_ tokens, nonces, or ids.
 Never ask a question. Never give the final answer.
 Do not repeat the previous status line if one is shown.
 NEVER output: One sec. · On it. · Got it.
@@ -367,6 +369,10 @@ export function sanitizePresenceAckLine(raw: string): string | null {
   t = t.split("\n")[0]?.trim() ?? "";
   if (!t) return null;
   if (/(composio|skill_view|\bmcp\b|tool_call|function_call|gpt-|grok-)/i.test(t)) return null;
+  // Strip test nonces / gate tokens — never surface in WIP.
+  t = t.replace(/\bGATE_[A-Za-z0-9_]+\b/g, "").replace(/\s{2,}/g, " ").trim();
+  t = t.replace(/\s*[:\-–—]+\s*$/g, "").trim();
+  if (!t) return null;
   if (isBannedFillerLine(t)) return null;
   const words = t.split(/\s+/);
   if (words.length > 12) t = words.slice(0, 8).join(" ");
