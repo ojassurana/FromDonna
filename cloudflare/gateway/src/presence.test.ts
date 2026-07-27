@@ -21,6 +21,7 @@ import {
   ruleBasedPresenceAck,
   sanitizePresenceAckLine,
   shouldSendPresenceAck,
+  softContextualPresenceLine,
   stageFromToolName,
 } from "./presence";
 
@@ -155,7 +156,7 @@ describe("resolvePresenceAckPreferFast LLM-first", () => {
     expect(result.text.toLowerCase()).toMatch(/pi|install/);
   });
 
-  it("rejects banned filler from llm and falls back bland", async () => {
+  it("rejects banned filler from llm and uses soft contextual fallback", async () => {
     const result = await resolvePresenceAckPreferFast({
       snippets: [],
       currentUserText: "install something please now",
@@ -164,10 +165,11 @@ describe("resolvePresenceAckPreferFast LLM-first", () => {
       callTinyLlm: async () => "One sec.",
     });
     expect(result.source).toBe("fallback");
-    expect(result.text).toBe(PRESENCE_ACK_FALLBACK);
+    expect(result.text.toLowerCase()).not.toMatch(/one sec|on it|working on that/);
+    expect(result.text).toMatch(/…$|\.\.\.$/);
   });
 
-  it("fallback when llm times out", async () => {
+  it("soft contextual fallback when llm times out", async () => {
     const result = await resolvePresenceAckPreferFast({
       snippets: [],
       currentUserText: "check something for me please",
@@ -179,7 +181,17 @@ describe("resolvePresenceAckPreferFast LLM-first", () => {
       },
     });
     expect(result.source).toBe("fallback");
-    expect(result.text).toBe(PRESENCE_ACK_FALLBACK);
+    expect(result.text).not.toBe(PRESENCE_ACK_FALLBACK);
+    expect(result.text.toLowerCase()).toContain("something");
+  });
+});
+
+describe("softContextualPresenceLine", () => {
+  it("pulls nouns from user text", () => {
+    const line = softContextualPresenceLine("What time is it in Singapore right now?");
+    expect(line).toBeTruthy();
+    expect(line!.toLowerCase()).toContain("singapore");
+    expect(line!.toLowerCase()).not.toMatch(/working on that|still working/);
   });
 });
 

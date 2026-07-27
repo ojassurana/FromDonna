@@ -401,9 +401,20 @@ async function handlePresenceStage(request: Request, env: Env): Promise<Response
     return json({ ok: true, skipped: line.reason, stage });
   }
 
-  // Only user-visible process when light LLM produced a contextual line.
-  // Never ship vague Still working… fallback as a bubble.
-  if (line.source !== "tiny_llm") {
+  // Process: light LLM preferred; soft contextual from user words OK; never pure vague bland.
+  if (line.source === "fallback") {
+    const softOk =
+      line.text !== PRESENCE_PROCESS_FALLBACK &&
+      !samePresenceText(line.text, "Working on that…") &&
+      !samePresenceText(line.text, "Still working…");
+    if (!softOk) {
+      console.log(
+        `presence process skipped reason=no_contextual_llm stage=${stage} user=${userId}`,
+      );
+      return json({ ok: true, skipped: "no_contextual_llm", stage });
+    }
+  }
+  if (line.source !== "tiny_llm" && line.source !== "fallback") {
     console.log(
       `presence process skipped reason=no_contextual_llm stage=${stage} user=${userId}`,
     );

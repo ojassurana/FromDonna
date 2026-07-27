@@ -35,7 +35,6 @@ export type PresenceConfig = {
 export const DEFAULT_PRESENCE_CONFIG: PresenceConfig = {
   enabled: true,
   contextMessages: 10,
-  /** LLM-first ack — allow enough time for edge proxy + small model. */
   ackDeadlineMs: 1200,
   /** Fast contextual process line; skip send if LLM misses (no vague bubble). */
   processDeadlineMs: 550,
@@ -323,6 +322,56 @@ export function pickFallbackAck(pool: string[], _seed: string): string {
   return line;
 }
 
+const SOFT_STOP = new Set(
+  (
+    "a an the and or but if to for of in on at by with from as is are was were be been being " +
+    "i me my we our you your they them their it its this that these those what when where who how why " +
+    "please just quick briefly only single one use tool tools need ok okay right now again " +
+    "give me list bullets bullet sentence sentences current"
+  ).split(/\s+/),
+);
+
+/**
+ * Soft contextual line from the user's own words (no app/scenario catalog).
+ * Used when light LLM misses — still human, never "Working on that…".
+ */
+export function softContextualPresenceLine(userText: string, verb = "Checking"): string | null {
+  const raw = (userText || "").replace(/[?!.,;:]+/g, " ").replace(/\s+/g, " ").trim();
+  if (!raw) return null;
+  const words = raw
+    .split(" ")
+    .map((w) => w.trim())
+    .filter((w) => w.length > 1 && !SOFT_STOP.has(w.toLowerCase()));
+  if (words.length === 0) return null;
+  // Prefer concrete tokens (Capitalized / longer / numbers kept)
+  const scored = words.map((w, i) => {
+    let s = w.length + (i < 6 ? 2 : 0);
+    if (/[A-Z]/.test(w[0]!)) s += 3;
+    if (/\d/.test(w)) s += 2;
+    if (w.length <= 2) s -= 2;
+    return { w, s };
+  });
+  scored.sort((a, b) => b.s - a.s);
+  const picked: string[] = [];
+  const seen = new Set<string>();
+  for (const { w } of scored) {
+    const k = w.toLowerCase();
+    if (seen.has(k)) continue;
+    seen.add(k);
+    picked.push(w);
+    if (picked.length >= 4) break;
+  }
+  // Keep original order of picked words
+  const order = new Map(words.map((w, i) => [w.toLowerCase(), i]));
+  picked.sort((a, b) => (order.get(a.toLowerCase()) ?? 0) - (order.get(b.toLowerCase()) ?? 0));
+  let topic = picked.join(" ").trim();
+  if (topic.length < 3) return null;
+  if (topic.length > 36) topic = topic.slice(0, 36).trim();
+  const line = `${verb} ${topic}…`;
+  if (isBannedFillerLine(line)) return null;
+  return line;
+}
+
 /** Build chat/completions messages for the tiny presence-ack model. */
 export function buildPresenceAckChatMessages(
   snippets: PresenceSnippet[],
@@ -429,7 +478,7 @@ export async function resolvePresenceAck(args: {
   return resolvePresenceAckPreferFast(args);
 }
 
-/** LLM-first ack with deadline; single non-scenario fallback. */
+/** LLM-first ack with deadline; soft contextual fallback from user words. */
 export async function resolvePresenceAckPreferFast(args: {
   snippets: PresenceSnippet[];
   currentUserText: string;
@@ -448,6 +497,9 @@ export async function resolvePresenceAckPreferFast(args: {
       if (cleaned) return { text: cleaned, source: "tiny_llm" };
     }
   }
+
+  const soft = softContextualPresenceLine(args.currentUserText, "Checking");
+  if (soft) return { text: soft, source: "fallback" };
 
   return {
     text: pickFallbackAck(config.fallbackPool, args.seed),
@@ -662,6 +714,12 @@ export async function resolvePresenceProcessLine(args: {
         return { text: cleaned, source: "tiny_llm", stage };
       }
     }
+  }
+
+  // Soft line from latest user words — still contextual, no scenario catalog.
+  const soft = softContextualPresenceLine(args.latestUserText || "", "Checking");
+  if (soft && (!lastStatus || !samePresenceText(lastStatus.text, soft))) {
+    return { text: soft, source: "fallback", stage };
   }
 
   const fallback = PRESENCE_PROCESS_FALLBACK;
