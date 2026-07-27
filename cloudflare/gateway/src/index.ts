@@ -64,8 +64,12 @@ export interface Env {
    */
   COMPOSIO_PROXY?: Fetcher;
   /**
-   * Product llm-proxy base (no trailing slash) for presence tiny-LLM acks.
-   * Defaults to https://fromdonna-llm-proxy.code-df4.workers.dev
+   * Service binding to fromdonna-llm-proxy for presence tiny-LLM.
+   * Required in production — public workers.dev fetch from a Worker returns CF 1042.
+   */
+  LLM_PROXY?: Fetcher;
+  /**
+   * Optional public llm-proxy base (local/tests). Production uses LLM_PROXY binding.
    */
   LLM_PROXY_URL?: string;
   /** Set to "0" / "false" to disable edge presence acks. */
@@ -210,6 +214,16 @@ function llmProxyBaseUrl(env: Env): string {
   return (env.LLM_PROXY_URL || DEFAULT_PRESENCE_CONFIG.llmProxyBaseUrl).replace(/\/$/, "");
 }
 
+function presenceLlmCall(env: Env, capability: string) {
+  return (body: Parameters<typeof callPresenceTinyLlm>[0]["body"]) =>
+    callPresenceTinyLlm({
+      fetcher: env.LLM_PROXY,
+      llmProxyBaseUrl: llmProxyBaseUrl(env),
+      capabilityToken: capability,
+      body,
+    });
+}
+
 /**
  * Edge presence ack: contextual WIP line before Hermes final.
  * Hybrid gate may skip simple turns (hi/echo). Hermes mid-turn stays off.
@@ -239,14 +253,7 @@ async function sendPresenceAck(args: {
     text,
     model: DEFAULT_PRESENCE_CONFIG.model,
     deadlineMs: 180,
-    callTinyLlm: capability
-      ? (body) =>
-          callPresenceTinyLlm({
-            llmProxyBaseUrl: llmProxyBaseUrl(env),
-            capabilityToken: capability!,
-            body,
-          })
-      : undefined,
+    callTinyLlm: capability ? presenceLlmCall(env, capability) : undefined,
   });
 
   // Always open turn + record user text so process budget / ring stay coherent.
@@ -268,14 +275,7 @@ async function sendPresenceAck(args: {
       tinyLlmAck: Boolean(capability),
       ackDeadlineMs: 1200,
     },
-    callTinyLlm: capability
-      ? (body) =>
-          callPresenceTinyLlm({
-            llmProxyBaseUrl: llmProxyBaseUrl(env),
-            capabilityToken: capability!,
-            body,
-          })
-      : undefined,
+    callTinyLlm: capability ? presenceLlmCall(env, capability) : undefined,
   });
 
   await telegram(env, "sendMessage", {
@@ -353,14 +353,7 @@ async function handlePresenceStage(request: Request, env: Env): Promise<Response
       tinyLlmAck: Boolean(capability),
       processDeadlineMs: 900,
     },
-    callTinyLlm: capability
-      ? (reqBody) =>
-          callPresenceTinyLlm({
-            llmProxyBaseUrl: llmProxyBaseUrl(env),
-            capabilityToken: capability!,
-            body: reqBody,
-          })
-      : undefined,
+    callTinyLlm: capability ? presenceLlmCall(env, capability) : undefined,
   });
 
   if ("skipped" in line) {

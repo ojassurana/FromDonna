@@ -81,8 +81,8 @@ Never invent tools, MCP, Composio, APIs, skill names, or system talk.
 Never ask a question. Never give the final answer.
 Match language/register of the latest user message when obvious.
 
-NEVER output these empty fillers: One sec. · On it. · Got it. · Looking that up… · On that follow-up…
-If truly unclear, output exactly: Working on that…`;
+If truly unclear, still prefer a concrete guess from the words they used (topic/object) over empty filler.
+Never output: One sec. · On it. · Got it. · Looking that up… · On that follow-up… · Working on that…`
 
 /** System instruction for process WIP lines (msg 2–3). General; driven by live tool activity + user ask. */
 export const PRESENCE_PROCESS_SYSTEM_PROMPT = `You write ONE short mid-work status line for Donna on Telegram.
@@ -657,6 +657,8 @@ export async function resolvePresenceProcessLine(args: {
 }
 
 export async function callPresenceTinyLlm(args: {
+  /** Prefer Worker service binding (CF blocks Worker→workers.dev fetch with 1042). */
+  fetcher?: Fetcher;
   llmProxyBaseUrl: string;
   capabilityToken: string;
   body:
@@ -670,16 +672,20 @@ export async function callPresenceTinyLlm(args: {
         messages: Array<{ role: "system" | "user" | "assistant"; content: string }>;
       };
 }): Promise<string | null> {
-  const base = args.llmProxyBaseUrl.replace(/\/$/, "");
-  const url = `${base}/v1/chat/completions`;
-  const response = await fetch(url, {
+  const url = args.fetcher
+    ? "https://llm-proxy/v1/chat/completions"
+    : `${args.llmProxyBaseUrl.replace(/\/$/, "")}/v1/chat/completions`;
+  const init: RequestInit = {
     method: "POST",
     headers: {
       "content-type": "application/json",
       authorization: `Bearer ${args.capabilityToken}`,
     },
     body: JSON.stringify(args.body),
-  });
+  };
+  const response = args.fetcher
+    ? await args.fetcher.fetch(url, init)
+    : await fetch(url, init);
   if (!response.ok) {
     const detail = await response.text().catch(() => "");
     console.error(`presence tiny llm HTTP ${response.status}: ${detail.slice(0, 200)}`);

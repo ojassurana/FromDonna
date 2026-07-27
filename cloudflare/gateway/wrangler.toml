@@ -21,6 +21,10 @@ bucket_name = "fromdonna-user-state"
 binding = "COMPOSIO_PROXY"
 service = "fromdonna-composio-proxy"
 
+[[services]]
+binding = "LLM_PROXY"
+service = "fromdonna-llm-proxy"
+
 # Public runtime configuration. Secrets are provisioned separately.
 [vars]
 E2B_TEMPLATE = "fromdonna-hermes"
