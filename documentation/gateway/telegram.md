@@ -95,10 +95,10 @@ Full detail: [presence.md](./presence.md).
 | Piece | Behavior |
 |--------|----------|
 | Trigger | Inbound user `message` with text |
-| **Hybrid gate** | Skip hi/thanks/echo/short acks; force ON for email/calendar/…; ambiguous → optional micro yes/no LLM |
-| Content | **Latest message** intent rules + optional **tiny LLM** (~380ms) via llm-proxy; concrete copy (e.g. Opening Gmail…); fallback pool |
-| Cap | Msg **1** ack (if gate ON) + up to **2** process lines + Hermes **final** |
-| Msg 2–3 | Plugin `fromdonna_presence` POSTs tool stages → gateway light LLM |
+| **Hybrid gate** | Structural skip hi/thanks/echo/short; ON for real asks; optional micro yes/no — **no app scenarios** |
+| Content | **LLM-first** latest-msg ack (~650ms); banned One sec/On it; bland fallback `Working on that…` only |
+| Cap | Msg **1** ack (if gate ON) + up to **2** process lines (LLM from live tool signal) + Hermes **final** |
+| Msg 2–3 | Plugin posts tool start → gateway tiny LLM (no hardcoded stage slogans) |
 | Hermes | Final path only; template mid-turn flags stay off |
 | Disable | `PRESENCE_ACK_ENABLED=0` on gateway Worker |
 | Code | `cloudflare/gateway/src/presence.ts`, plugin `extensions/plugins/fromdonna_presence/` |

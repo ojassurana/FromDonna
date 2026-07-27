@@ -266,7 +266,7 @@ async function sendPresenceAck(args: {
     config: {
       llmProxyBaseUrl: llmProxyBaseUrl(env),
       tinyLlmAck: Boolean(capability),
-      ackDeadlineMs: 380,
+      ackDeadlineMs: 650,
     },
     callTinyLlm: capability
       ? (body) =>
@@ -334,11 +334,12 @@ async function handlePresenceStage(request: Request, env: Env): Promise<Response
   // claim is the source of truth.
 
   const snippets = await loadPresenceRing(env.FROMDONNA_ROUTING, userId);
+  const latestUserText = [...snippets].reverse().find((s) => s.role === "user")?.text;
   let capability: string | null = null;
   try {
     capability = await mintLlmCapability(env, userId);
   } catch {
-    // rules-only
+    // fallback-only process line
   }
 
   const line = await resolvePresenceProcessLine({
@@ -346,7 +347,12 @@ async function handlePresenceStage(request: Request, env: Env): Promise<Response
     toolName,
     stage,
     seed: userId,
-    config: { llmProxyBaseUrl: llmProxyBaseUrl(env), tinyLlmAck: Boolean(capability) },
+    latestUserText,
+    config: {
+      llmProxyBaseUrl: llmProxyBaseUrl(env),
+      tinyLlmAck: Boolean(capability),
+      processDeadlineMs: 650,
+    },
     callTinyLlm: capability
       ? (reqBody) =>
           callPresenceTinyLlm({
