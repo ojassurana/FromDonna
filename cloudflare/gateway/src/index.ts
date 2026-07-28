@@ -17,12 +17,10 @@ import {
 import { ensureUserComposio, getLastComposioMintError, mintComposioMcpAccess } from "./composio";
 import {
   DEFAULT_PRESENCE_CONFIG,
-  PRESENCE_PROCESS_FALLBACK,
   appendPresenceSnippets,
   callPresenceTinyLlm,
   claimPresenceProcessSlot,
   isPresenceStatusLine,
-  isPresenceTurnFinalized,
   loadPresenceRing,
   loadPresenceTurn,
   markPresenceTurnFinal,
@@ -30,12 +28,13 @@ import {
   resolvePresenceAckPreferFast,
   resolvePresenceGate,
   resolvePresenceProcessLine,
-  samePresenceText,
   sanitizeStageId,
   stageFromToolName,
   type PresenceSnippet,
 } from "./presence";
 import { normalizeTelegramUpdate, type TelegramUpdate } from "./telegram";
+// Cron scheduler (prototype — wakes sandboxes for scheduled tasks).
+import { handleCronTick } from "./cron_scheduler";
 import {
   harnessHealthPollDelayMs,
   shouldSendEarlyTyping,
@@ -293,19 +292,14 @@ async function sendPresenceAck(args: {
 }
 
 /**
- * Msg 2–3: process WIP from sandbox tool stages.
- * Claim → short contextual LLM → ONE send (no bland-first flash).
- * Never send after Hermes final.
+ * Msg 2–3: process-based human WIP from sandbox tool stages.
  * Auth: Bearer WORKER_TO_HARNESS_SECRET + body userId/chatId must match D1 route.
  */
 async function handlePresenceStage(request: Request, env: Env): Promise<Response> {
   const auth = request.headers.get("authorization") || "";
   const expected = `Bearer ${required(env, "WORKER_TO_HARNESS_SECRET")}`;
   if (auth !== expected) return new Response("Unauthorized", { status: 401 });
-  if (!presenceEnabled(env)) {
-    console.log("presence process skipped reason=disabled");
-    return json({ ok: true, skipped: "disabled" });
-  }
+  if (!presenceEnabled(env)) return json({ ok: true, skipped: "disabled" });
 
   let body: {
     userId?: string;
@@ -323,13 +317,12 @@ async function handlePresenceStage(request: Request, env: Env): Promise<Response
   const chatId = (body.chatId || "").trim();
   if (!userId || !chatId) return json({ ok: false, error: "userId_and_chatId_required" }, 400);
 
+  // Multi-tenant: chat must match the routed conversation for this user.
   const route = await lookupByUserId(env, userId);
   if (!route || route.status !== "ready") {
-    console.log(`presence process skipped reason=user_not_ready user=${userId}`);
     return json({ ok: false, error: "user_not_ready" }, 403);
   }
   if (String(route.gateway_conversation_id) !== String(chatId)) {
-    console.log(`presence process skipped reason=chat_mismatch user=${userId}`);
     return json({ ok: false, error: "chat_mismatch" }, 403);
   }
 
@@ -339,49 +332,18 @@ async function handlePresenceStage(request: Request, env: Env): Promise<Response
 
   const turn = await loadPresenceTurn(env.FROMDONNA_ROUTING, userId);
   const epoch = turn.pre_final_count;
-  if (isPresenceTurnFinalized(turn)) {
-    console.log(`presence process skipped reason=final_already stage=${stage} user=${userId}`);
-    return json({ ok: true, skipped: "final_already", stage });
-  }
-
-  // Reserve slot first so budget is real, then write ONE contextual line.
-  const claim = await claimPresenceProcessSlot(
-    env.FROMDONNA_ROUTING,
-    userId,
-    stage,
-    epoch,
-  );
-  if (!claim.ok) {
-    console.log(
-      `presence process skipped reason=${claim.reason} stage=${stage} user=${userId} epoch=${epoch}`,
-    );
-    return json({ ok: true, skipped: claim.reason, stage });
-  }
-
-  const turnAfterClaim = await loadPresenceTurn(env.FROMDONNA_ROUTING, userId);
-  if (isPresenceTurnFinalized(turnAfterClaim) || turnAfterClaim.pre_final_count !== epoch) {
-    console.log(`presence process skipped reason=final_race stage=${stage} user=${userId}`);
-    return json({ ok: true, skipped: "final_race", stage });
-  }
+  // Fast pure gate (still re-checked atomically on claim after resolve).
+  // claim is the source of truth.
 
   const snippets = await loadPresenceRing(env.FROMDONNA_ROUTING, userId);
-  const lastNonStatus = [...snippets].reverse().find((s) => s.role !== "status");
-  if (lastNonStatus?.role === "assistant") {
-    console.log(`presence process skipped reason=assistant_already stage=${stage} user=${userId}`);
-    return json({ ok: true, skipped: "assistant_already", stage });
-  }
-
   const latestUserText = [...snippets].reverse().find((s) => s.role === "user")?.text;
-  const lastStatus = [...snippets].reverse().find((s) => s.role === "status");
-
   let capability: string | null = null;
   try {
     capability = await mintLlmCapability(env, userId);
   } catch {
-    // fallback path
+    // fallback-only process line
   }
 
-  // ONE contextual line from light LLM (short deadline). No bland-first flash.
   const line = await resolvePresenceProcessLine({
     snippets,
     toolName,
@@ -391,78 +353,41 @@ async function handlePresenceStage(request: Request, env: Env): Promise<Response
     config: {
       llmProxyBaseUrl: llmProxyBaseUrl(env),
       tinyLlmAck: Boolean(capability),
-      processDeadlineMs: DEFAULT_PRESENCE_CONFIG.processDeadlineMs,
+      processDeadlineMs: 900,
     },
     callTinyLlm: capability ? presenceLlmCall(env, capability) : undefined,
   });
 
   if ("skipped" in line) {
-    console.log(`presence process skipped reason=${line.reason} stage=${stage} user=${userId}`);
-    return json({ ok: true, skipped: line.reason, stage });
+    return json({ ok: true, skipped: line.reason, stage: line.stage });
   }
 
-  // Process: light LLM preferred; soft contextual from user words OK; never pure vague bland.
-  if (line.source === "fallback") {
-    const softOk =
-      line.text !== PRESENCE_PROCESS_FALLBACK &&
-      !samePresenceText(line.text, "Working on that…") &&
-      !samePresenceText(line.text, "Still working…");
-    if (!softOk) {
-      console.log(
-        `presence process skipped reason=no_contextual_llm stage=${stage} user=${userId}`,
-      );
-      return json({ ok: true, skipped: "no_contextual_llm", stage });
-    }
-  }
-  if (line.source !== "tiny_llm" && line.source !== "fallback") {
-    console.log(
-      `presence process skipped reason=no_contextual_llm stage=${stage} user=${userId}`,
-    );
-    return json({ ok: true, skipped: "no_contextual_llm", stage });
-  }
-  const text = line.text;
-  const source = line.source;
-  if (lastStatus && samePresenceText(lastStatus.text, text)) {
-    console.log(`presence process skipped reason=duplicate_ack stage=${stage} user=${userId}`);
-    return json({ ok: true, skipped: "duplicate_ack", stage });
-  }
+  const claim = await claimPresenceProcessSlot(
+    env.FROMDONNA_ROUTING,
+    userId,
+    line.stage,
+    epoch,
+  );
+  if (!claim.ok) return json({ ok: true, skipped: claim.reason });
 
-  // Never land after Hermes final.
-  const turnBeforeSend = await loadPresenceTurn(env.FROMDONNA_ROUTING, userId);
-  if (isPresenceTurnFinalized(turnBeforeSend) || turnBeforeSend.pre_final_count !== epoch) {
-    console.log(`presence process skipped reason=final_before_send stage=${stage} user=${userId}`);
-    return json({ ok: true, skipped: "final_before_send", stage });
-  }
-  const ringBeforeSend = await loadPresenceRing(env.FROMDONNA_ROUTING, userId);
-  const lastBefore = [...ringBeforeSend].reverse().find((s) => s.role !== "status");
-  if (lastBefore?.role === "assistant") {
-    console.log(`presence process skipped reason=assistant_before_send stage=${stage} user=${userId}`);
-    return json({ ok: true, skipped: "assistant_before_send", stage });
-  }
-
-  let messageId: number | null = null;
   try {
-    const sent = (await telegramJson(env, "sendMessage", {
+    await telegram(env, "sendMessage", {
       chat_id: chatId,
-      text,
-    })) as { result?: { message_id?: number } } | null;
-    const mid = sent?.result?.message_id;
-    messageId = typeof mid === "number" ? mid : null;
+      text: line.text,
+    });
   } catch (error) {
     console.error(
       "presence process send failed:",
       error instanceof Error ? error.message : error,
     );
-    return json({ ok: false, error: "send_failed", stage }, 502);
+    return json({ ok: false, error: "send_failed" }, 502);
   }
 
   await appendPresenceSnippets(env.FROMDONNA_ROUTING, userId, [
-    { role: "status", text },
+    { role: "status", text: line.text },
   ]);
-  console.log(
-    `presence process source=${source} stage=${stage} tool=${toolName || "-"} user=${userId} mid=${messageId ?? "-"} text=${text.slice(0, 80)}`,
-  );
-  return json({ ok: true, text, source, stage, messageId });
+  console.log(`presence process source=${line.source} stage=${line.stage} user=${userId}`);
+  return json({ ok: true, text: line.text, source: line.source, stage: line.stage });
 }
 
 /** Keep Telegram "typing…" alive while inject is in flight (bounded). */
@@ -1486,10 +1411,9 @@ async function postTelegramUpdate(env: Env, row: UserAgentRow, update: TelegramU
       "content-type": "application/json",
       authorization: `Bearer ${required(env, "WORKER_TO_HARNESS_SECRET")}`,
       "x-llm-capability": capability,
-      // Warm inject skips /bootstrap — keep presence plugin env fresh every turn.
+      // Warm inject skips /bootstrap — keep presence plugin chat/user env fresh.
       "x-fromdonna-user-id": row.user_id,
       "x-fromdonna-chat-id": row.gateway_conversation_id,
-      "x-fromdonna-worker-url": workerPublicUrl(env),
     },
     body: JSON.stringify({ update }),
   });
@@ -1791,6 +1715,12 @@ async function handleTelegram(request: Request, env: Env, ctx: ExecutionContext)
 }
 
 export default {
+  // Cron trigger (prototype): Cloudflare fires this every minute to wake sandboxes
+  // for scheduled tasks. See wrangler.toml [triggers] and src/cron_scheduler.ts.
+  async scheduled(_event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
+    ctx.waitUntil(handleCronTick(env));
+  },
+
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
     try {
@@ -1817,6 +1747,18 @@ export default {
       // Presence process stages (msg 2–3): sandbox Hermes plugin → edge light LLM.
       if (request.method === "POST" && url.pathname === "/internal/presence/stage") {
         return await handlePresenceStage(request, env);
+      }
+
+      // Cron fire (prototype): scheduled() posts a synthetic turn here to wake a
+      // sandbox and run a scheduled task. Auth via WORKER_TO_HARNESS_SECRET.
+      if (request.method === "POST" && url.pathname === "/internal/cron/fire") {
+        const auth = request.headers.get("authorization") || "";
+        const expected = `Bearer ${required(env, "WORKER_TO_HARNESS_SECRET")}`;
+        if (auth !== expected) return new Response("Unauthorized", { status: 401 });
+        const body = (await request.json().catch(() => null)) as { update?: TelegramUpdate } | null;
+        if (!body?.update) return json({ ok: false, error: "missing_update" }, 400);
+        ctx.waitUntil(processTelegramUpdate(env, body.update, ctx));
+        return json({ ok: true });
       }
 
       // Official Hermes TelegramAdapter Bot API reverse proxy (token never leaves Worker).
