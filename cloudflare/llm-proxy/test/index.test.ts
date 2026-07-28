@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { fromCodexResponses, parseCodexResponsesSse, toCodexResponsesRequest } from "../src/codex";
-import { grokRelayUrl } from "../src/env";
+import { fromCodexResponses, codexSseErrorStatus, parseCodexResponsesSse, toCodexResponsesRequest } from "../src/codex";
+import { grokRelayUrl, openaiResponsesUrl, xaiChatCompletionsUrl } from "../src/env";
+import { embeddedErrorStatus, isRelayFailure } from "../src/fallback";
 import { fromGrokChatCompletion, toGrokChatCompletionsRequest } from "../src/grok";
 import { isSupportedModel, providerForModel, SUPPORTED_MODELS } from "../src/models";
 import {
@@ -52,6 +53,96 @@ test("derives Grok relay URL from Codex responses path", () => {
       LLM_CAPABILITY_SECRET: "y",
     }),
     "https://explicit.example/v1/chat/completions",
+  );
+});
+
+test("falls back only when the relay itself is the problem", () => {
+  // Relay down / broken upstream.
+  assert.equal(isRelayFailure(500), true);
+  assert.equal(isRelayFailure(502), true);
+  assert.equal(isRelayFailure(503), true);
+  assert.equal(isRelayFailure(504), true);
+  // OAuth plan out of quota or rate limited — the "runs out" case.
+  assert.equal(isRelayFailure(429), true);
+  // Relay rejected us, or its OAuth credential expired.
+  assert.equal(isRelayFailure(401), true);
+  assert.equal(isRelayFailure(403), true);
+  assert.equal(isRelayFailure(408), true);
+
+  // Bad request: the direct API would reject it identically, so do NOT spend
+  // the API key. These must surface to the caller unchanged.
+  assert.equal(isRelayFailure(400), false);
+  assert.equal(isRelayFailure(404), false);
+  assert.equal(isRelayFailure(422), false);
+  // Success is obviously never a fallback trigger.
+  assert.equal(isRelayFailure(200), false);
+});
+
+test("detects error envelopes hidden inside an HTTP 200 body", () => {
+  // No envelope at all — a normal success body.
+  assert.equal(embeddedErrorStatus('{"choices":[{"message":{"content":"hi"}}]}'), null);
+  assert.equal(embeddedErrorStatus("not json"), null);
+  assert.equal(embeddedErrorStatus(""), null);
+
+  // An explicit numeric status wins over any wording.
+  assert.equal(embeddedErrorStatus('{"error":{"code":429,"message":"slow down"}}'), 429);
+  assert.equal(embeddedErrorStatus('{"error":{"status":503,"message":"upstream"}}'), 503);
+
+  // Quota wording with no numeric code — the "runs out" case this exists for.
+  assert.equal(embeddedErrorStatus('{"error":{"message":"You exceeded your current quota"}}'), 429);
+  assert.equal(embeddedErrorStatus('{"error":{"type":"rate_limit_exceeded"}}'), 429);
+  assert.equal(embeddedErrorStatus('{"error":{"message":"insufficient credit"}}'), 429);
+
+  // Expired/rejected credential.
+  assert.equal(embeddedErrorStatus('{"error":{"message":"Unauthorized"}}'), 401);
+  assert.equal(embeddedErrorStatus('{"error":{"message":"invalid api key"}}'), 401);
+
+  // Request-shape errors must map to 400 so the fallback does NOT fire and
+  // spend the API key on a request the direct API would reject identically.
+  assert.equal(embeddedErrorStatus('{"error":{"message":"Invalid request: bad tool schema"}}'), 400);
+  assert.equal(embeddedErrorStatus('{"error":{"message":"The model does not exist"}}'), 400);
+  assert.equal(isRelayFailure(embeddedErrorStatus('{"error":{"message":"malformed input"}}')!), false);
+
+  // Unrecognized envelope: worth one retry, so a retryable status.
+  assert.equal(embeddedErrorStatus('{"error":{"message":"something odd"}}'), 502);
+});
+
+test("detects Codex SSE failures delivered on an HTTP 200", () => {
+  // A clean stream carries no failure.
+  assert.equal(
+    codexSseErrorStatus('data: {"type":"response.completed","response":{"output":[]}}\n\n'),
+    null,
+  );
+
+  // Top-level error frame.
+  assert.equal(
+    codexSseErrorStatus('data: {"type":"error","error":{"message":"quota exceeded"}}\n\n'),
+    429,
+  );
+
+  // Terminal failure carrying the error on the response object.
+  assert.equal(
+    codexSseErrorStatus(
+      'data: {"type":"response.failed","response":{"error":{"code":401,"message":"expired"}}}\n\n',
+    ),
+    401,
+  );
+
+  // A failure with no recognizable envelope still reports a retryable status.
+  assert.equal(codexSseErrorStatus('data: {"type":"response.failed","response":{}}\n\n'), 502);
+});
+
+test("direct-API fallback URLs default to the public providers and stay overridable", () => {
+  const base = { CODEX_RELAY_URL: "https://relay.example/v1/responses", RELAY_SHARED_SECRET: "x", LLM_CAPABILITY_SECRET: "y" };
+  assert.equal(openaiResponsesUrl(base), "https://api.openai.com/v1/responses");
+  assert.equal(xaiChatCompletionsUrl(base), "https://api.x.ai/v1/chat/completions");
+  assert.equal(
+    openaiResponsesUrl({ ...base, OPENAI_RESPONSES_URL: "https://proxy.example/v1/responses" }),
+    "https://proxy.example/v1/responses",
+  );
+  assert.equal(
+    xaiChatCompletionsUrl({ ...base, XAI_CHAT_COMPLETIONS_URL: "https://proxy.example/v1/chat/completions" }),
+    "https://proxy.example/v1/chat/completions",
   );
 });
 

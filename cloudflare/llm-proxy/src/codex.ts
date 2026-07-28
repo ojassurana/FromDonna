@@ -1,4 +1,6 @@
 import type { Env } from "./env";
+import { openaiResponsesUrl } from "./env";
+import { embeddedErrorStatus, isRelayFailure, logFallback, RELAY_UNREACHABLE } from "./fallback";
 import {
   ChatCompletionRequestError,
   type ChatContentPart,
@@ -22,6 +24,22 @@ export async function codexResponse(env: Env, body: Record<string, unknown>): Pr
       "Content-Type": "application/json",
       "X-Relay-Token": env.RELAY_SHARED_SECRET,
       "ngrok-skip-browser-warning": "true",
+    },
+    body: JSON.stringify(body),
+  });
+}
+
+/**
+ * Fallback transport: this Worker's own OpenAI API key against the public
+ * Responses API. Only reached when the relay fails (see fallback.ts) and
+ * OPENAI_API_KEY is configured.
+ */
+export async function codexDirectResponse(env: Env, body: Record<string, unknown>): Promise<Response> {
+  return fetch(openaiResponsesUrl(env), {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${env.OPENAI_API_KEY}`,
     },
     body: JSON.stringify(body),
   });
@@ -298,18 +316,105 @@ export function parseCodexResponsesSse(text: string): JsonObject {
   };
 }
 
+/**
+ * Codex streams a failure as an SSE frame on an otherwise-200 response, so the
+ * HTTP status alone can't tell us the turn failed. Scan for the terminal error
+ * frames and report the status they imply, or null when the stream is healthy.
+ */
+export function codexSseErrorStatus(raw: string): number | null {
+  if (!raw.includes("response.failed") && !raw.includes("response.incomplete") && !raw.includes('"error"')) {
+    return null;
+  }
+  for (const frame of raw.split(/\r?\n\r?\n/)) {
+    const data = frame
+      .split(/\r?\n/)
+      .filter((line) => line.startsWith("data:"))
+      .map((line) => line.slice(5).trim())
+      .join("");
+    if (!data || data === "[DONE]") continue;
+    let event: unknown;
+    try {
+      event = JSON.parse(data);
+    } catch {
+      continue;
+    }
+    if (!isObject(event)) continue;
+    const type = typeof event.type === "string" ? event.type : "";
+    // Top-level error frame: {"type":"error","error":{...}}
+    if (type === "error") return embeddedErrorStatus(data) ?? 502;
+    // Terminal failure carrying the error on the response object.
+    if ((type === "response.failed" || type === "response.incomplete") && isObject(event.response)) {
+      return embeddedErrorStatus(JSON.stringify(event.response)) ?? 502;
+    }
+  }
+  return null;
+}
+
 export const codexAdapter: ProviderAdapter<Env> = {
   async complete(env, request) {
-    const upstream = await codexResponse(env, toCodexResponsesRequest(request));
-    const raw = await upstream.text();
-    if (!upstream.ok) {
+    const body = toCodexResponsesRequest(request);
+
+    // Primary transport: the OAuth relay.
+    let raw = "";
+    let status = RELAY_UNREACHABLE;
+    try {
+      const upstream = await codexResponse(env, body);
+      raw = await upstream.text();
+      status = upstream.status;
+    } catch (error) {
+      // No HTTP status at all — tunnel down, DNS, or TLS failure.
+      logFallback({ provider: "codex", stage: "relay_failed", status, model: request.model, detail: error });
+    }
+
+    // An error frame on a 200 is still a failure. Fold it into the status so
+    // the fallback decision below can see it.
+    if (status >= 200 && status < 300) {
+      const embedded = codexSseErrorStatus(raw);
+      if (embedded !== null) status = embedded;
+    }
+
+    // Fallback transport: this Worker's own API key, direct to the provider.
+    if (isRelayFailure(status)) {
+      if (!env.OPENAI_API_KEY) {
+        logFallback({ provider: "codex", stage: "no_fallback_configured", status, model: request.model });
+      } else {
+        logFallback({ provider: "codex", stage: "relay_failed", status, model: request.model, detail: raw });
+        try {
+          const direct = await codexDirectResponse(env, {
+            ...body,
+            // The relay accepts internal aliases the public API rejects.
+            model: env.OPENAI_FALLBACK_MODEL || request.model,
+          });
+          raw = await direct.text();
+          status = direct.status;
+          logFallback({
+            provider: "codex",
+            stage: direct.ok ? "fallback_ok" : "fallback_failed",
+            status,
+            model: request.model,
+            ...(direct.ok ? {} : { detail: raw }),
+          });
+        } catch (error) {
+          logFallback({
+            provider: "codex",
+            stage: "fallback_failed",
+            status: RELAY_UNREACHABLE,
+            model: request.model,
+            detail: error,
+          });
+          throw new UpstreamError("Codex relay and direct API both failed.", 502);
+        }
+      }
+    }
+
+    if (status < 200 || status >= 300) {
       let payload: unknown;
       try {
         payload = JSON.parse(raw);
       } catch {
         /* handled below */
       }
-      throw new UpstreamError(`Codex upstream returned HTTP ${upstream.status}.`, upstream.status, payload);
+      throw new UpstreamError(`Codex upstream returned HTTP ${status}.`, status, payload);
     }
     const parsed = parseCodexResponsesSse(raw);
     const normalized = fromCodexResponses(request.model, parsed);

@@ -1,4 +1,5 @@
-import { grokRelayUrl, type Env } from "./env";
+import { grokRelayUrl, xaiChatCompletionsUrl, type Env } from "./env";
+import { isRelayFailure, logFallback, embeddedErrorStatus, RELAY_UNREACHABLE } from "./fallback";
 import {
   type ChatContentPart,
   type JsonObject,
@@ -125,6 +126,21 @@ async function grokChatCompletion(env: Env, body: JsonObject): Promise<Response>
   });
 }
 
+/**
+ * Fallback transport: this Worker's own xAI API key against the public API.
+ * Only reached when the relay fails (see fallback.ts) and XAI_API_KEY is set.
+ */
+async function grokDirectChatCompletion(env: Env, body: JsonObject): Promise<Response> {
+  return fetch(xaiChatCompletionsUrl(env), {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${env.XAI_API_KEY}`,
+    },
+    body: JSON.stringify(body),
+  });
+}
+
 export const grokAdapter: ProviderAdapter<Env> = {
   async complete(env, request) {
     // Refuse image parts only if we later need a stricter policy; xAI accepts
@@ -140,16 +156,69 @@ export const grokAdapter: ProviderAdapter<Env> = {
       }
     }
 
-    const upstream = await grokChatCompletion(env, toGrokChatCompletionsRequest(request));
-    const raw = await upstream.text();
+    const body = toGrokChatCompletionsRequest(request);
+
+    // Primary transport: the OAuth relay.
+    let raw = "";
+    let status = RELAY_UNREACHABLE;
+    try {
+      const upstream = await grokChatCompletion(env, body);
+      raw = await upstream.text();
+      status = upstream.status;
+    } catch (error) {
+      // No HTTP status at all — tunnel down, DNS, or TLS failure.
+      logFallback({ provider: "grok", stage: "relay_failed", status, model: request.model, detail: error });
+    }
+
+    // A 200 carrying an error envelope is still a failure. Fold it into the
+    // status so the fallback decision below can see it.
+    if (status >= 200 && status < 300) {
+      const embedded = embeddedErrorStatus(raw);
+      if (embedded !== null) status = embedded;
+    }
+
+    // Fallback transport: this Worker's own API key, direct to the provider.
+    if (isRelayFailure(status)) {
+      if (!env.XAI_API_KEY) {
+        logFallback({ provider: "grok", stage: "no_fallback_configured", status, model: request.model });
+      } else {
+        logFallback({ provider: "grok", stage: "relay_failed", status, model: request.model, detail: raw });
+        try {
+          const direct = await grokDirectChatCompletion(env, {
+            ...body,
+            // The relay accepts catalog aliases the public API may not.
+            model: env.XAI_FALLBACK_MODEL || request.model,
+          });
+          raw = await direct.text();
+          status = direct.status;
+          logFallback({
+            provider: "grok",
+            stage: direct.ok ? "fallback_ok" : "fallback_failed",
+            status,
+            model: request.model,
+            ...(direct.ok ? {} : { detail: raw }),
+          });
+        } catch (error) {
+          logFallback({
+            provider: "grok",
+            stage: "fallback_failed",
+            status: RELAY_UNREACHABLE,
+            model: request.model,
+            detail: error,
+          });
+          throw new UpstreamError("Grok relay and direct API both failed.", 502);
+        }
+      }
+    }
+
     let payload: unknown;
     try {
       payload = JSON.parse(raw);
     } catch {
       payload = undefined;
     }
-    if (!upstream.ok) {
-      throw new UpstreamError(`Grok upstream returned HTTP ${upstream.status}.`, upstream.status, payload);
+    if (status < 200 || status >= 300) {
+      throw new UpstreamError(`Grok upstream returned HTTP ${status}.`, status, payload);
     }
     if (!isObject(payload)) {
       throw new UpstreamError("Grok upstream returned a non-JSON body.", 502);
