@@ -10,6 +10,19 @@ CODEX_RELAY_URL = "https://codex-relay.ojassurana.com/v1/responses"
 # Secrets are provisioned separately and are never committed:
 # - RELAY_SHARED_SECRET
 # - LLM_CAPABILITY_SECRET
+#
+# Direct-provider fallback (src/fallback.ts). Both optional — with no key set,
+# that provider has no fallback and relay errors propagate exactly as before:
+# - OPENAI_API_KEY   used for gpt-5.6-terra when the Codex OAuth relay fails
+# - XAI_API_KEY      used for grok-* when the Grok OAuth relay fails
+#
+# Optional fallback overrides (plain vars, not secrets):
+# - OPENAI_RESPONSES_URL      default https://api.openai.com/v1/responses
+# - XAI_CHAT_COMPLETIONS_URL  default https://api.x.ai/v1/chat/completions
+# - OPENAI_FALLBACK_MODEL     real OpenAI model id; the relay-only alias
+#                             "gpt-5.6-terra" is rejected by the public API
+# - XAI_FALLBACK_MODEL        same, if a catalog id is relay-only
+#
 # Legacy/unused on the live relay path (OAuth is resolved on the host):
 # - CODEX_ACCESS_TOKEN
 # - CODEX_REFRESH_TOKEN
