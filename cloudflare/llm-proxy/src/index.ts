@@ -20,20 +20,25 @@ function decodeBase64Url(value: string): Uint8Array | null {
   }
 }
 
-/** Validate the gateway's short-lived HMAC capability before spending relay credentials. */
-async function validCapability(env: Env, authorization: string | null): Promise<boolean> {
+/**
+ * Validate the gateway's short-lived HMAC capability before spending relay
+ * credentials, and return its subject. The subject doubles as the pool routing
+ * key: it is already authenticated and stable per caller, so no new plumbing is
+ * needed to keep one caller pinned to one upstream endpoint.
+ */
+async function capabilitySubject(env: Env, authorization: string | null): Promise<string | null> {
   const token = authorization?.match(/^Bearer ([A-Za-z0-9_-]+\.[A-Za-z0-9_-]+)$/)?.[1];
-  if (!token) return false;
+  if (!token) return null;
   const [payloadPart, signaturePart] = token.split(".");
   const payload = decodeBase64Url(payloadPart);
   const signature = decodeBase64Url(signaturePart);
-  if (!payload || !signature || payload.byteLength > 1024 || signature.byteLength !== 32) return false;
+  if (!payload || !signature || payload.byteLength > 1024 || signature.byteLength !== 32) return null;
   let parsed: { sub?: unknown; exp?: unknown };
-  try { parsed = JSON.parse(new TextDecoder().decode(payload)); } catch { return false; }
+  try { parsed = JSON.parse(new TextDecoder().decode(payload)); } catch { return null; }
   const now = Math.floor(Date.now() / 1000);
-  if (typeof parsed.sub !== "string" || !parsed.sub || typeof parsed.exp !== "number" || !Number.isInteger(parsed.exp) || parsed.exp < now || parsed.exp > now + 16 * 60) return false;
+  if (typeof parsed.sub !== "string" || !parsed.sub || typeof parsed.exp !== "number" || !Number.isInteger(parsed.exp) || parsed.exp < now || parsed.exp > now + 16 * 60) return null;
   const key = await crypto.subtle.importKey("raw", new TextEncoder().encode(env.LLM_CAPABILITY_SECRET), { name: "HMAC", hash: "SHA-256" }, false, ["verify"]);
-  return crypto.subtle.verify("HMAC", key, signature, payload);
+  return (await crypto.subtle.verify("HMAC", key, signature, payload)) ? parsed.sub : null;
 }
 
 export async function handleRequest(request: Request, env: Env): Promise<Response> {
@@ -48,7 +53,8 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
   if (request.method !== "POST" || url.pathname !== "/v1/chat/completions") return errorResponse(404, "Not found.", "not_found");
 
   // Only the gateway Worker can mint this short-lived HMAC capability.
-  if (!(await validCapability(env, request.headers.get("Authorization")))) {
+  const subject = await capabilitySubject(env, request.headers.get("Authorization"));
+  if (!subject) {
     return errorResponse(401, "A valid capability token is required.", "invalid_capability_token");
   }
 
@@ -64,7 +70,7 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
   if (!adapter) return errorResponse(404, `The model '${input.model}' is not available.`, "model_not_found");
 
   try {
-    const result = await adapter.complete(env, input);
+    const result = await adapter.complete(env, input, { key: subject });
     if (input.stream) {
       return new Response(toChatCompletionSse(input.model, result), {
         status: 200,

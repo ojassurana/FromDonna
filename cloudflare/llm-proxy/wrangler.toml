@@ -7,12 +7,54 @@ CODEX_RELAY_URL = "https://codex-relay.ojassurana.com/v1/responses"
 # /v1/chat/completions for the xAI/Grok adapter on the same host relay.
 # GROK_RELAY_URL = "https://codex-relay.ojassurana.com/v1/chat/completions"
 
+# --- Endpoint pool (src/pool.ts) --------------------------------------------
+#
+# One credential is a throughput ceiling, not just a failure risk. Rate limits on
+# the major providers are scoped to the *organization*, so extra keys on one
+# account add no capacity — real headroom comes from independent quota pools,
+# which in practice means several providers. LLM_POOL is that list.
+#
+# It is a plain var, not a secret: it holds URLs and the *names* of secrets, so
+# the routing topology stays reviewable in git and changeable without a code
+# deploy. Only the keys themselves are secrets.
+#
+# Fields per entry:
+#   id      unique; used as the cooldown key
+#   group   interchangeable set — "codex" or "grok" (must match a catalog model)
+#   kind    "relay" (OAuth host relay) or "direct" (base + credential)
+#   order   lower wins outright; tier 2 is only reached when tier 1 is unusable
+#   weight  share of its tier's traffic — set it proportional to real quota
+#   base    direct only: origin + version prefix, no endpoint path
+#   wire    direct only: "responses" or "chat_completions"
+#   keyVar  direct only: NAME of the Worker secret holding the key
+#   model   model id to send upstream; omit to forward the caller's model
+#
+# Unset = previous behaviour exactly: relay first, then the single OPENAI_API_KEY
+# or XAI_API_KEY endpoint if configured.
+#
+# LLM_POOL = '''
+# [
+#   { "id": "codex-relay", "group": "codex", "kind": "relay", "order": 1, "weight": 1 },
+#   { "id": "oai-1",  "group": "codex", "kind": "direct", "order": 2, "weight": 10,
+#     "base": "https://api.openai.com/v1", "wire": "responses",
+#     "keyVar": "OAI_KEY_1", "model": "gpt-5.6" },
+#   { "id": "azure-1", "group": "codex", "kind": "direct", "order": 2, "weight": 10,
+#     "base": "https://acme.openai.azure.com/openai/v1", "wire": "chat_completions",
+#     "keyVar": "AZURE_KEY_1", "model": "gpt-5.6" },
+#   { "id": "grok-relay", "group": "grok", "kind": "relay", "order": 1, "weight": 1 },
+#   { "id": "xai-1", "group": "grok", "kind": "direct", "order": 2, "weight": 5,
+#     "base": "https://api.x.ai/v1", "wire": "chat_completions",
+#     "keyVar": "XAI_KEY_1", "model": "grok-4.5" }
+# ]
+# '''
+
 # Secrets are provisioned separately and are never committed:
 # - RELAY_SHARED_SECRET
 # - LLM_CAPABILITY_SECRET
+# - any keyVar named in LLM_POOL (e.g. OAI_KEY_1, AZURE_KEY_1, XAI_KEY_1)
 #
-# Direct-provider fallback (src/fallback.ts). Both optional — with no key set,
-# that provider has no fallback and relay errors propagate exactly as before:
+# Legacy single-key fallback, used when LLM_POOL is unset. Both optional — with
+# no key set, that provider has no fallback and relay errors propagate as before:
 # - OPENAI_API_KEY   used for gpt-5.6-terra when the Codex OAuth relay fails
 # - XAI_API_KEY      used for grok-* when the Grok OAuth relay fails
 #
@@ -27,6 +69,10 @@ CODEX_RELAY_URL = "https://codex-relay.ojassurana.com/v1/responses"
 # - CODEX_ACCESS_TOKEN
 # - CODEX_REFRESH_TOKEN
 
+# Cooldown state. The pool writes here only on failure, so KV's one-write-per-
+# second-per-key limit is never the bottleneck; request counting would need a
+# Durable Object and is deliberately not done. POOL_STATE is optional — when
+# unbound the pool reuses this namespace.
 [[kv_namespaces]]
 binding = "CODEX_TOKENS"
 id = "3bdfdedaa2184651866854718dc226f6"
