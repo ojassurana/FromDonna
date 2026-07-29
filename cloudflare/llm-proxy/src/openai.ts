@@ -62,8 +62,19 @@ export type NormalizedChatCompletionResponse = {
   usage?: { inputTokens?: number; outputTokens?: number };
 };
 
+/**
+ * Stable key used to keep one caller pinned to one upstream endpoint. Donna is
+ * an agent: switching model mid-conversation changes reasoning style and
+ * tool-call formatting mid-task, which is where agents derail.
+ */
+export type RoutingContext = { key: string };
+
 export interface ProviderAdapter<Env> {
-  complete(env: Env, request: NormalizedChatCompletionRequest): Promise<NormalizedChatCompletionResponse>;
+  complete(
+    env: Env,
+    request: NormalizedChatCompletionRequest,
+    routing?: RoutingContext,
+  ): Promise<NormalizedChatCompletionResponse>;
 }
 
 export class ChatCompletionRequestError extends Error {}

@@ -11,9 +11,27 @@ export type Env = {
   /** HMAC key shared with the gateway Worker, never exposed to sandboxes. */
   LLM_CAPABILITY_SECRET: string;
 
-  // --- Direct-provider fallback (see fallback.ts) --------------------------
-  // All optional. When a key is unset that provider has no fallback and relay
-  // failures propagate unchanged, exactly as before this was added.
+  // --- Endpoint pool (see pool.ts) ----------------------------------------
+
+  /**
+   * JSON array of interchangeable upstream endpoints. Config, not a secret: it
+   * holds only URLs and the *names* of the secrets that authenticate them, so
+   * the routing topology stays reviewable in git and changeable without a code
+   * deploy. Unset = the legacy relay-then-single-key behaviour below.
+   */
+  LLM_POOL?: string;
+  /**
+   * KV namespace for per-endpoint cooldowns. Optional: without it the pool
+   * still retries within a request, it just cannot remember a bad endpoint
+   * between requests. Falls back to CODEX_TOKENS when unbound.
+   */
+  POOL_STATE?: KVNamespace;
+  /** Existing namespace, reused for cooldowns when POOL_STATE is unbound. */
+  CODEX_TOKENS?: KVNamespace;
+
+  // --- Direct-provider credentials ----------------------------------------
+  // All optional. With no key configured that provider contributes no endpoint
+  // and relay failures propagate unchanged, exactly as before the pool existed.
 
   /** OpenAI API key used when the Codex OAuth relay is out of quota or down. */
   OPENAI_API_KEY?: string;
@@ -32,16 +50,6 @@ export type Env = {
   /** Same for xAI, if a catalog id is relay-only. Unset = send as-is. */
   XAI_FALLBACK_MODEL?: string;
 };
-
-/** Public OpenAI Responses endpoint used by the Codex fallback. */
-export function openaiResponsesUrl(env: Env): string {
-  return env.OPENAI_RESPONSES_URL || "https://api.openai.com/v1/responses";
-}
-
-/** Public xAI Chat Completions endpoint used by the Grok fallback. */
-export function xaiChatCompletionsUrl(env: Env): string {
-  return env.XAI_CHAT_COMPLETIONS_URL || "https://api.x.ai/v1/chat/completions";
-}
 
 export function grokRelayUrl(env: Env): string {
   if (env.GROK_RELAY_URL) return env.GROK_RELAY_URL;

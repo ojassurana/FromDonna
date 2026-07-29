@@ -1,49 +1,23 @@
+/**
+ * Codex mapping layer: request/response translation between the neutral contract
+ * and the OpenAI Responses shape, plus the failure detection that shape needs.
+ *
+ * Transport and credential choice deliberately live elsewhere (pool.ts,
+ * adapter.ts). This module knows the Responses API and nothing about which
+ * endpoint or key serves it, which is what lets one pool span providers.
+ */
+
 import type { Env } from "./env";
-import { openaiResponsesUrl } from "./env";
-import { embeddedErrorStatus, isRelayFailure, logFallback, RELAY_UNREACHABLE } from "./fallback";
+import { embeddedErrorStatus } from "./fallback";
 import {
   ChatCompletionRequestError,
   type ChatContentPart,
   type JsonObject,
   type NormalizedChatCompletionRequest,
   type NormalizedChatCompletionResponse,
-  type ProviderAdapter,
-  UpstreamError,
 } from "./openai";
 
 export type { Env };
-
-/**
- * The Worker never owns Codex OAuth state. The trusted relay resolves Hermes's
- * active runtime credential for every request, keeping one token authority.
- */
-export async function codexResponse(env: Env, body: Record<string, unknown>): Promise<Response> {
-  return fetch(env.CODEX_RELAY_URL, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "X-Relay-Token": env.RELAY_SHARED_SECRET,
-      "ngrok-skip-browser-warning": "true",
-    },
-    body: JSON.stringify(body),
-  });
-}
-
-/**
- * Fallback transport: this Worker's own OpenAI API key against the public
- * Responses API. Only reached when the relay fails (see fallback.ts) and
- * OPENAI_API_KEY is configured.
- */
-export async function codexDirectResponse(env: Env, body: Record<string, unknown>): Promise<Response> {
-  return fetch(openaiResponsesUrl(env), {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${env.OPENAI_API_KEY}`,
-    },
-    body: JSON.stringify(body),
-  });
-}
 
 function isObject(value: unknown): value is JsonObject {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -349,95 +323,3 @@ export function codexSseErrorStatus(raw: string): number | null {
   }
   return null;
 }
-
-export const codexAdapter: ProviderAdapter<Env> = {
-  async complete(env, request) {
-    const body = toCodexResponsesRequest(request);
-
-    // Primary transport: the OAuth relay.
-    let raw = "";
-    let status = RELAY_UNREACHABLE;
-    try {
-      const upstream = await codexResponse(env, body);
-      raw = await upstream.text();
-      status = upstream.status;
-    } catch (error) {
-      // No HTTP status at all — tunnel down, DNS, or TLS failure.
-      logFallback({ provider: "codex", stage: "relay_failed", status, model: request.model, detail: error });
-    }
-
-    // An error frame on a 200 is still a failure. Fold it into the status so
-    // the fallback decision below can see it.
-    if (status >= 200 && status < 300) {
-      const embedded = codexSseErrorStatus(raw);
-      if (embedded !== null) status = embedded;
-    }
-
-    // Fallback transport: this Worker's own API key, direct to the provider.
-    if (isRelayFailure(status)) {
-      if (!env.OPENAI_API_KEY) {
-        logFallback({ provider: "codex", stage: "no_fallback_configured", status, model: request.model });
-      } else {
-        logFallback({ provider: "codex", stage: "relay_failed", status, model: request.model, detail: raw });
-        try {
-          const direct = await codexDirectResponse(env, {
-            ...body,
-            // The relay accepts internal aliases the public API rejects.
-            model: env.OPENAI_FALLBACK_MODEL || request.model,
-          });
-          raw = await direct.text();
-          status = direct.status;
-          logFallback({
-            provider: "codex",
-            stage: direct.ok ? "fallback_ok" : "fallback_failed",
-            status,
-            model: request.model,
-            ...(direct.ok ? {} : { detail: raw }),
-          });
-        } catch (error) {
-          logFallback({
-            provider: "codex",
-            stage: "fallback_failed",
-            status: RELAY_UNREACHABLE,
-            model: request.model,
-            detail: error,
-          });
-          throw new UpstreamError("Codex relay and direct API both failed.", 502);
-        }
-      }
-    }
-
-    if (status < 200 || status >= 300) {
-      let payload: unknown;
-      try {
-        payload = JSON.parse(raw);
-      } catch {
-        /* handled below */
-      }
-      throw new UpstreamError(`Codex upstream returned HTTP ${status}.`, status, payload);
-    }
-    const parsed = parseCodexResponsesSse(raw);
-    const normalized = fromCodexResponses(request.model, parsed);
-    // Never hand Hermes a successful empty completion when the upstream spent
-    // tokens — keep a minimal diagnostic so the agent can recover instead of
-    // thrashing "empty content" retries.
-    if (!normalized.content.length && !normalized.toolCalls.length) {
-      const usage = isObject(parsed.usage) ? parsed.usage : {};
-      const outTokens = typeof usage.output_tokens === "number" ? usage.output_tokens : 0;
-      if (outTokens > 0 || raw.includes("function_call") || raw.includes("output_text")) {
-        console.error(
-          JSON.stringify({
-            msg: "codex_empty_mapping",
-            model: request.model,
-            outTokens,
-            rawHead: raw.slice(0, 1500),
-            parsedOutputTypes: Array.isArray(parsed.output)
-              ? (parsed.output as unknown[]).map((item) => (isObject(item) ? item.type : typeof item))
-              : [],
-          }),
-        );
-      }
-    }
-    return normalized;
-  },
-};

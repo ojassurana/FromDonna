@@ -1,11 +1,22 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { fromCodexResponses, codexSseErrorStatus, parseCodexResponsesSse, toCodexResponsesRequest } from "../src/codex";
-import { grokRelayUrl, openaiResponsesUrl, xaiChatCompletionsUrl } from "../src/env";
+import { grokRelayUrl } from "../src/env";
 import { embeddedErrorStatus, isRelayFailure } from "../src/fallback";
 import { fromGrokChatCompletion, toGrokChatCompletionsRequest } from "../src/grok";
 import { isSupportedModel, providerForModel, SUPPORTED_MODELS } from "../src/models";
 import {
+  cooldownSeconds,
+  directTarget,
+  fnv1a32,
+  orderedCandidates,
+  parsePool,
+  runWithPool,
+  type PoolEntry,
+  type PoolEnv,
+} from "../src/pool";
+import {
+  ChatCompletionRequestError,
   normalizeChatCompletionRequest,
   toChatCompletion,
   toChatCompletionSse,
@@ -132,17 +143,231 @@ test("detects Codex SSE failures delivered on an HTTP 200", () => {
   assert.equal(codexSseErrorStatus('data: {"type":"response.failed","response":{}}\n\n'), 502);
 });
 
-test("direct-API fallback URLs default to the public providers and stay overridable", () => {
-  const base = { CODEX_RELAY_URL: "https://relay.example/v1/responses", RELAY_SHARED_SECRET: "x", LLM_CAPABILITY_SECRET: "y" };
-  assert.equal(openaiResponsesUrl(base), "https://api.openai.com/v1/responses");
-  assert.equal(xaiChatCompletionsUrl(base), "https://api.x.ai/v1/chat/completions");
-  assert.equal(
-    openaiResponsesUrl({ ...base, OPENAI_RESPONSES_URL: "https://proxy.example/v1/responses" }),
-    "https://proxy.example/v1/responses",
+const RELAY_ENV = {
+  CODEX_RELAY_URL: "https://relay.example/v1/responses",
+  RELAY_SHARED_SECRET: "x",
+  LLM_CAPABILITY_SECRET: "y",
+} satisfies PoolEnv;
+
+test("with no LLM_POOL the pool reproduces the previous single-key fallback", () => {
+  // Nothing configured: relay only, so a deployment that has not opted in
+  // behaves exactly as it did before the pool existed.
+  assert.deepEqual(parsePool(RELAY_ENV, "codex"), [
+    { id: "codex-relay", group: "codex", kind: "relay", order: 1, weight: 1 },
+  ]);
+
+  // A key configured: relay first, then that one direct endpoint at order 2.
+  const withKey = parsePool({ ...RELAY_ENV, OPENAI_API_KEY: "sk-test" }, "codex");
+  assert.equal(withKey.length, 2);
+  assert.equal(withKey[1].kind, "direct");
+  assert.equal(withKey[1].order, 2);
+  assert.equal(withKey[1].base, "https://api.openai.com/v1");
+  assert.equal(withKey[1].wire, "responses");
+  assert.equal(directTarget({ ...RELAY_ENV, OPENAI_API_KEY: "sk-test" }, withKey[1]).url, "https://api.openai.com/v1/responses");
+
+  const grok = parsePool({ ...RELAY_ENV, XAI_API_KEY: "xai-test" }, "grok");
+  assert.equal(grok[1].wire, "chat_completions");
+  assert.equal(directTarget({ ...RELAY_ENV, XAI_API_KEY: "xai-test" }, grok[1]).url, "https://api.x.ai/v1/chat/completions");
+
+  // The documented URL overrides still apply, now via the pool's base.
+  const overridden = parsePool(
+    { ...RELAY_ENV, OPENAI_API_KEY: "sk-test", OPENAI_RESPONSES_URL: "https://proxy.example/v1/responses" },
+    "codex",
   );
-  assert.equal(
-    xaiChatCompletionsUrl({ ...base, XAI_CHAT_COMPLETIONS_URL: "https://proxy.example/v1/chat/completions" }),
-    "https://proxy.example/v1/chat/completions",
+  assert.equal(overridden[1].base, "https://proxy.example/v1");
+  assert.equal(overridden[1].model, undefined);
+
+  // The relay accepts aliases the public API rejects, so the fallback model id
+  // must reach the direct entry.
+  const aliased = parsePool({ ...RELAY_ENV, OPENAI_API_KEY: "sk-test", OPENAI_FALLBACK_MODEL: "gpt-5.6" }, "codex");
+  assert.equal(aliased[1].model, "gpt-5.6");
+});
+
+test("credentials are referenced by name, never stored in pool config", () => {
+  const entry: PoolEntry = {
+    id: "oai-1", group: "codex", kind: "direct", order: 2, weight: 1,
+    base: "https://api.openai.com/v1", wire: "responses", keyVar: "OAI_KEY_1",
+  };
+  const target = directTarget({ ...RELAY_ENV, OAI_KEY_1: "sk-secret" }, entry);
+  assert.equal(target.headers.Authorization, "Bearer sk-secret");
+  // The config itself carries only the name, so it stays reviewable in git.
+  assert.equal(JSON.stringify(entry).includes("sk-secret"), false);
+});
+
+test("pool config keeps only usable entries in the requested group", () => {
+  const env: PoolEnv = {
+    ...RELAY_ENV,
+    KEY_A: "a",
+    LLM_POOL: JSON.stringify([
+      { id: "codex-relay", group: "codex", kind: "relay", order: 1, weight: 1 },
+      { id: "ok", group: "codex", kind: "direct", order: 2, weight: 3, base: "https://a.example/v1", keyVar: "KEY_A" },
+      // Secret not provisioned — configuration drift, so skip it rather than
+      // send an unauthenticated request that is guaranteed to fail.
+      { id: "missing-secret", group: "codex", kind: "direct", order: 2, weight: 1, base: "https://b.example/v1", keyVar: "KEY_ABSENT" },
+      // Nowhere to send: unusable.
+      { id: "no-base", group: "codex", kind: "direct", order: 2, weight: 1, keyVar: "KEY_A" },
+      // Duplicate id would share a cooldown key and mask the other's health.
+      { id: "ok", group: "codex", kind: "direct", order: 3, weight: 1, base: "https://c.example/v1", keyVar: "KEY_A" },
+      // Another group's endpoint must not answer a codex request.
+      { id: "grok-1", group: "grok", kind: "direct", order: 2, weight: 1, base: "https://d.example/v1", keyVar: "KEY_A" },
+    ]),
+  };
+  assert.deepEqual(parsePool(env, "codex").map((entry) => entry.id), ["codex-relay", "ok"]);
+  assert.deepEqual(parsePool(env, "grok").map((entry) => entry.id), ["grok-1"]);
+
+  // Trailing slashes must not produce a double slash in the final URL.
+  const trimmed = parsePool(
+    { ...RELAY_ENV, KEY_A: "a", LLM_POOL: JSON.stringify([{ id: "t", group: "codex", kind: "direct", base: "https://a.example/v1/", keyVar: "KEY_A" }]) },
+    "codex",
+  );
+  assert.equal(directTarget({ ...RELAY_ENV, KEY_A: "a" }, trimmed[0]).url, "https://a.example/v1/chat/completions");
+
+  // Malformed config must not take the proxy down.
+  assert.deepEqual(parsePool({ ...RELAY_ENV, LLM_POOL: "{not json" }, "codex").map((e) => e.kind), ["relay"]);
+  assert.deepEqual(parsePool({ ...RELAY_ENV, LLM_POOL: "[]" }, "codex").map((e) => e.kind), ["relay"]);
+});
+
+test("order tiers win outright over weight", () => {
+  // The subscription-priced relay is order 1 with weight 1; a heavily-weighted
+  // paid endpoint at order 2 must still never be tried first, or we would pay
+  // per token for capacity the subscription already covers.
+  const entries: PoolEntry[] = [
+    { id: "paid", group: "codex", kind: "direct", order: 2, weight: 100, base: "https://a.example/v1", keyVar: "K" },
+    { id: "relay", group: "codex", kind: "relay", order: 1, weight: 1 },
+  ];
+  for (const key of ["a", "b", "c", "zzz", "user_42"]) {
+    assert.deepEqual(orderedCandidates(entries, key).map((entry) => entry.id), ["relay", "paid"]);
+  }
+});
+
+test("one caller sticks to one endpoint while different callers spread by weight", () => {
+  const tier = (id: string, weight: number): PoolEntry =>
+    ({ id, group: "codex", kind: "direct", order: 2, weight, base: `https://${id}.example/v1`, keyVar: "K" });
+  const entries = [tier("big", 8), tier("small-1", 1), tier("small-2", 1)];
+
+  // Sticky: the same routing key always resolves to the same first choice, so a
+  // multi-turn agent conversation does not change model mid-task.
+  const first = orderedCandidates(entries, "caller-7")[0].id;
+  for (let i = 0; i < 5; i += 1) {
+    assert.equal(orderedCandidates(entries, "caller-7")[0].id, first);
+  }
+  // Every entry still appears, in order, as the retry tail.
+  assert.equal(orderedCandidates(entries, "caller-7").length, 3);
+
+  // Spread: across many callers, traffic tracks weight (ideal 800/100/100).
+  const counts: Record<string, number> = { big: 0, "small-1": 0, "small-2": 0 };
+  for (let i = 0; i < 1000; i += 1) counts[orderedCandidates(entries, `user_${i}`)[0].id] += 1;
+  assert.ok(counts.big > 700 && counts.big < 880, `big=${counts.big}`);
+  assert.ok(counts["small-1"] > 40, `small-1=${counts["small-1"]}`);
+  assert.ok(counts["small-2"] > 40, `small-2=${counts["small-2"]}`);
+
+  // Stable across isolates and deploys: the routing decision must not change
+  // just because the request landed in a different datacentre.
+  assert.equal(fnv1a32("caller-7:2"), fnv1a32("caller-7:2"));
+  assert.notEqual(fnv1a32("caller-7:1"), fnv1a32("caller-7:2"));
+});
+
+const headers = (values: Record<string, string>) => ({
+  get: (name: string) => values[name.toLowerCase()] ?? null,
+});
+
+test("cooldown length comes from the provider instead of a guess", () => {
+  // The provider already knows when the window resets; read it.
+  assert.equal(cooldownSeconds(429, headers({ "retry-after-ms": "2500" })), 3);
+  assert.equal(cooldownSeconds(429, headers({ "retry-after": "12" })), 12);
+  assert.equal(cooldownSeconds(429, headers({ "x-ratelimit-reset-requests": "6s" })), 6);
+  assert.equal(cooldownSeconds(429, headers({ "x-ratelimit-reset-requests": "1m30s" })), 90);
+  assert.equal(cooldownSeconds(429, headers({ "x-ratelimit-reset-requests": "250ms" })), 1);
+  // retry-after-ms is more precise, so it wins over the whole-second header.
+  assert.equal(cooldownSeconds(429, headers({ "retry-after-ms": "1500", "retry-after": "60" })), 2);
+
+  // No headers at all: fall back to something sane per status.
+  assert.equal(cooldownSeconds(429), 30);
+  assert.equal(cooldownSeconds(401), 300);
+  assert.equal(cooldownSeconds(503), 15);
+
+  // Both are HTTP 429 but they mean opposite things: a throttle clears in
+  // seconds, an exhausted account never clears without a human. Retrying a dead
+  // key every request would waste an attempt on every single request.
+  assert.equal(cooldownSeconds(429, undefined, '{"error":{"code":"insufficient_quota"}}'), 900);
+  assert.equal(cooldownSeconds(429, undefined, '{"error":{"code":"rate_limit_exceeded"}}'), 30);
+
+  // Never trust an absurd value from upstream.
+  assert.equal(cooldownSeconds(429, headers({ "retry-after": "999999" })), 900);
+  assert.equal(cooldownSeconds(429, headers({ "retry-after": "0" })), 1);
+  assert.equal(cooldownSeconds(429, headers({ "retry-after": "garbage" })), 30);
+});
+
+const poolOf = (...ids: string[]): PoolEnv => ({
+  ...RELAY_ENV,
+  KEY: "k",
+  LLM_POOL: JSON.stringify(
+    ids.map((id, index) => ({
+      id,
+      group: "codex",
+      kind: "direct",
+      // Distinct tiers make the attempt order deterministic for assertions.
+      order: index + 1,
+      weight: 1,
+      base: `https://${id}.example/v1`,
+      keyVar: "KEY",
+    })),
+  ),
+});
+
+test("a failing endpoint is retried on the next one, up to a bounded number of attempts", async () => {
+  const tried: string[] = [];
+  const outcome = await runWithPool(poolOf("a", "b", "c"), { group: "codex", routingKey: "u1" }, async (entry) => {
+    tried.push(entry.id);
+    // First endpoint is out of quota; the second one answers.
+    return entry.id === "a" ? { status: 429, raw: "rate limited" } : { status: 200, raw: "ok" };
+  });
+  assert.deepEqual(tried, ["a", "b"]);
+  assert.equal(outcome.status, 200);
+  assert.equal(outcome.entry.id, "b");
+  assert.equal(outcome.attempts, 2);
+
+  // All bad: stop at 3 distinct endpoints rather than walking a large pool.
+  // Failed requests still count against a provider's quota.
+  const all: string[] = [];
+  const exhausted = await runWithPool(poolOf("a", "b", "c", "d", "e"), { group: "codex", routingKey: "u1" }, async (entry) => {
+    all.push(entry.id);
+    return { status: 503, raw: "down" };
+  });
+  assert.deepEqual(all, ["a", "b", "c"]);
+  assert.equal(exhausted.status, 503);
+
+  // A transport throw has no status at all — tunnel, DNS, or TLS — and must
+  // still fall through to the next endpoint.
+  const thrown: string[] = [];
+  const recovered = await runWithPool(poolOf("a", "b"), { group: "codex", routingKey: "u1" }, async (entry) => {
+    thrown.push(entry.id);
+    if (entry.id === "a") throw new Error("tunnel closed");
+    return { status: 200, raw: "ok" };
+  });
+  assert.deepEqual(thrown, ["a", "b"]);
+  assert.equal(recovered.status, 200);
+});
+
+test("a bad request is returned immediately instead of burning the pool", async () => {
+  // Every endpoint would reject a malformed request identically, so trying more
+  // of them only spends quota and adds latency.
+  const tried: string[] = [];
+  const outcome = await runWithPool(poolOf("a", "b", "c"), { group: "codex", routingKey: "u1" }, async (entry) => {
+    tried.push(entry.id);
+    return { status: 400, raw: '{"error":{"message":"bad tool schema"}}' };
+  });
+  assert.deepEqual(tried, ["a"]);
+  assert.equal(outcome.status, 400);
+  assert.equal(outcome.attempts, 1);
+
+  // A mapping error is the caller's fault too, and must not be disguised as a
+  // transport failure by the retry loop.
+  await assert.rejects(
+    runWithPool(poolOf("a", "b"), { group: "codex", routingKey: "u1" }, async () => {
+      throw new ChatCompletionRequestError("content part type 'video' is not supported.");
+    }),
+    ChatCompletionRequestError,
   );
 });
 

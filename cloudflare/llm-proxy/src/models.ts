@@ -1,6 +1,5 @@
-import { codexAdapter } from "./codex";
+import { codexAdapter, grokAdapter } from "./adapter";
 import type { Env } from "./env";
-import { grokAdapter } from "./grok";
 import type { ProviderAdapter } from "./openai";
 
 export type Provider = "openai-codex" | "xai-oauth";
@@ -33,7 +32,12 @@ export function providerForModel(model: string): Provider | null {
   return MODEL_ADAPTERS[model]?.provider ?? null;
 }
 
-/** Model routing lives here; the Chat Completions contract itself is provider-neutral. */
+/**
+ * Model routing lives here; the Chat Completions contract itself is
+ * provider-neutral. The adapter a model maps to selects an interchangeable
+ * *pool*, not a single endpoint — which endpoint serves the request is decided
+ * per request in pool.ts.
+ */
 export function adapterForModel(model: string): ProviderAdapter<Env> | null {
   return MODEL_ADAPTERS[model]?.adapter ?? null;
 }
